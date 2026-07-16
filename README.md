@@ -50,8 +50,8 @@ automatically, and the mind injects into every turn.
   `done { id, note? }`, `drop { id, note? }`.
 
 Facts are stored **declarative, not imperative** ("the user prefers verbose recon", never "always be
-verbose"). Every write **and every injection** is scanned for secrets, exfiltration, prompt-injection,
-deception, and invisible unicode — a flagged entry is withheld with a placeholder rather than
+verbose"). Every write **and every injection** is scanned for secrets, prompt-injection, deception,
+and invisible unicode — a flagged entry is withheld with a placeholder rather than
 re-entering the prompt raw. A backlog item with a `dueInSeconds` arms a durable wake, re-armed across
 restarts; one that came due while you were away is delivered on the next start. A durable-preference
 message ("from now on, always…") raises a gentle capture nudge on the status line
@@ -61,6 +61,19 @@ message ("from now on, always…") raises a gentle capture nudge on the status l
 
 A read-only view of the current mind — objective, long-term memory, working context, and open backlog
 — exactly what is injected into the model each turn.
+
+## Delegation-aware
+
+When pi-persona delegates (background sub-agent legs, the v1.5.0 default), the mind adapts so a worker
+never carries — or pollutes — the supervisor's memory:
+
+- **Delegated legs inherit only the lean mind** — a worker sub-agent gets the north-star + durable
+  identity (long-term) only; the supervisor's working-context and backlog are dropped, the `memory`/
+  `backlog` tools are withheld (no writes), and no wakes fire. A worker inherits *who the persona is*,
+  not its project state. Detected via the same flags pi-persona sets on its children.
+- **A blocked leg becomes a backlog candidate** — when a delegated leg comes back `[BLOCKED]` /
+  `FLAG: UNKNOWN`, a deterministic status-line nudge suggests `backlog add` so the thread isn't lost
+  (on both the sync tool result and the async completion report; `PI_PERSONA_MIND_NUDGE=off` disables).
 
 ## Per-persona
 
