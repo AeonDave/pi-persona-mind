@@ -11,8 +11,10 @@ what it *learns* and what it *means to do* persist to disk and re-appear in its 
 turn — captured by the agent, resurfaced deterministically, with zero per-turn token cost.
 
 It is **loosely coupled** to [pi-persona](https://github.com/AeonDave/pi-persona): it scopes memory to
-the active persona by reading pi-persona's own marker, and degrades to a global scope when pi-persona
-is absent. No hard dependency — it works on its own too.
+the active persona by mirroring pi-persona's own persona resolution (the `PI_PERSONA_DEFAULT` pin, the
+on-disk marker, and the `PI_AGENT_DIR` / `PI_PERSONA_STATE_FILE` locations), so the two never disagree
+about which persona is active — and it degrades to a global scope when pi-persona is absent. No hard
+dependency — it works on its own too.
 
 > **Everything is deterministic and cross-OS.** No embeddings, no SQLite, no external service, no
 > background LLM: capture is explicit (the agent calls the tools), resurfacing is a model-free
@@ -113,8 +115,9 @@ npm run typecheck   # strict tsc --noEmit (exactOptionalPropertyTypes)
 npm test            # tsx --test — pure core modules + a Pi-surface smoke test
 ```
 
-See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design, the v0.2 hardening notes, and the explicit
-non-goals (no SQLite, no embeddings, no background LLM consolidation).
+See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design, the v0.2 and v0.4 hardening notes (and the
+audit's documented known-limitations), and the explicit non-goals (no SQLite, no embeddings, no
+background LLM consolidation).
 
 ### Pi compatibility
 

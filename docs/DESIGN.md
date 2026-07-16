@@ -45,9 +45,9 @@ src/
 
 ### Storage layout
 
-Under `<agentDir>/pi-persona-mind/` (agentDir from `getAgentDir()`; pi-persona resolves the same root by
-default, but overriding its marker location via `PI_AGENT_DIR` or `PI_PERSONA_STATE_FILE` desyncs the two —
-the mind then reads no marker and scopes to `_default`; see Scope resolution):
+Under `<agentDir>/pi-persona-mind/` (agentDir mirrors pi-persona's own `PI_AGENT_DIR || getAgentDir()`,
+and the marker location follows `PI_PERSONA_STATE_FILE`, so the two stay in lockstep under those
+overrides; see Scope resolution):
 
 ```
 memory/ltm/<persona>.json      long-term, per persona
@@ -95,9 +95,15 @@ interface BacklogEntry {
 
 ### Scope resolution (`scope.ts`)
 
-- **Active persona:** read `<agentDir>/persona/state.json` (`{ lastPersona }` — pi-persona's own
-  marker). Absent / unreadable / null → `_default`. This is the only pi-persona coupling and it is
-  read-only and best-effort.
+- **Active persona:** mirrors pi-persona's own restore precedence — the `PI_PERSONA_DEFAULT` env pin
+  wins, else the on-disk marker (`<stateFile>` `{ lastPersona }`) when `PI_PERSONA_PERSIST` ≠ "off",
+  else `_default`. The marker path follows `PI_PERSONA_STATE_FILE` and the agent dir follows
+  `PI_AGENT_DIR`, so an env-pinned / persist-off / relocated session scopes to the same persona
+  pi-persona actually activated. Read-only and best-effort; this is the only pi-persona coupling.
+- **Persona → filename:** sanitized to one safe path segment. A name that would collide with an
+  internal store is disambiguated: the `_shared` / `_default` sentinels (case-insensitively) and
+  Windows reserved device names are prefixed `persona-…`, and a name with no filesystem-safe
+  characters (CJK/Cyrillic/emoji) gets a stable content hash instead of collapsing onto `_default`.
 - **Project root:** walk up from `ctx.cwd` to the nearest `.git`; fall back to `ctx.cwd`. Hash with
   sha256, slice 24, prefix a sanitized basename slug (mirrors the ecosystem convention).
 
@@ -220,3 +226,66 @@ sessions routinely. Two deterministic, model-free changes make the mind delegati
   to `backlog add` so a surrendered hand-off becomes captured deferred intent. Reached on both delivery
   paths: the sync `delegate`/`council` tool_result, and the background/async default where the report
   arrives as a follow-up user message (scanned in `before_agent_start`). Nudge-only, never auto-writes.
+
+## v0.4 — audit hardening (correctness, durability, coupling parity)
+
+A dedicated adversarial audit (25 confirmed findings) drove a hardening pass. Every fix is
+stdlib-only, cross-OS, backward-compatible for the common (Latin-named, single-session) case, and
+covered by tests.
+
+**Namespace / persona isolation (`scope.ts`):**
+- A persona name with no filesystem-safe characters (CJK/Cyrillic/emoji) no longer sanitizes to `""`
+  → `_default` (which merged every such persona with each other **and** with the no-persona scope); it
+  gets a stable `persona-<hash>` segment so distinct names stay distinct.
+- The reserved-sentinel guard is case-insensitive (a case-insensitive FS aliases `_SHARED.json` to
+  `_shared.json`) and also covers Windows reserved device names (`NUL`/`CON`/`COM1`…).
+
+**Coupling parity with pi-persona (`scope.ts`):**
+- Active-persona resolution mirrors pi-persona's precedence: `PI_PERSONA_DEFAULT` pin > (`PI_PERSONA_PERSIST`
+  ≠ off ? marker : none), so an env-pinned or persist-off session no longer scopes to a stale marker.
+- The agent dir honors `PI_AGENT_DIR` (raw value, as pi-persona does) and the marker path honors
+  `PI_PERSONA_STATE_FILE`, so the two co-locate and never desync.
+
+**Injection / scanner (`scanner.ts`, `inject.ts`):**
+- The content scanner matches a whitespace-collapsed copy too, closing a newline-split injection
+  bypass (a newline inside a phrase slipped the newline-bounded rules yet rejoined into a clean
+  instruction when the render path collapses whitespace). Fixed on both the write gate and the
+  load-time re-scan.
+- `INVISIBLE` now covers variation selectors (U+FE00-FE0F, U+E0100-E01EF) and the Unicode Tags block
+  (U+E0000-E007F) — the modern ASCII-smuggling vectors it previously missed.
+- The budget footer counts dropped `objective` entries (a pinned north-star no longer silently
+  vanishes) and is omitted from a lean worker block (whose `memory`/`backlog` tools are withheld).
+
+**Concurrency / durability (`store.ts`, `index.ts`):**
+- `withCommitLock` never time-steals a live local holder (it is legitimately mid-critical-section),
+  and `casUpdate` re-verifies lock ownership before committing — retrying if it was stolen — closing
+  the dual-steal / stalled-holder lost-write windows.
+- `atomicWriteFile` no longer overwrites a good `.bak` with a torn live file during a recovery write.
+- The wake-owner lock no longer treats a live local owner as stale after 120 s (the deterministic
+  cross-session wake double-fire); an armed wake re-checks item state before firing (no nag for a
+  done/dropped item).
+
+**Memory ops (`service.ts`):** `recall` dedupes a fact stored in both tiers by id (no double count);
+`promote` writes long-term before removing short-term, so a crash leaves a harmless duplicate, not a loss.
+
+### Known limitations (documented, not yet fixed)
+
+Real but bounded; a robust fix would migrate existing on-disk stores or needs a cross-repo change with
+pi-persona. Tracked for a later pass:
+
+- **Lossy persona-name collisions.** Two *distinct* names that sanitize to the same segment (`dev ops`
+  vs `dev-ops`, names identical in their first 64 chars, or case-variants on a case-insensitive FS)
+  still share one LTM file. A hash-suffixed filename would fix it but relocate every existing store.
+- **Project-slug case / junction split.** `projectSlug` hashes the resolved cwd without realpath or
+  case folding, so the same project reached via a different drive-letter case, a junction/subst, or a
+  symlink gets a separate STM/backlog store. Recovered by launching from the canonical path.
+- **`PI_PERSONA_DISABLE` detection nuance.** A worker leg is detected via `PI_PERSONA_DISABLE` /
+  `PI_PERSONA_CHILD`. A user who sets `PI_PERSONA_DISABLE` as a kill switch (not a delegation marker),
+  or an unusual non-`"1"` value, can be mis-classified. Cleanly separating the kill switch from the
+  in-process delegation marker needs a dedicated pi-persona leg signal.
+- **Blocked-leg nudge coverage.** The capture nudge fires on the sync `delegate`/`council` result and
+  the async follow-up report, but not on secondary collection paths (`intercom wait`, `flow`, a
+  mandatory-orchestration system-prompt injection).
+- **Per-entry validation prune.** An entry that fails schema validation is dropped on load (schema
+  drift → drop) and the next write commits the pruned set; unlike file-level corruption it is not
+  quarantined.
