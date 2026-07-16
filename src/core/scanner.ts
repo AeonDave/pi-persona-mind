@@ -15,7 +15,9 @@
  *               it never flags an `elite` pentest persona's legitimate notes.
  *
  * Pattern-based, no LLM: cheap, deterministic, cross-OS. Injection patterns are filler-tolerant so
- * padding between the verb and its target cannot bypass them.
+ * padding between the verb and its target cannot bypass them, and are matched against a
+ * whitespace-collapsed copy too so a newline placed inside a phrase (which the render path rejoins)
+ * cannot slip past the scan.
  */
 
 export type ScanScope = "all" | "context" | "strict";
@@ -32,10 +34,12 @@ interface Rule {
 	minScope: ScanScope;
 }
 
-// Invisible / format control characters: zero-width spaces & joiners (U+200B-200D), bidi marks and
+// Invisible / format-control characters: zero-width spaces & joiners (U+200B-200D), bidi marks and
 // overrides (U+200E-200F, U+202A-202E), word joiner & invisible math ops (U+2060-2064), bidi
-// isolates (U+2066-2069), and BOM/ZWNBSP (U+FEFF) — the "Trojan Source"-style hiding set.
-const INVISIBLE = /[​-‏‪-‮⁠-⁤⁦-⁩﻿]/;
+// isolates (U+2066-2069), BOM/ZWNBSP (U+FEFF), variation selectors (U+FE00-FE0F and the
+// supplementary U+E0100-E01EF), and the Unicode Tags block (U+E0000-E007F) — the "Trojan Source"
+// hiding set plus the tag/variation-selector vectors used in modern LLM ASCII-smuggling.
+const INVISIBLE = /[​-‏‪-‮⁠-⁤⁦-⁩︀-️﻿\u{e0000}-\u{e007f}\u{e0100}-\u{e01ef}]/u;
 
 // A filler gap that tolerates padding words/punctuation (bounded to avoid catastrophic backtracking).
 const GAP = "[^.\\n]{0,120}?";
@@ -68,10 +72,14 @@ const RULES: Rule[] = [
  */
 export function scanContent(text: string, scope: ScanScope = "context"): ScanResult {
 	if (INVISIBLE.test(text)) return { ok: false, reason: "invisible unicode / hidden characters detected" };
+	// The render path collapses whitespace (inject.oneLine), so a newline inside an injection phrase
+	// would slip past the newline-bounded rules yet re-join into a clean instruction. Match the
+	// collapsed copy too — normalizing BEFORE scanning, not after.
+	const collapsed = text.replace(/\s+/g, " ");
 	const limit = SCOPE_RANK[scope];
 	for (const rule of RULES) {
 		if (SCOPE_RANK[rule.minScope] > limit) continue;
-		if (rule.re.test(text)) return { ok: false, reason: rule.reason };
+		if (rule.re.test(text) || (collapsed !== text && rule.re.test(collapsed))) return { ok: false, reason: rule.reason };
 	}
 	return { ok: true };
 }

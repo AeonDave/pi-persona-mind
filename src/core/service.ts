@@ -201,7 +201,7 @@ export class MindService {
 		const now = this.now();
 		if (opts.lean) {
 			const ltm = await this.longMemories();
-			return renderMind({ persona: this.scope.persona, ltm, stm: [], backlog: [], now, ...(this.budget ? { budget: this.budget } : {}) });
+			return renderMind({ persona: this.scope.persona, ltm, stm: [], backlog: [], now, lean: true, ...(this.budget ? { budget: this.budget } : {}) });
 		}
 		const [ltm, stmRaw, backlogRaw] = await Promise.all([this.longMemories(), this.stm.load(), this.backlog.load()]);
 		return renderMind({

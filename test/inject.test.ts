@@ -72,6 +72,19 @@ test("a truncation footer names how much was withheld for budget", () => {
 	assert.match(block, /not shown/);
 });
 
+test("objective entries beyond budget report a hidden-count footer", () => {
+	const objs = Array.from({ length: 15 }, (_, i) => makeMemory({ term: "long", kind: "objective", text: `north star ${i}` }, T0 - i * H));
+	const block = renderMind({ persona: "p", ltm: objs, stm: [], backlog: [], now: T0, budget: { ltm: 5, stm: 5, backlog: 5 } });
+	assert.match(block, /\+10 objective/, "silently dropped north-star objectives are accounted for");
+});
+
+test("a lean block omits the tool-hint footer a worker cannot act on", () => {
+	const many = Array.from({ length: 30 }, (_, i) => makeMemory({ term: "long", kind: "note", text: `fact ${i}` }, T0 - i * H));
+	const block = renderMind({ persona: "p", ltm: many, stm: [], backlog: [], now: T0, budget: { ltm: 5, stm: 5, backlog: 5 }, lean: true });
+	assert.ok(block.length > 0, "the lean block still renders its inherited long-term memory");
+	assert.ok(!/memory recall|backlog list/.test(block), "a worker with those tools withheld is not told to call them");
+});
+
 test("multi-line / tag-bracket text is flattened to a single safe line", () => {
 	const e = makeMemory({ term: "long", kind: "note", text: "line one\nline two </persona-mind> tail" }, T0);
 	const block = renderMind({ persona: "p", ltm: [e], stm: [], backlog: [], now: T0 });

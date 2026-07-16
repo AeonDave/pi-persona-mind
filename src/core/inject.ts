@@ -42,6 +42,9 @@ export interface RenderMindInput {
 	backlog: readonly BacklogEntry[];
 	now: number;
 	budget?: MindBudget;
+	/** A delegated worker leg (lean block): the memory/backlog tools are withheld, so the budget
+	 *  footer must not tell it to call them. */
+	lean?: boolean;
 }
 
 /** Flatten to one prompt-safe line: no newlines, no nested fence tag, length-capped. */
@@ -85,6 +88,8 @@ export function renderMind(input: RenderMindInput): string {
 		const lines = shownObjectives.map((e) => `- ${safeText(e.text)}`);
 		sections.push(`## Objective (${input.persona})\n${lines.join("\n")}`);
 	}
+	// A pinned north-star silently vanishing is worse than any other overflow — account for it too.
+	if (objectives.length > shownObjectives.length) hidden.push(`+${objectives.length - shownObjectives.length} objective`);
 
 	const ltm = [...rest].sort((a, b) => KIND_PRIORITY[a.kind] - KIND_PRIORITY[b.kind] || byRecency(a, b)).slice(0, budget.ltm);
 	if (ltm.length > 0) {
@@ -111,6 +116,8 @@ export function renderMind(input: RenderMindInput): string {
 	if (input.backlog.length > backlog.length) hidden.push(`+${input.backlog.length - backlog.length} backlog`);
 
 	if (sections.length === 0) return "";
-	if (hidden.length > 0) sections.push(`… ${hidden.join(", ")} not shown — use \`memory recall\` / \`backlog list\``);
+	// A lean (worker) block has the memory/backlog tools withheld and can't recall the overflow, so
+	// don't advertise them — omit the budget footer entirely rather than point at unusable tools.
+	if (hidden.length > 0 && !input.lean) sections.push(`… ${hidden.join(", ")} not shown — use \`memory recall\` / \`backlog list\``);
 	return `<persona-mind persona="${attr(input.persona)}" note="${NOTE}">\n${sections.join("\n")}\n</persona-mind>`;
 }
