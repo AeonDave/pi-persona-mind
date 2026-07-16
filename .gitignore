@@ -1,5 +1,12 @@
 node_modules/
 dist/
+*.tsbuildinfo
 *.log
+.env
+.env.*
 .DS_Store
+Thumbs.db
 .pi/
+
+# Agent working artifacts
+.superpowers/
