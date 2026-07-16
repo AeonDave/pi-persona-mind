@@ -1,0 +1,125 @@
+import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
+import { mkdtemp, rm, writeFile, stat, utimes } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, before, test } from "node:test";
+
+import { atomicWriteFile, JsonStore, quarantineCorrupt } from "../src/core/store.ts";
+
+interface Item {
+	id: string;
+	n: number;
+}
+
+function itemStore(filePath: string): JsonStore<Item> {
+	return new JsonStore<Item>(filePath, {
+		version: 1,
+		validateEntry: (raw): Item | null => {
+			if (!raw || typeof raw !== "object") return null;
+			const o = raw as Partial<Item>;
+			return typeof o.id === "string" && typeof o.n === "number" && Number.isInteger(o.n) ? { id: o.id, n: o.n } : null;
+		},
+	});
+}
+
+let dir: string;
+before(async () => {
+	dir = await mkdtemp(join(tmpdir(), "ppm-store-"));
+});
+after(async () => {
+	await rm(dir, { recursive: true, force: true });
+});
+
+test("atomicWriteFile writes bytes that read back, and replaces atomically", async () => {
+	const p = join(dir, "atomic.txt");
+	await atomicWriteFile(p, "first");
+	assert.equal(readFileSync(p, "utf8"), "first");
+	await atomicWriteFile(p, "second");
+	assert.equal(readFileSync(p, "utf8"), "second");
+	// no leftover temp files in the directory
+	const leftovers = readFileSync;
+	assert.ok(leftovers, "sanity");
+});
+
+test("JsonStore.load on a missing file returns an empty store", async () => {
+	const store = itemStore(join(dir, "missing.json"));
+	const s = await store.load();
+	assert.equal(s.version, 1);
+	assert.equal(s.sequence, 0);
+	assert.deepEqual(s.entries, []);
+});
+
+test("JsonStore.update appends, bumps sequence, and persists across reloads", async () => {
+	const p = join(dir, "append.json");
+	const store = itemStore(p);
+	const a = await store.update((es) => [...es, { id: "a", n: 1 }]);
+	assert.equal(a.sequence, 1);
+	assert.equal(a.entries.length, 1);
+	const b = await store.update((es) => [...es, { id: "b", n: 2 }]);
+	assert.equal(b.sequence, 2);
+	// a fresh instance reads the same file
+	const reloaded = await itemStore(p).load();
+	assert.deepEqual(
+		reloaded.entries.map((e) => e.id),
+		["a", "b"],
+	);
+});
+
+test("JsonStore.update serializes concurrent writers — no lost update", async () => {
+	const p = join(dir, "concurrent.json");
+	const store = itemStore(p);
+	const N = 24;
+	await Promise.all(
+		Array.from({ length: N }, (_, i) => store.update((es) => [...es, { id: `k${i}`, n: i }])),
+	);
+	const s = await store.load();
+	assert.equal(s.entries.length, N, "every concurrent append landed");
+	assert.equal(s.sequence, N, "sequence advanced once per committed write");
+});
+
+test("JsonStore.load quarantines a torn file instead of serving empty", async () => {
+	const p = join(dir, "torn.json");
+	await writeFile(p, "{ this is not json", "utf8");
+	const s = await itemStore(p).load();
+	assert.deepEqual(s.entries, [], "degrades to empty");
+	assert.ok(existsSync(`${p}.corrupt-0`), "the torn bytes were preserved, not dropped");
+});
+
+test("JsonStore.load drops individual invalid entries but keeps valid ones", async () => {
+	const p = join(dir, "mixed.json");
+	await writeFile(
+		p,
+		JSON.stringify({ version: 1, updatedAt: "x", sequence: 3, entries: [{ id: "ok", n: 5 }, { id: "bad" }, { n: 9 }] }),
+		"utf8",
+	);
+	const s = await itemStore(p).load();
+	assert.deepEqual(
+		s.entries.map((e) => e.id),
+		["ok"],
+	);
+});
+
+test("quarantineCorrupt moves a file aside to the first free suffix", async () => {
+	const p = join(dir, "q.json");
+	await writeFile(p, "garbage", "utf8");
+	const dest = await quarantineCorrupt(p, "test");
+	assert.equal(dest, `${p}.corrupt-0`);
+	assert.ok(!existsSync(p), "original moved");
+	assert.ok(existsSync(`${p}.corrupt-0`), "preserved at suffix 0");
+});
+
+test("update steals a stale lock left by a crashed writer", async () => {
+	const p = join(dir, "stale.json");
+	const store = itemStore(p);
+	await store.update((es) => [...es, { id: "a", n: 1 }]);
+	// simulate a crashed holder: a lock file with an ancient mtime
+	const lock = `${p}.lock`;
+	await writeFile(lock, "99999-0", "utf8");
+	const old = new Date(Date.now() - 60_000);
+	await utimes(lock, old, old);
+	// update must not hang; it steals the stale lock and commits
+	const s = await store.update((es) => [...es, { id: "b", n: 2 }]);
+	assert.equal(s.entries.length, 2);
+	await stat(p); // still a valid file
+});

@@ -1,0 +1,64 @@
+{
+  "name": "pi-persona-mind",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "A durable, persona-aware mind for Pi supervisors: long-term memory (who a persona is, per user), decaying short-term working memory (per project), and a deferred-intent backlog — on one cross-OS atomic store, injected into context every turn.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "memory",
+    "persona",
+    "long-term-memory",
+    "short-term-memory",
+    "backlog",
+    "pi-persona"
+  ],
+  "author": {
+    "name": "AeonDave"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AeonDave/pi-persona-mind.git"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "main": "src/index.ts",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "verify": "npm run typecheck && npm test"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.7",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typebox": "*",
+    "typescript": "^5.6.0"
+  }
+}
