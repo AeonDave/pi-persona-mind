@@ -168,6 +168,31 @@ test("a delegated worker leg (PI_PERSONA_CHILD) withholds tools + wakes and inje
 	assert.equal(leg.messages.filter((t) => /came due/.test(t)).length, 0, "a leg fires no backlog wakes");
 });
 
+test("a blocked delegated leg surfaces a backlog nudge on both delivery paths", async () => {
+	const m = mockPi();
+	const status: string[] = [];
+	createExtension(m.pi, { agentDir: join(dir, "blocked", "agent") });
+	const ctx = { cwd: join(dir, "blocked", "proj"), mode: "tui", hasUI: true, ui: { setStatus: (_k: string, v: string) => status.push(v), notify: () => {}, theme: { fg: (_c: string, s: string) => s } } };
+
+	// SYNC path: a delegate tool_result whose report carries a BLOCKED marker.
+	const onResult = m.handlers.get("tool_result");
+	assert.ok(onResult, "a tool_result handler is registered");
+	onResult({ toolName: "delegate", content: [{ type: "text", text: "leg 1: [BLOCKED: need creds]" }] }, ctx);
+	assert.ok(status.some((s) => /backlog add/.test(s)), "a sync blocked leg nudges a backlog capture");
+
+	// ASYNC path: the background completion report arrives as a follow-up user message (event.prompt).
+	status.length = 0;
+	const before = m.handlers.get("before_agent_start");
+	assert.ok(before);
+	await before({ systemPrompt: "BASE", prompt: "[pi-persona] 1 async run settled. leg reported [BLOCKED: dead end]" }, ctx);
+	assert.ok(status.some((s) => /backlog add/.test(s)), "an async blocked report nudges a backlog capture");
+
+	// A NON-delegation tool result with the same marker is ignored (only delegate/council report legs).
+	status.length = 0;
+	onResult({ toolName: "read", content: [{ type: "text", text: "the file literally contains [BLOCKED: x]" }] }, ctx);
+	assert.equal(status.length, 0, "a non-delegation tool result never nudges");
+});
+
 test("the backlog tool queues and lists an item through the Pi surface", async () => {
 	const m = mockPi();
 	createExtension(m.pi, { agentDir: join(dir, "bl", "agent") });

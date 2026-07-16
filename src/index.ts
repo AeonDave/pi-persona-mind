@@ -15,6 +15,7 @@ import { hostname } from "node:os";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
+import { detectBlockedLeg } from "./core/blocked.ts";
 import { detectCaptureCue } from "./core/capture.ts";
 import { resolveScope } from "./core/scope.ts";
 import { MindService } from "./core/service.ts";
@@ -179,6 +180,18 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		}
 	};
 
+	// A delegated leg came back BLOCKED — surface it as a backlog candidate (deterministic, nudge-only,
+	// never auto-writes). Reached on BOTH delivery paths: the sync delegate/council tool_result, and the
+	// v1.5.0 background-default path where the report arrives as a follow-up user message (before_agent_start).
+	const nudgeBlocked = (ctx: ExtensionContext, snippet: string): void => {
+		try {
+			const hint = `⚠️ a delegated leg reported ${snippet} — \`backlog add\` so the thread isn't lost`;
+			ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme ? ctx.ui.theme.fg("accent", hint) : hint);
+		} catch {
+			/* cosmetic */
+		}
+	};
+
 	// Inject the mind into every turn. before_agent_start re-fires after compaction, so this is also
 	// how memory survives compaction: it re-injects from disk. Fail-open: a stalled read (slow disk,
 	// lock contention) degrades to no injection rather than hanging the turn.
@@ -187,12 +200,21 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		// preference/instruction, surface a gentle hint on the status line (no LLM, no auto-write).
 		// Supervisor-only: a worker has no memory tools to act on it, and its "prompt" is a task packet.
 		if (nudgeEnabled && !isDelegatedLeg) {
-			const cue = detectCaptureCue(event.prompt);
-			if (cue) {
-				try {
-					ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme ? ctx.ui.theme.fg("accent", `💡 worth remembering? memory remember (${cue.kind})`) : `💡 worth remembering? (${cue.kind})`);
-				} catch {
-					/* cosmetic */
+			// A delegated leg that came back BLOCKED arrives HERE on the v1.5.0 async/background-default
+			// path: pi-persona delivers the completion report as a fresh follow-up user message, so it
+			// shows up as event.prompt (not a delegate tool_result). A blocked leg is deferred intent —
+			// nudge a backlog capture so the thread isn't lost. This takes precedence over the capture cue.
+			const blocked = detectBlockedLeg(event.prompt);
+			if (blocked) {
+				nudgeBlocked(ctx, blocked.snippet);
+			} else {
+				const cue = detectCaptureCue(event.prompt);
+				if (cue) {
+					try {
+						ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme ? ctx.ui.theme.fg("accent", `💡 worth remembering? memory remember (${cue.kind})`) : `💡 worth remembering? (${cue.kind})`);
+					} catch {
+						/* cosmetic */
+					}
 				}
 			}
 		}
@@ -205,6 +227,19 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		}
 		if (block) return { systemPrompt: `${event.systemPrompt}\n\n${block}` };
 		return;
+	});
+
+	// The SYNC delegation path: a `delegate`/`council` tool_result whose report carries a BLOCKED/UNKNOWN
+	// marker (the async/background default lands in before_agent_start above). No result mutation — just a
+	// status-line nudge — so it composes cleanly alongside pi-persona's own tool_result hook.
+	const REPORT_TOOLS = new Set(["delegate", "council"]);
+	pi.on("tool_result", (event, ctx) => {
+		if (!nudgeEnabled || isDelegatedLeg) return undefined;
+		if (!REPORT_TOOLS.has(event.toolName)) return undefined;
+		const text = event.content.reduce((s, c) => (c.type === "text" ? s + c.text : s), "");
+		const blocked = detectBlockedLeg(text);
+		if (blocked) nudgeBlocked(ctx, blocked.snippet);
+		return undefined;
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
