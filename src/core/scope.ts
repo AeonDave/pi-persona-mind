@@ -52,18 +52,35 @@ export function parsePersonaState(raw: string | undefined): string | null {
 }
 
 /** The internal scope names a real persona must never be allowed to occupy (they back the shared
- *  tier and the no-persona fallback; a collision would bleed private↔shared memory or merge scopes). */
+ *  tier and the no-persona fallback; a collision would bleed private↔shared memory or merge scopes).
+ *  Compared case-insensitively — a case-insensitive filesystem aliases `_SHARED.json` to `_shared.json`. */
 const RESERVED_SCOPES: ReadonlySet<string> = new Set([DEFAULT_PERSONA, SHARED_SCOPE]);
 
-/** A filesystem-safe single path segment for a persona name (no separators, no traversal). A name
- *  that sanitizes onto an internal sentinel is prefixed so it can never hijack that reserved store. */
+/** Windows reserved device base names: `NUL.json`/`CON.json`/… resolve to the device (a silent
+ *  write-to-void) in legacy Win32 path resolution, so a persona named after one must not be a filename. */
+const WIN_RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+
+function isReservedSegment(s: string): boolean {
+	return RESERVED_SCOPES.has(s.toLowerCase()) || WIN_RESERVED.test(s);
+}
+
+/** A stable 12-hex content id for a persona name, used when it has no filesystem-safe characters. */
+function personaHash(name: string): string {
+	return createHash("sha256").update(name).digest("hex").slice(0, 12);
+}
+
+/** A filesystem-safe single path segment for a persona name (no separators, no traversal). Two hazards
+ *  are guarded: a name with no safe characters (CJK/Cyrillic/emoji) would collapse to one sentinel and
+ *  merge every such persona (and the no-persona scope) — it gets a stable content-derived segment; and a
+ *  name that lands on an internal sentinel or a Windows device name is prefixed so it can never hijack
+ *  that reserved store. */
 export function sanitizePersona(name: string): string {
 	const s = name
 		.replace(/[^a-zA-Z0-9._-]+/g, "-")
 		.replace(/^[-.]+|[-.]+$/g, "")
 		.slice(0, 64);
-	if (!s) return DEFAULT_PERSONA;
-	return RESERVED_SCOPES.has(s) ? `persona-${s}` : s;
+	if (!s) return `persona-${personaHash(name)}`;
+	return isReservedSegment(s) ? `persona-${s}` : s;
 }
 
 /**
@@ -85,8 +102,24 @@ export function personaStateFile(agentDir: string, env: NodeJS.ProcessEnv = proc
  */
 export function preferredAgentDir(explicit: string | undefined, env: NodeJS.ProcessEnv = process.env): string | undefined {
 	if (explicit !== undefined) return explicit;
-	const override = env.PI_AGENT_DIR?.trim();
+	// Raw value with a truthiness check, exactly as pi-persona does (`PI_AGENT_DIR || getAgentDir()`);
+	// trimming here would make the two extensions resolve different dirs for a padded value.
+	const override = env.PI_AGENT_DIR;
 	return override ? override : undefined;
+}
+
+/**
+ * The persona the mind should scope to, mirroring pi-persona's own restore precedence
+ * (`defaultPersona ?? (persist ? readLastPersona() : undefined)`): the `PI_PERSONA_DEFAULT` env pin
+ * wins, else the on-disk marker when persistence is on (`PI_PERSONA_PERSIST` ≠ "off"), else the default
+ * scope. Mirroring it keeps the mind from injecting or writing a different persona's memory than the one
+ * pi-persona actually activated (an env-pinned or persist-off session would otherwise trust a stale marker).
+ */
+export function activePersona(agentDir: string, env: NodeJS.ProcessEnv = process.env): string {
+	const pin = env.PI_PERSONA_DEFAULT?.trim();
+	const persist = env.PI_PERSONA_PERSIST?.trim().toLowerCase() !== "off";
+	const named = pin ? pin : persist ? parsePersonaState(tryRead(personaStateFile(agentDir, env))) : null;
+	return named ? sanitizePersona(named) : DEFAULT_PERSONA;
 }
 
 /** A stable per-project store name: sanitized basename + a 24-hex hash of the canonical path. */
@@ -133,8 +166,7 @@ function tryRead(path: string): string | undefined {
 
 /** Resolve the full scope for a turn: active persona, project root, and the store paths. */
 export function resolveScope(agentDir: string, cwd: string): Scope {
-	const named = parsePersonaState(tryRead(personaStateFile(agentDir)));
-	const persona = named === null ? DEFAULT_PERSONA : sanitizePersona(named);
+	const persona = activePersona(agentDir);
 	const projectRoot = findProjectRoot(resolve(cwd), (d) => existsSync(join(d, ".git")));
 	const slug = projectSlug(projectRoot);
 	return { persona, projectRoot, slug, paths: mindPaths(agentDir, persona, slug) };

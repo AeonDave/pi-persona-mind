@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 
-import { findProjectRoot, mindPaths, parsePersonaState, personaStateFile, preferredAgentDir, projectSlug, resolveScope, sanitizePersona } from "../src/core/scope.ts";
+import { activePersona, findProjectRoot, mindPaths, parsePersonaState, personaStateFile, preferredAgentDir, projectSlug, resolveScope, sanitizePersona } from "../src/core/scope.ts";
 
 test("parsePersonaState reads a named lastPersona, else null (absent/invalid)", () => {
 	assert.equal(parsePersonaState(JSON.stringify({ lastPersona: "elite" })), "elite");
@@ -19,25 +19,64 @@ test("sanitizePersona keeps safe names, neutralizes separators, and reserves int
 	assert.equal(sanitizePersona("elite"), "elite");
 	assert.equal(sanitizePersona("a/b c"), "a-b-c");
 	assert.equal(sanitizePersona("../escape"), "escape");
-	assert.equal(sanitizePersona(""), "_default");
 	// A REAL persona must never map onto an internal sentinel file: `_shared.json` is the cross-persona
 	// shared tier and `_default.json` is the no-persona fallback — a persona landing on either would bleed
 	// private↔shared memory or silently merge two scopes. Disambiguate with a prefix.
 	assert.equal(sanitizePersona("_shared"), "persona-_shared");
 	assert.equal(sanitizePersona("_default"), "persona-_default");
+	// The reserve check is case-INSENSITIVE: on a case-insensitive FS `_SHARED.json` is the same physical
+	// file as `_shared.json`, so a case-variant must be disambiguated off the sentinel too.
+	assert.equal(sanitizePersona("_SHARED"), "persona-_SHARED");
+	assert.equal(sanitizePersona("_Default"), "persona-_Default");
+	// Windows reserved device names would resolve `NUL.json` to the device (silent void) on Win≤10.
+	assert.equal(sanitizePersona("NUL"), "persona-NUL");
+	assert.equal(sanitizePersona("com1"), "persona-com1");
+});
+
+test("sanitizePersona gives a non-Latin name a stable, unique segment (never collapses to _default)", () => {
+	// Names with zero filesystem-safe chars used to sanitize to "" → DEFAULT_PERSONA, merging every
+	// CJK/Cyrillic/emoji persona with each other AND with the no-persona fallback scope.
+	const jp = sanitizePersona("日本語アシスタント");
+	const ru = sanitizePersona("Анна");
+	const emoji = sanitizePersona("🔥");
+	for (const seg of [jp, ru, emoji]) {
+		assert.notEqual(seg, "_default", "a real persona must never land on the no-persona sentinel");
+		assert.match(seg, /^persona-[0-9a-f]{8,}$/, "a stable content-derived segment");
+	}
+	assert.notEqual(jp, ru);
+	assert.notEqual(ru, emoji);
+	assert.notEqual(jp, emoji);
+	assert.equal(sanitizePersona("日本語アシスタント"), jp, "deterministic across calls");
+});
+
+test("preferredAgentDir mirrors pi-persona's raw `PI_AGENT_DIR || getAgentDir()` (no trim, avoids desync)", () => {
+	assert.equal(preferredAgentDir("/explicit", { PI_AGENT_DIR: "/env" }), "/explicit");
+	assert.equal(preferredAgentDir(undefined, { PI_AGENT_DIR: "/env" }), "/env");
+	// pi-persona uses the raw value with a truthiness check — so does the mind, to resolve to the same dir.
+	assert.equal(preferredAgentDir(undefined, { PI_AGENT_DIR: "  /padded/dir  " }), "  /padded/dir  ");
+	assert.equal(preferredAgentDir(undefined, { PI_AGENT_DIR: "" }), undefined);
+	assert.equal(preferredAgentDir(undefined, {}), undefined);
+});
+
+test("activePersona mirrors pi-persona's precedence: PI_PERSONA_DEFAULT > (persist ? marker : none)", async () => {
+	const agentDir = join(dir, "active-agent");
+	await mkdir(join(agentDir, "persona"), { recursive: true });
+	await writeFile(join(agentDir, "persona", "state.json"), JSON.stringify({ lastPersona: "ada" }), "utf8");
+
+	// Marker only: persist defaults on, no pin → the marker persona.
+	assert.equal(activePersona(agentDir, {}), "ada");
+	// Env pin wins over the marker (pi-persona activates the pin, so the mind must scope to it).
+	assert.equal(activePersona(agentDir, { PI_PERSONA_DEFAULT: "grace" }), "grace");
+	// persist=off: pi-persona neither reads nor writes the marker, so the mind must not trust it either.
+	assert.equal(activePersona(agentDir, { PI_PERSONA_PERSIST: "off" }), "_default");
+	// persist=off but an env pin is set → the pin still wins.
+	assert.equal(activePersona(agentDir, { PI_PERSONA_PERSIST: "off", PI_PERSONA_DEFAULT: "grace" }), "grace");
 });
 
 test("personaStateFile honors pi-persona's PI_PERSONA_STATE_FILE, else <agentDir>/persona/state.json", () => {
 	assert.equal(personaStateFile("/agent", { PI_PERSONA_STATE_FILE: "/custom/state.json" }), "/custom/state.json");
 	assert.equal(personaStateFile("/agent", { PI_PERSONA_STATE_FILE: "   " }), join("/agent", "persona", "state.json"));
 	assert.equal(personaStateFile("/agent", {}), join("/agent", "persona", "state.json"));
-});
-
-test("preferredAgentDir: an explicit override wins, else PI_AGENT_DIR, else undefined (caller falls back to getAgentDir)", () => {
-	assert.equal(preferredAgentDir("/explicit", { PI_AGENT_DIR: "/env" }), "/explicit");
-	assert.equal(preferredAgentDir(undefined, { PI_AGENT_DIR: "/env" }), "/env");
-	assert.equal(preferredAgentDir(undefined, { PI_AGENT_DIR: "   " }), undefined);
-	assert.equal(preferredAgentDir(undefined, {}), undefined);
 });
 
 test("projectSlug is a deterministic slug + 24-hex hash", () => {
