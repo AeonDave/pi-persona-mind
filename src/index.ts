@@ -120,13 +120,16 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	const ownerToken = `${hostname()}:${process.pid}:${++ownerInstanceSeq}`;
 	const getMind = (ctx: ExtensionContext): MindService => new MindService(resolveScope(agentDir, ctx.cwd));
 
-	// A DELEGATED worker leg? pi-persona disables ITSELF in sub-agent sessions (fork-bomb guard) via
-	// PI_PERSONA_DISABLE (in-process, set transiently around session creation) / PI_PERSONA_CHILD
-	// (child process, set for its whole lifetime). Sampled HERE at factory time because the in-process
-	// flag is popped before the turn runs. A worker is not the persona: it inherits only the lean mind
-	// (north-star + identity — see buildInjection), and must NOT manage the supervisor's memory or fire
-	// its wakes. Absent the flags (the normal supervisor), everything runs full — behavior is unchanged.
-	const isDelegatedLeg = process.env.PI_PERSONA_DISABLE === "1" || process.env.PI_PERSONA_CHILD === "1";
+	// A DELEGATED worker leg? pi-persona (≥ 1.5.2) marks its sub-agent sessions with a DEDICATED marker,
+	// PI_PERSONA_LEG=1 — the in-process fork-bomb guard sets it transiently around session creation, and
+	// the child engine puts it in the spawn env (a child process also carries PI_PERSONA_CHILD=1). We key
+	// on those, NOT on PI_PERSONA_DISABLE: that flag is ALSO pi-persona's user-facing kill switch, so a
+	// user who disables pi-persona interactively is a supervisor running the mind standalone — not a leg,
+	// and it must keep its memory tools. Sampled HERE at factory time (the in-process marker is popped
+	// before the turn runs). A worker is not the persona: it inherits only the lean mind (north-star +
+	// identity — see buildInjection) and must NOT manage the supervisor's memory or fire its wakes. Absent
+	// the markers (the normal supervisor, or a user kill switch), everything runs full — behavior unchanged.
+	const isDelegatedLeg = process.env.PI_PERSONA_LEG === "1" || process.env.PI_PERSONA_CHILD === "1";
 
 	// Withhold the write tools from a worker: a leg reading/writing the supervisor persona's LTM/STM/
 	// backlog is exactly the bleed we prevent. It still INHERITS the lean block below (read-only, curated).

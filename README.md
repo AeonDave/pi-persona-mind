@@ -72,7 +72,9 @@ never carries — or pollutes — the supervisor's memory:
 - **Delegated legs inherit only the lean mind** — a worker sub-agent gets the north-star + durable
   identity (long-term) only; the supervisor's working-context and backlog are dropped, the `memory`/
   `backlog` tools are withheld (no writes), and no wakes fire. A worker inherits *who the persona is*,
-  not its project state. Detected via the same flags pi-persona sets on its children.
+  not its project state. Detected via the dedicated `PI_PERSONA_LEG` marker pi-persona (≥ 1.5.2) sets
+  on a delegated leg — distinct from its user-facing kill switch, so disabling pi-persona yourself keeps
+  the mind running standalone rather than treating your session as a stripped-down worker.
 - **A blocked leg becomes a backlog candidate** — when a delegated leg comes back `[BLOCKED]` /
   `FLAG: UNKNOWN`, a deterministic status-line nudge suggests `backlog add` so the thread isn't lost
   (on both the sync tool result and the async completion report; `PI_PERSONA_MIND_NUDGE=off` disables).

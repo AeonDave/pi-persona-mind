@@ -215,8 +215,8 @@ pi-persona v1.5.0 made background delegation the default, so a supervisor now sp
 sessions routinely. Two deterministic, model-free changes make the mind delegation-aware:
 
 - **Lean inheritance for delegated legs** — a sub-agent session loads this extension too (pi-persona
-  only disables itself in children). Detected at factory time via the same flags pi-persona sets on a
-  child (`PI_PERSONA_DISABLE` in-process / `PI_PERSONA_CHILD` child-process), a worker leg now: injects
+  only disables itself in children). Detected at factory time via the dedicated marker pi-persona sets
+  on a leg (`PI_PERSONA_LEG`, plus `PI_PERSONA_CHILD` for a child process — see v0.4.1), a worker leg now: injects
   a **lean** `<persona-mind>` block — the north-star + durable identity (long-term) ONLY, dropping the
   supervisor's working-context and backlog; **withholds** the `memory`/`backlog` tools (no writes into
   the supervisor persona's stores); and **fires no wakes**. A worker inherits *who the persona is*, not
@@ -268,6 +268,18 @@ covered by tests.
 **Memory ops (`service.ts`):** `recall` dedupes a fact stored in both tiers by id (no double count);
 `promote` writes long-term before removing short-term, so a crash leaves a harmless duplicate, not a loss.
 
+## v0.4.1 — dedicated delegated-leg marker
+
+Closes the `PI_PERSONA_DISABLE` detection nuance (was a v0.4 known-limitation). pi-persona ≥ 1.5.2 sets
+a **dedicated** `PI_PERSONA_LEG=1` marker on every delegated worker leg (the in-process fork-bomb guard
+sets it transiently around session creation; the child engine puts it in the spawn env), distinct from
+`PI_PERSONA_DISABLE` — which doubles as pi-persona's user-facing kill switch. The mind now keys leg
+detection on `PI_PERSONA_LEG` (+ `PI_PERSONA_CHILD` for a child process), never on `PI_PERSONA_DISABLE`.
+So a user who disables pi-persona interactively is correctly treated as a **supervisor running the mind
+standalone** (full mind, memory tools present), not a lean worker with its tools withheld. Child-process
+legs still resolve via `PI_PERSONA_CHILD` on any pi-persona version; clean in-process leg detection needs
+pi-persona ≥ 1.5.2.
+
 ### Known limitations (documented, not yet fixed)
 
 Real but bounded; a robust fix would migrate existing on-disk stores or needs a cross-repo change with
@@ -279,10 +291,6 @@ pi-persona. Tracked for a later pass:
 - **Project-slug case / junction split.** `projectSlug` hashes the resolved cwd without realpath or
   case folding, so the same project reached via a different drive-letter case, a junction/subst, or a
   symlink gets a separate STM/backlog store. Recovered by launching from the canonical path.
-- **`PI_PERSONA_DISABLE` detection nuance.** A worker leg is detected via `PI_PERSONA_DISABLE` /
-  `PI_PERSONA_CHILD`. A user who sets `PI_PERSONA_DISABLE` as a kill switch (not a delegation marker),
-  or an unusual non-`"1"` value, can be mis-classified. Cleanly separating the kill switch from the
-  in-process delegation marker needs a dedicated pi-persona leg signal.
 - **Blocked-leg nudge coverage.** The capture nudge fires on the sync `delegate`/`council` result and
   the async follow-up report, but not on secondary collection paths (`intercom wait`, `flow`, a
   mandatory-orchestration system-prompt injection).

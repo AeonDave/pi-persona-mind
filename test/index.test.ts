@@ -169,6 +169,42 @@ test("a delegated worker leg (PI_PERSONA_CHILD) withholds tools + wakes and inje
 	assert.equal(leg.messages.filter((t) => /came due/.test(t)).length, 0, "a leg fires no backlog wakes");
 });
 
+test("PI_PERSONA_LEG marks a delegated leg — the mind withholds its write tools", () => {
+	const prev = process.env.PI_PERSONA_LEG;
+	process.env.PI_PERSONA_LEG = "1";
+	const leg = mockPi();
+	try {
+		createExtension(leg.pi, { agentDir: join(dir, "legmarker", "agent") });
+	} finally {
+		if (prev === undefined) delete process.env.PI_PERSONA_LEG;
+		else process.env.PI_PERSONA_LEG = prev;
+	}
+	assert.equal(leg.tools.has("memory"), false, "a PI_PERSONA_LEG leg registers no memory tool");
+	assert.equal(leg.tools.has("backlog"), false, "a PI_PERSONA_LEG leg registers no backlog tool");
+});
+
+test("PI_PERSONA_DISABLE alone (a user kill switch, no leg marker) is NOT a leg — the mind runs full", () => {
+	const prevDisable = process.env.PI_PERSONA_DISABLE;
+	const prevLeg = process.env.PI_PERSONA_LEG;
+	const prevChild = process.env.PI_PERSONA_CHILD;
+	process.env.PI_PERSONA_DISABLE = "1"; // pi-persona's kill switch — NOT a delegation marker
+	delete process.env.PI_PERSONA_LEG;
+	delete process.env.PI_PERSONA_CHILD;
+	const sup = mockPi();
+	try {
+		createExtension(sup.pi, { agentDir: join(dir, "killswitch", "agent") });
+	} finally {
+		if (prevDisable === undefined) delete process.env.PI_PERSONA_DISABLE;
+		else process.env.PI_PERSONA_DISABLE = prevDisable;
+		if (prevLeg === undefined) delete process.env.PI_PERSONA_LEG;
+		else process.env.PI_PERSONA_LEG = prevLeg;
+		if (prevChild === undefined) delete process.env.PI_PERSONA_CHILD;
+		else process.env.PI_PERSONA_CHILD = prevChild;
+	}
+	assert.equal(sup.tools.has("memory"), true, "a user who disabled pi-persona still gets the mind's tools (standalone)");
+	assert.equal(sup.tools.has("backlog"), true, "backlog tool present for a kill-switch supervisor too");
+});
+
 test("a blocked delegated leg surfaces a backlog nudge on both delivery paths", async () => {
 	const m = mockPi();
 	const status: string[] = [];
