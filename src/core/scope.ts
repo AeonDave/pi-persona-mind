@@ -38,24 +38,55 @@ export interface Scope {
 	paths: ScopePaths;
 }
 
-/** Read pi-persona's `{ lastPersona }` marker; anything missing/invalid ⇒ the default scope. */
-export function parsePersonaState(raw: string | undefined): string {
-	if (raw === undefined) return DEFAULT_PERSONA;
+/** Read pi-persona's `{ lastPersona }` marker; the selected persona NAME, or null when none is
+ *  selected / the marker is missing or invalid (the caller maps null to the {@link DEFAULT_PERSONA}
+ *  scope). Kept distinct from a persona literally *named* `_default`, which must not merge with it. */
+export function parsePersonaState(raw: string | undefined): string | null {
+	if (raw === undefined) return null;
 	try {
 		const parsed = JSON.parse(raw) as { lastPersona?: unknown };
-		return typeof parsed.lastPersona === "string" && parsed.lastPersona.trim() ? parsed.lastPersona : DEFAULT_PERSONA;
+		return typeof parsed.lastPersona === "string" && parsed.lastPersona.trim() ? parsed.lastPersona : null;
 	} catch {
-		return DEFAULT_PERSONA;
+		return null;
 	}
 }
 
-/** A filesystem-safe single path segment for a persona name (no separators, no traversal). */
+/** The internal scope names a real persona must never be allowed to occupy (they back the shared
+ *  tier and the no-persona fallback; a collision would bleed private↔shared memory or merge scopes). */
+const RESERVED_SCOPES: ReadonlySet<string> = new Set([DEFAULT_PERSONA, SHARED_SCOPE]);
+
+/** A filesystem-safe single path segment for a persona name (no separators, no traversal). A name
+ *  that sanitizes onto an internal sentinel is prefixed so it can never hijack that reserved store. */
 export function sanitizePersona(name: string): string {
 	const s = name
 		.replace(/[^a-zA-Z0-9._-]+/g, "-")
 		.replace(/^[-.]+|[-.]+$/g, "")
 		.slice(0, 64);
-	return s || DEFAULT_PERSONA;
+	if (!s) return DEFAULT_PERSONA;
+	return RESERVED_SCOPES.has(s) ? `persona-${s}` : s;
+}
+
+/**
+ * Where pi-persona keeps its active-persona marker. Honors pi-persona's OWN override
+ * (`PI_PERSONA_STATE_FILE`) so the two extensions never disagree about the marker's location and
+ * the mind silently scopes to the wrong persona; absent it, the conventional
+ * `<agentDir>/persona/state.json`. Env is injectable for tests.
+ */
+export function personaStateFile(agentDir: string, env: NodeJS.ProcessEnv = process.env): string {
+	const override = env.PI_PERSONA_STATE_FILE?.trim();
+	return override ? override : join(agentDir, "persona", "state.json");
+}
+
+/**
+ * The agent dir the mind should use, mirroring pi-persona's own `PI_AGENT_DIR || getAgentDir()`
+ * precedence so both extensions co-locate their data: an explicit override (tests) wins, else
+ * `PI_AGENT_DIR`, else `undefined` — signalling the caller to fall back to Pi's `getAgentDir()`
+ * (kept lazy so tests that inject a dir never invoke the SDK). Env is injectable for tests.
+ */
+export function preferredAgentDir(explicit: string | undefined, env: NodeJS.ProcessEnv = process.env): string | undefined {
+	if (explicit !== undefined) return explicit;
+	const override = env.PI_AGENT_DIR?.trim();
+	return override ? override : undefined;
 }
 
 /** A stable per-project store name: sanitized basename + a 24-hex hash of the canonical path. */
@@ -102,7 +133,8 @@ function tryRead(path: string): string | undefined {
 
 /** Resolve the full scope for a turn: active persona, project root, and the store paths. */
 export function resolveScope(agentDir: string, cwd: string): Scope {
-	const persona = sanitizePersona(parsePersonaState(tryRead(join(agentDir, "persona", "state.json"))));
+	const named = parsePersonaState(tryRead(personaStateFile(agentDir)));
+	const persona = named === null ? DEFAULT_PERSONA : sanitizePersona(named);
 	const projectRoot = findProjectRoot(resolve(cwd), (d) => existsSync(join(d, ".git")));
 	const slug = projectSlug(projectRoot);
 	return { persona, projectRoot, slug, paths: mindPaths(agentDir, persona, slug) };

@@ -17,7 +17,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 import { detectBlockedLeg } from "./core/blocked.ts";
 import { detectCaptureCue } from "./core/capture.ts";
-import { resolveScope } from "./core/scope.ts";
+import { preferredAgentDir, resolveScope } from "./core/scope.ts";
 import { MindService } from "./core/service.ts";
 import { registerBacklogTool } from "./tools/backlog.ts";
 import { registerMemoryTool } from "./tools/memory.ts";
@@ -98,7 +98,10 @@ function withDeadline<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
 
 /** Build the extension. Exported (separately from the default factory) so tests can inject agentDir. */
 export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): void {
-	const agentDir = opts.agentDir ?? getAgentDir();
+	// Mirror pi-persona's own PI_AGENT_DIR precedence so both extensions co-locate their data (and the
+	// mind never reads a stale/missing marker under the wrong root). getAgentDir() stays lazy — only
+	// called when neither an explicit override (tests) nor PI_AGENT_DIR is set.
+	const agentDir = preferredAgentDir(opts.agentDir) ?? getAgentDir();
 	const nudgeEnabled = process.env.PI_PERSONA_MIND_NUDGE !== "off";
 	const ownerToken = `${hostname()}:${process.pid}:${++ownerInstanceSeq}`;
 	const getMind = (ctx: ExtensionContext): MindService => new MindService(resolveScope(agentDir, ctx.cwd));

@@ -4,22 +4,40 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 
-import { findProjectRoot, mindPaths, parsePersonaState, projectSlug, resolveScope, sanitizePersona } from "../src/core/scope.ts";
+import { findProjectRoot, mindPaths, parsePersonaState, personaStateFile, preferredAgentDir, projectSlug, resolveScope, sanitizePersona } from "../src/core/scope.ts";
 
-test("parsePersonaState reads lastPersona, else _default", () => {
+test("parsePersonaState reads a named lastPersona, else null (absent/invalid)", () => {
 	assert.equal(parsePersonaState(JSON.stringify({ lastPersona: "elite" })), "elite");
-	assert.equal(parsePersonaState(JSON.stringify({ lastPersona: null })), "_default");
-	assert.equal(parsePersonaState(JSON.stringify({})), "_default");
-	assert.equal(parsePersonaState("not json"), "_default");
-	assert.equal(parsePersonaState(undefined), "_default");
+	assert.equal(parsePersonaState(JSON.stringify({ lastPersona: null })), null);
+	assert.equal(parsePersonaState(JSON.stringify({ lastPersona: "   " })), null);
+	assert.equal(parsePersonaState(JSON.stringify({})), null);
+	assert.equal(parsePersonaState("not json"), null);
+	assert.equal(parsePersonaState(undefined), null);
 });
 
-test("sanitizePersona keeps safe names and neutralizes path separators", () => {
+test("sanitizePersona keeps safe names, neutralizes separators, and reserves internal scope names", () => {
 	assert.equal(sanitizePersona("elite"), "elite");
-	assert.equal(sanitizePersona("_default"), "_default");
 	assert.equal(sanitizePersona("a/b c"), "a-b-c");
 	assert.equal(sanitizePersona("../escape"), "escape");
 	assert.equal(sanitizePersona(""), "_default");
+	// A REAL persona must never map onto an internal sentinel file: `_shared.json` is the cross-persona
+	// shared tier and `_default.json` is the no-persona fallback — a persona landing on either would bleed
+	// private↔shared memory or silently merge two scopes. Disambiguate with a prefix.
+	assert.equal(sanitizePersona("_shared"), "persona-_shared");
+	assert.equal(sanitizePersona("_default"), "persona-_default");
+});
+
+test("personaStateFile honors pi-persona's PI_PERSONA_STATE_FILE, else <agentDir>/persona/state.json", () => {
+	assert.equal(personaStateFile("/agent", { PI_PERSONA_STATE_FILE: "/custom/state.json" }), "/custom/state.json");
+	assert.equal(personaStateFile("/agent", { PI_PERSONA_STATE_FILE: "   " }), join("/agent", "persona", "state.json"));
+	assert.equal(personaStateFile("/agent", {}), join("/agent", "persona", "state.json"));
+});
+
+test("preferredAgentDir: an explicit override wins, else PI_AGENT_DIR, else undefined (caller falls back to getAgentDir)", () => {
+	assert.equal(preferredAgentDir("/explicit", { PI_AGENT_DIR: "/env" }), "/explicit");
+	assert.equal(preferredAgentDir(undefined, { PI_AGENT_DIR: "/env" }), "/env");
+	assert.equal(preferredAgentDir(undefined, { PI_AGENT_DIR: "   " }), undefined);
+	assert.equal(preferredAgentDir(undefined, {}), undefined);
 });
 
 test("projectSlug is a deterministic slug + 24-hex hash", () => {
@@ -70,4 +88,29 @@ test("resolveScope reads pi-persona's active persona and locates the project roo
 test("resolveScope degrades to _default when pi-persona is absent", () => {
 	const scope = resolveScope(join(dir, "no-agent"), dir);
 	assert.equal(scope.persona, "_default");
+});
+
+test("resolveScope reads the marker from PI_PERSONA_STATE_FILE, and a persona named _shared never aliases the shared tier", async () => {
+	// The marker lives OUTSIDE <agentDir> — exactly the desync PI_PERSONA_STATE_FILE creates in pi-persona.
+	const agentDir = join(dir, "env-agent");
+	const stateDir = join(dir, "elsewhere");
+	await mkdir(stateDir, { recursive: true });
+	const stateFile = join(stateDir, "custom-state.json");
+	await writeFile(stateFile, JSON.stringify({ lastPersona: "_shared" }), "utf8");
+	const proj = join(dir, "env-proj");
+	await mkdir(join(proj, ".git"), { recursive: true });
+
+	const prev = process.env.PI_PERSONA_STATE_FILE;
+	process.env.PI_PERSONA_STATE_FILE = stateFile;
+	try {
+		const scope = resolveScope(agentDir, proj);
+		// Marker was found at the override path (not <agentDir>/persona/state.json, which does not exist).
+		assert.equal(scope.persona, "persona-_shared", "a persona named _shared is disambiguated off the shared tier");
+		assert.ok(scope.paths.ltm.endsWith(join("ltm", "persona-_shared.json")));
+		assert.ok(scope.paths.shared.endsWith(join("ltm", "_shared.json")));
+		assert.notEqual(scope.paths.ltm, scope.paths.shared, "private LTM must never be the shared tier file");
+	} finally {
+		if (prev === undefined) delete process.env.PI_PERSONA_STATE_FILE;
+		else process.env.PI_PERSONA_STATE_FILE = prev;
+	}
 });
