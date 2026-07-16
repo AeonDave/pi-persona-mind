@@ -65,7 +65,7 @@ test("a remembered fact is injected into the next turn's system prompt", async (
 
 	const before = m.handlers.get("before_agent_start");
 	assert.ok(before);
-	const result = (await before({ systemPrompt: "BASE PROMPT" }, ctx)) as { systemPrompt?: string } | undefined;
+	const result = (await before({ systemPrompt: "BASE PROMPT", prompt: "carry on" }, ctx)) as { systemPrompt?: string } | undefined;
 	assert.ok(result?.systemPrompt, "the turn's system prompt was augmented");
 	assert.match(result.systemPrompt, /BASE PROMPT/);
 	assert.match(result.systemPrompt, /<persona-mind/);
@@ -77,8 +77,52 @@ test("before_agent_start injects nothing when the mind is empty", async () => {
 	createExtension(m.pi, { agentDir: join(dir, "empty", "agent") });
 	const before = m.handlers.get("before_agent_start");
 	assert.ok(before);
-	const result = await before({ systemPrompt: "BASE" }, ctxFor(join(dir, "empty", "proj")));
+	const result = await before({ systemPrompt: "BASE", prompt: "hi" }, ctxFor(join(dir, "empty", "proj")));
 	assert.equal(result, undefined, "no memory ⇒ prompt untouched");
+});
+
+test("a backlog item due while offline is delivered on session_start", async () => {
+	const m = mockPi();
+	const agentDir = join(dir, "wakes", "agent");
+	createExtension(m.pi, { agentDir });
+	const ctx = ctxFor(join(dir, "wakes", "proj"));
+	const backlog = m.tools.get("backlog");
+	assert.ok(backlog);
+	await backlog.execute("t1", { action: "add", text: "re-check the share", dueInSeconds: -60 }, undefined, undefined, ctx);
+	const start = m.handlers.get("session_start");
+	assert.ok(start);
+	await start({}, ctx);
+	assert.ok(
+		m.messages.some((t) => /came due while you were away/.test(t) && /re-check the share/.test(t)),
+		"the missed wake was delivered, not dropped",
+	);
+});
+
+test("only the elected owner session delivers a missed wake (no double-fire)", async () => {
+	const agentDir = join(dir, "owner", "agent");
+	const cwd = join(dir, "owner", "proj");
+	const a = mockPi();
+	createExtension(a.pi, { agentDir });
+	const ctxA = ctxFor(cwd);
+	await a.tools.get("backlog")?.execute("t1", { action: "add", text: "shared lead", dueInSeconds: -60 }, undefined, undefined, ctxA);
+	const b = mockPi();
+	createExtension(b.pi, { agentDir });
+	const ctxB = ctxFor(cwd);
+	await a.handlers.get("session_start")?.({}, ctxA);
+	await b.handlers.get("session_start")?.({}, ctxB);
+	const delivered = a.messages.filter((t) => /came due/.test(t)).length + b.messages.filter((t) => /came due/.test(t)).length;
+	assert.equal(delivered, 1, "exactly one session delivered the missed wake");
+});
+
+test("a durable-preference user message raises the capture nudge on the status line", async () => {
+	const m = mockPi();
+	const status: string[] = [];
+	createExtension(m.pi, { agentDir: join(dir, "nudge", "agent") });
+	const ctx = { cwd: join(dir, "nudge", "proj"), mode: "tui", hasUI: true, ui: { setStatus: (_k: string, v: string) => status.push(v), notify: () => {}, theme: { fg: (_c: string, s: string) => s } } };
+	const before = m.handlers.get("before_agent_start");
+	assert.ok(before);
+	await before({ systemPrompt: "BASE", prompt: "From now on, always use verbose recon logs." }, ctx);
+	assert.ok(status.some((s) => /worth remembering/.test(s)), "the nudge was surfaced");
 });
 
 test("the backlog tool queues and lists an item through the Pi surface", async () => {

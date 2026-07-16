@@ -34,15 +34,19 @@ automatically, and the mind injects into every turn.
 
 ## Tools (agent-facing)
 
-- **`memory`** — `remember { term: long|short, kind, text, tags?, ttlHours?, shared?, supersedes? }`,
-  `recall { query?, scope?, max? }`, `forget { id }`.
+- **`memory`** — `remember { term: long|short, kind, text, tags?, ttlHours?, shared?, source?, supersedes? }`,
+  `recall { query?, scope?, max? }`, `forget { id }`, `promote { id }` (graduate a short-term memory
+  to durable long-term). The `objective` kind is a persona's durable north-star, pinned above the rest.
 - **`backlog`** — `add { text, tags?, dueInSeconds? }`, `list { state?, all? }`, `take { id }`,
   `done { id, note? }`, `drop { id, note? }`.
 
 Facts are stored **declarative, not imperative** ("the user prefers verbose recon", never "always be
-verbose") and every write is scanned for secrets, exfiltration, prompt-injection, and invisible
-unicode before it touches disk. Open backlog items with a `dueInSeconds` arm a durable wake that is
-re-armed across restarts.
+verbose"). Every write **and every injection** is scanned for secrets, exfiltration, prompt-injection,
+deception, and invisible unicode — a flagged entry is withheld with a placeholder rather than
+re-entering the prompt raw. Open backlog items with a `dueInSeconds` arm a durable wake that is
+re-armed across restarts (and one that came due while you were away is delivered on the next start).
+A durable-preference message ("from now on, always…") raises a gentle capture nudge on the status
+line (`PI_PERSONA_MIND_NUDGE=off` to disable).
 
 ## `/mind`
 

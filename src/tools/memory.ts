@@ -16,8 +16,8 @@ import type { MindService, RememberInput } from "../core/service.ts";
 export type GetMind = (ctx: ExtensionContext) => MindService;
 
 const MemoryParams = Type.Object({
-	action: Type.Union([Type.Literal("remember"), Type.Literal("recall"), Type.Literal("forget")], {
-		description: "remember = store a fact · recall = search · forget = delete by id",
+	action: Type.Union([Type.Literal("remember"), Type.Literal("recall"), Type.Literal("forget"), Type.Literal("promote")], {
+		description: "remember = store a fact · recall = search · forget = delete by id · promote = graduate a short-term memory to durable long-term",
 	}),
 	term: Type.Optional(
 		Type.Union([Type.Literal("long"), Type.Literal("short")], {
@@ -43,12 +43,13 @@ const MemoryParams = Type.Object({
 	shared: Type.Optional(
 		Type.Boolean({ description: "remember(long): store in the cross-persona shared tier — facts true for EVERY persona (e.g. the user's OS)" }),
 	),
+	source: Type.Optional(Type.String({ description: "remember: optional human-citable origin of this fact (e.g. 'the user said', 'child scout')" })),
 	query: Type.Optional(Type.String({ description: "recall: keywords (empty = most recent)" })),
 	scope: Type.Optional(
 		Type.Union([Type.Literal("long"), Type.Literal("short"), Type.Literal("both")], { description: "recall: which tier to search (default both)" }),
 	),
 	max: Type.Optional(Type.Number({ description: "recall: maximum results (default 8)" })),
-	id: Type.Optional(Type.String({ description: "forget: the id of the entry to delete" })),
+	id: Type.Optional(Type.String({ description: "forget/promote: the id of the entry" })),
 });
 
 interface ToolResult {
@@ -84,17 +85,28 @@ export function registerMemoryTool(pi: ExtensionAPI, getMind: GetMind): void {
 				if (params.ttlHours !== undefined) input.ttlHours = params.ttlHours;
 				if (params.supersedes) input.supersedes = params.supersedes;
 				if (params.shared) input.toShared = params.shared;
+				if (params.source) input.source = params.source;
 				const r = await mind.remember(input);
 				return r.ok
-					? say(`Remembered ${r.entry.id} — ${params.term}-term ${params.kind}. It will re-appear in your context.`, { id: r.entry.id, ok: true })
+					? say(`Remembered ${r.entry.id} — ${r.entry.expiresAt ? "short" : "long"}-term ${params.kind}. It will re-appear in your context.`, { id: r.entry.id, ok: true })
 					: say(`Not stored: ${r.reason}`, { ok: false, reason: r.reason });
 			}
 
 			if (params.action === "recall") {
-				const hits = await mind.recall(params.query ?? "", params.scope ?? "both", params.max ?? 8);
+				const { hits, total } = await mind.recall(params.query ?? "", params.scope ?? "both", params.max ?? 8);
 				if (hits.length === 0) return say(params.query ? `No memory matches "${params.query}".` : "Your memory is empty.", { count: 0 });
+				const withheld = total - hits.length;
+				const more = withheld > 0 ? `\n… +${withheld} more match(es) — narrow the query or raise max.` : "";
 				const lines = hits.map((e) => `- [${e.id}] (${e.kind}) ${e.text}`);
-				return say(`${hits.length} recalled:\n${lines.join("\n")}`, { count: hits.length, ids: hits.map((e) => e.id) });
+				return say(`${hits.length} recalled${withheld > 0 ? ` of ${total}` : ""}:\n${lines.join("\n")}${more}`, { count: hits.length, total, withheld, ids: hits.map((e) => e.id) });
+			}
+
+			if (params.action === "promote") {
+				if (!params.id) return say("memory promote needs { id } (a short-term memory to make durable).");
+				const r = await mind.promote(params.id);
+				return r.ok
+					? say(`Promoted ${params.id} to long-term — it will no longer decay.`, { ok: true, id: params.id })
+					: say(`No short-term memory with id "${params.id}".`, { ok: false });
 			}
 
 			// forget

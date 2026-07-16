@@ -18,7 +18,8 @@
  * The pattern is adapted from OpenLore's `atomic-store.ts` (clay-good/openlore, MIT).
  */
 
-import { access, link, mkdir, open, readFile, rename, stat, unlink } from "node:fs/promises";
+import { access, copyFile, link, mkdir, open, readFile, rename, stat, unlink } from "node:fs/promises";
+import { hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
 
 /** Every persisted store carries the monotonic compare-and-swap counter. */
@@ -54,6 +55,10 @@ export async function atomicWriteFile(path: string, data: string): Promise<void>
 		} finally {
 			await fh.close();
 		}
+		// Preserve the current (known-good) file as a last-known-good sidecar BEFORE we overwrite it,
+		// so a later torn/truncated live file can be rolled back to it (JsonStore.load consults .bak
+		// before quarantining). Best-effort: absent (first write) or unbackupable ⇒ skip.
+		await copyFile(path, `${path}.bak`).catch(() => {});
 		await rename(tmp, path);
 		renamed = true;
 	} finally {
@@ -80,13 +85,39 @@ const LOCK_MAX_WAIT_MS = 30_000;
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Is the lock held by a LOCAL process that is already dead? The lock token is `host:pid-seq`; only
+ * when the host matches ours can we probe the pid (`process.kill(pid, 0)`: ESRCH ⇒ gone). A token
+ * from another machine (network FS) or an unparseable/legacy one returns false, so those fall back
+ * to the time-based stale rule. Lets a crashed holder's lock be stolen instantly, with no wrongful
+ * steal from a slow-but-alive holder.
+ */
+async function holderIsDeadLocal(lockPath: string): Promise<boolean> {
+	let content: string;
+	try {
+		content = await readFile(lockPath, "utf-8");
+	} catch {
+		return false;
+	}
+	const colon = content.indexOf(":");
+	if (colon < 0 || content.slice(0, colon) !== hostname()) return false;
+	const pid = Number.parseInt(content.slice(colon + 1), 10);
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return false; // exists (alive)
+	} catch (err) {
+		return (err as NodeJS.ErrnoException).code === "ESRCH"; // ESRCH ⇒ dead; EPERM ⇒ alive
+	}
+}
+
+/**
  * Run `fn` while holding a per-file advisory lock (exclusive-create lockfile, polled, with a
  * stale-steal for a crashed holder). The lock carries an ownership token and is released only if
  * still ours, so a hold stolen as stale (e.g. a long GC pause) is never wrongly deleted.
  */
 async function withCommitLock<T>(lockPath: string, fn: () => Promise<T>): Promise<T> {
 	await mkdir(dirname(lockPath), { recursive: true });
-	const token = `${process.pid}-${lockSeq++}`;
+	const token = `${hostname()}:${process.pid}-${lockSeq++}`;
 	const start = Date.now();
 	for (;;) {
 		try {
@@ -96,6 +127,12 @@ async function withCommitLock<T>(lockPath: string, fn: () => Promise<T>): Promis
 			break;
 		} catch (err) {
 			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+			// A crashed LOCAL holder is stolen at once (no 10s wait); otherwise fall back to the
+			// time-based stale rule for a holder we cannot probe (another host) or one still alive.
+			if (await holderIsDeadLocal(lockPath)) {
+				await unlink(lockPath).catch(() => {});
+				continue;
+			}
 			try {
 				const s = await stat(lockPath);
 				if (Date.now() - s.mtimeMs > LOCK_STALE_MS) {
@@ -222,27 +259,15 @@ export class JsonStore<E> {
 		return { version: this.opts.version, updatedAt: new Date(this.now()).toISOString(), sequence: 0, entries: [] };
 	}
 
-	async load(): Promise<StoreFile<E>> {
-		let raw: string;
-		try {
-			raw = await readFile(this.filePath, "utf-8");
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code === "ENOENT") return this.empty();
-			throw err;
-		}
+	/** Parse + validate raw store bytes into a StoreFile, or null on unparseable JSON / wrong shape. */
+	private parseStore(raw: string): StoreFile<E> | null {
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(raw);
 		} catch {
-			const dest = await quarantineCorrupt(this.filePath, "invalid JSON");
-			this.onWarn(`mind store: ${this.filePath} was not valid JSON — quarantined to ${dest ?? "(nowhere)"}, starting empty`);
-			return this.empty();
+			return null;
 		}
-		if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as { entries?: unknown }).entries)) {
-			const dest = await quarantineCorrupt(this.filePath, "unexpected shape");
-			this.onWarn(`mind store: ${this.filePath} had an unexpected shape — quarantined to ${dest ?? "(nowhere)"}, starting empty`);
-			return this.empty();
-		}
+		if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as { entries?: unknown }).entries)) return null;
 		const obj = parsed as Partial<StoreFile<unknown>>;
 		const entries: E[] = [];
 		for (const rawEntry of obj.entries as unknown[]) {
@@ -255,6 +280,36 @@ export class JsonStore<E> {
 			sequence: typeof obj.sequence === "number" ? obj.sequence : 0,
 			entries,
 		};
+	}
+
+	/** Try to recover the last-known-good `.bak` sidecar. Returns null if it is absent or also bad. */
+	private async tryBak(): Promise<StoreFile<E> | null> {
+		try {
+			return this.parseStore(await readFile(`${this.filePath}.bak`, "utf-8"));
+		} catch {
+			return null;
+		}
+	}
+
+	async load(): Promise<StoreFile<E>> {
+		let raw: string;
+		try {
+			raw = await readFile(this.filePath, "utf-8");
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code === "ENOENT") return this.empty();
+			throw err;
+		}
+		const parsed = this.parseStore(raw);
+		if (parsed) return parsed;
+		// Live file is torn/invalid — roll back to the last-known-good backup before giving up.
+		const bak = await this.tryBak();
+		if (bak) {
+			this.onWarn(`mind store: ${this.filePath} was corrupt — recovered from ${this.filePath}.bak (the last committed write may be lost)`);
+			return bak;
+		}
+		const dest = await quarantineCorrupt(this.filePath, "unparseable / unexpected shape");
+		this.onWarn(`mind store: ${this.filePath} was corrupt and had no usable backup — quarantined to ${dest ?? "(nowhere)"}, starting empty`);
+		return this.empty();
 	}
 
 	/** Atomically apply `mutate` to the current entries and persist. Returns the committed store. */

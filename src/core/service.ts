@@ -13,7 +13,7 @@ import { makeBacklog, openItems, transition, validateBacklog, viewFor } from "./
 import type { MindBudget } from "./inject.ts";
 import { renderMind } from "./inject.ts";
 import type { MemoryEntry, MemoryInput, MemoryKind, MemoryTerm } from "./memory.ts";
-import { makeMemory, pruneExpired, recall, upsertMemory, validateMemory } from "./memory.ts";
+import { makeMemory, promoteToLong, pruneExpired, recall, upsertMemory, validateMemory } from "./memory.ts";
 import { scanContent } from "./scanner.ts";
 import type { Scope } from "./scope.ts";
 import { JsonStore, type JsonStoreOptions } from "./store.ts";
@@ -35,6 +35,8 @@ export interface RememberInput {
 	supersedes?: string;
 	/** Long-term only: write to the cross-persona shared tier instead of the active persona's. */
 	toShared?: boolean;
+	source?: string;
+	derivedFrom?: string[];
 }
 
 export interface BacklogAddInput {
@@ -84,16 +86,31 @@ export class MindService {
 		const scan = scanContent(text);
 		if (!scan.ok) return { ok: false, reason: scan.reason ?? "rejected by content scanner" };
 
-		const makeInput: MemoryInput = { term: input.term, kind: input.kind, text };
+		// An objective is the persona's durable north-star — always long-term, never a decaying note.
+		const term: MemoryTerm = input.kind === "objective" ? "long" : input.term;
+		const makeInput: MemoryInput = { term, kind: input.kind, text };
 		if (input.tags) makeInput.tags = input.tags;
 		if (input.ttlHours !== undefined) makeInput.ttlHours = input.ttlHours;
 		if (input.supersedes) makeInput.supersedes = input.supersedes;
-		if (input.term === "short") makeInput.persona = this.scope.persona;
+		if (input.source) makeInput.source = input.source;
+		if (input.derivedFrom && input.derivedFrom.length > 0) makeInput.derivedFrom = input.derivedFrom;
+		if (term === "short") makeInput.persona = this.scope.persona;
 
 		const entry = makeMemory(makeInput, this.now());
-		const store = input.term === "short" ? this.stm : input.toShared ? this.shared : this.ltm;
+		const store = term === "short" ? this.stm : input.toShared ? this.shared : this.ltm;
 		await store.update((es) => upsertMemory(es, entry));
 		return { ok: true, entry };
+	}
+
+	/** Graduate a short-term entry into the persona's long-term store (model-free consolidation). */
+	async promote(id: string): Promise<{ ok: true; entry: MemoryEntry } | { ok: false }> {
+		const stm = await this.stm.load();
+		const found = stm.entries.find((e) => e.id === id);
+		if (!found) return { ok: false };
+		const promoted = promoteToLong(found, this.now());
+		await this.stm.update((es) => es.filter((e) => e.id !== id));
+		await this.ltm.update((es) => upsertMemory(es, promoted));
+		return { ok: true, entry: promoted };
 	}
 
 	/** Merge shared ⊕ persona long-term memory (the persona's entry wins on an id conflict). */
@@ -105,12 +122,14 @@ export class MindService {
 		return [...byId.values()];
 	}
 
-	/** Keyword + recency recall across the requested tier(s). Short-term is pruned of expired first. */
-	async recall(query: string, term: Recallable, max: number): Promise<MemoryEntry[]> {
+	/** Keyword + recency recall across the requested tier(s). Returns the top `max` plus the TOTAL
+	 *  number of matches, so the caller can tell the model what it withheld. Short-term is pruned first. */
+	async recall(query: string, term: Recallable, max: number): Promise<{ hits: MemoryEntry[]; total: number }> {
 		const pool: MemoryEntry[] = [];
 		if (term === "long" || term === "both") pool.push(...(await this.longMemories()));
 		if (term === "short" || term === "both") pool.push(...pruneExpired((await this.stm.load()).entries, this.now()));
-		return recall(pool, query, this.now(), { max });
+		const all = recall(pool, query, this.now(), { max: Number.MAX_SAFE_INTEGER });
+		return { hits: all.slice(0, max), total: all.length };
 	}
 
 	/** Remove a memory by id from every memory tier it appears in. Returns how many were removed. */

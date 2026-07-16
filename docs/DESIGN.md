@@ -146,6 +146,45 @@ rename on EXDEV/EPERM. Every path built with `node:path`.
 
 ## Testing
 
-`tsx --test`. Every pure core module (store, ids, scanner, model, scope, inject) is unit-tested,
-including a Windows lock/rename/atomic-write pass. `tsc --noEmit` (strict, exactOptionalPropertyTypes)
-is the compile gate.
+`tsx --test`. Every pure core module (store, ids, scanner, model, scope, inject, capture) is
+unit-tested, including a Windows lock/rename/atomic-write pass, plus a Pi-surface smoke test.
+`tsc --noEmit` (strict, exactOptionalPropertyTypes) is the compile gate.
+
+## v0.2 — hardening + model-free capabilities
+
+Driven by a comparison against the wider Pi memory ecosystem (TGYD/pi memory·scheduler·goal·storage,
+observational-memory). All additions stay stdlib-only, cross-OS, and deterministic-by-default.
+
+**Hardening (fixes to confirmed v0.1 gaps):**
+- **Scan-on-load** — `inject.ts` re-runs the content scanner on every entry before rendering and
+  withholds a flagged one with a `[withheld — flagged: …]` placeholder. Closes the hole that v0.1
+  scanned only on write, so a pre-rule / supply-chain / out-of-band entry could inject un-rescanned.
+- **`.bak` recovery** — `atomicWriteFile` keeps a last-known-good sidecar; `JsonStore.load` rolls back
+  to it on a torn live file before quarantining. Corruption is now recoverable, not just loud.
+- **Missed-wake delivery** — a backlog item that came due while offline is delivered on
+  `session_start` (wiring the previously-dead `dueBacklog()`), not silently dropped.
+- **Truncation footer** — injection and `recall` now report what was withheld for budget
+  (`… +N long-term not shown`), instead of truncating silently.
+- **Fail-open injection** — `before_agent_start` races `buildInjection` against a 750 ms deadline;
+  a stalled read degrades to no injection rather than hanging the turn.
+- **pid-liveness lock steal** — `withCommitLock` steals a crashed *local* holder's lock at once
+  (`host:pid` token + `process.kill(pid,0)`), falling back to the time-based stale rule otherwise.
+- **Single wake-firer election** — only the elected owner session arms/fires wakes, so concurrent
+  sessions never double-deliver.
+
+**Model-free capabilities (deterministic; no LLM, no new deps):**
+- **Objective faculty** — a new `objective` memory kind: the persona's durable north-star, pinned in
+  its own section above long-term. (Beats a derive/evaluate goal engine by persisting across sessions.)
+- **`memory promote`** — graduate a short-term memory into durable long-term (drops expiry, keeps id
+  and age). Captures consolidation's value with zero background LLM.
+- **Capture nudge** — `core/capture.ts` scans the user message for durable cues ("always/prefer/
+  remember that…") and surfaces a gentle status-line hint (`PI_PERSONA_MIND_NUDGE=off` disables).
+  Default is nudge-only; never auto-writes.
+- **Scanner scope tiers** — `all|context|strict`, with filler-tolerant injection patterns and a
+  deception rule. Offensive-security vocabulary lives in the opt-in `strict` tier so it never
+  false-positives on the `elite` pentest persona.
+- **Provenance** — optional `source` / `derivedFrom` on a memory (excluded from the content id).
+
+**Deliberately still out of scope:** embeddings/FTS/SQLite (marginal at persona scale; native-addon
+cross-OS fragility), an external memory service, and a full cron scheduler. Out-of-band "dream"
+consolidation stays a documented future option, gated on real stale-memory pain.

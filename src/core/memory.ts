@@ -11,7 +11,7 @@
 
 import { contentId } from "./ids.ts";
 
-export const MEMORY_KINDS = ["invariant", "preference", "convention", "gotcha", "rationale", "note"] as const;
+export const MEMORY_KINDS = ["objective", "invariant", "preference", "convention", "gotcha", "rationale", "note"] as const;
 export type MemoryKind = (typeof MEMORY_KINDS)[number];
 export type MemoryTerm = "long" | "short";
 
@@ -33,6 +33,10 @@ export interface MemoryEntry {
 	persona?: string;
 	/** Short-term only: recordedAt + ttl. Absent ⇒ long-term / durable. */
 	expiresAt?: string;
+	/** Optional human-citable origin ("session 3", "child scout"). NOT part of the content id. */
+	source?: string;
+	/** Optional ids of the entries this fact was distilled from (an intra-store citation graph). */
+	derivedFrom?: string[];
 }
 
 export interface MemoryInput {
@@ -44,6 +48,8 @@ export interface MemoryInput {
 	ttlHours?: number;
 	supersedes?: string;
 	persona?: string;
+	source?: string;
+	derivedFrom?: string[];
 }
 
 function iso(now: number): string {
@@ -72,7 +78,25 @@ export function makeMemory(input: MemoryInput, now: number): MemoryEntry {
 	}
 	if (input.supersedes) entry.supersedes = input.supersedes;
 	if (input.persona) entry.persona = input.persona;
+	if (input.source) entry.source = input.source;
+	if (input.derivedFrom && input.derivedFrom.length > 0) entry.derivedFrom = [...input.derivedFrom];
 	return entry;
+}
+
+/** Graduate a short-term entry into durable long-term: drop expiry + persona tag, keep id/age. */
+export function promoteToLong(entry: MemoryEntry, now: number): MemoryEntry {
+	const promoted: MemoryEntry = {
+		id: entry.id,
+		kind: entry.kind,
+		text: entry.text,
+		tags: entry.tags,
+		recordedAt: entry.recordedAt,
+		lastSeenAt: iso(now),
+	};
+	if (entry.supersedes) promoted.supersedes = entry.supersedes;
+	if (entry.source) promoted.source = entry.source;
+	if (entry.derivedFrom) promoted.derivedFrom = entry.derivedFrom;
+	return promoted;
 }
 
 /** True once a short-term entry has passed its expiry. Long-term entries never expire. */
@@ -172,5 +196,7 @@ export function validateMemory(raw: unknown): MemoryEntry | null {
 	if (typeof o.supersedes === "string") entry.supersedes = o.supersedes;
 	if (typeof o.persona === "string") entry.persona = o.persona;
 	if (typeof o.expiresAt === "string") entry.expiresAt = o.expiresAt;
+	if (typeof o.source === "string") entry.source = o.source;
+	if (isStringArray(o.derivedFrom)) entry.derivedFrom = o.derivedFrom;
 	return entry;
 }

@@ -7,6 +7,7 @@ import {
 	isExpired,
 	makeMemory,
 	type MemoryEntry,
+	promoteToLong,
 	pruneExpired,
 	recall,
 	upsertMemory,
@@ -90,6 +91,32 @@ test("validateMemory accepts a well-formed entry and rejects junk", () => {
 	assert.equal(validateMemory({ id: "x", kind: "bogus", text: "y" }), null);
 	assert.equal(validateMemory(null), null);
 	assert.equal(validateMemory({ id: "x" }), null);
+});
+
+test("objective is a valid kind (the persona's durable north-star)", () => {
+	const e = makeMemory({ term: "long", kind: "objective", text: "root the DC before the window closes" }, T0);
+	assert.equal(e.kind, "objective");
+	assert.equal(e.expiresAt, undefined);
+	assert.deepEqual(validateMemory(JSON.parse(JSON.stringify(e))), e);
+});
+
+test("provenance (source/derivedFrom) is stored but EXCLUDED from the content id", () => {
+	const withProv = makeMemory({ term: "long", kind: "note", text: "same fact", tags: ["t"], source: "session 3", derivedFrom: ["abc", "def"] }, T0);
+	const without = makeMemory({ term: "long", kind: "note", text: "same fact", tags: ["t"] }, T0);
+	assert.equal(withProv.id, without.id, "re-recording the same fact from a new source must not fork the id");
+	assert.equal(withProv.source, "session 3");
+	assert.deepEqual(withProv.derivedFrom, ["abc", "def"]);
+	assert.deepEqual(validateMemory(JSON.parse(JSON.stringify(withProv))), withProv);
+});
+
+test("promoteToLong drops expiry, preserves recordedAt + id, bumps lastSeenAt", () => {
+	const stm = makeMemory({ term: "short", kind: "note", text: "graduating fact", ttlHours: 12, persona: "elite" }, T0);
+	const ltm = promoteToLong(stm, T0 + 5 * 3_600_000);
+	assert.equal(ltm.id, stm.id, "same fact, same id");
+	assert.equal(ltm.expiresAt, undefined, "no longer decays");
+	assert.equal(ltm.persona, undefined, "long-term is not persona-tagged in the entry");
+	assert.equal(ltm.recordedAt, stm.recordedAt, "keeps its original age");
+	assert.equal(ltm.lastSeenAt, new Date(T0 + 5 * 3_600_000).toISOString());
 });
 
 test("recall bumps nothing (pure) — inputs are not mutated", () => {

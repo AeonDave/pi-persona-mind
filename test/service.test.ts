@@ -32,7 +32,7 @@ test("remember(long) then recall finds it", async () => {
 	const s = svc("recall", "elite", 1_000_000);
 	const r = await s.remember({ term: "long", kind: "preference", text: "prefers verbose recon" });
 	assert.equal(r.ok, true);
-	const hits = await s.recall("recon", "both", 10);
+	const { hits } = await s.recall("recon", "both", 10);
 	assert.equal(hits.length, 1);
 	assert.equal(hits[0]?.text, "prefers verbose recon");
 });
@@ -41,7 +41,7 @@ test("the content scanner rejects a secret before it is stored", async () => {
 	const s = svc("scan", "elite", 1_000_000);
 	const r = await s.remember({ term: "long", kind: "note", text: "key is sk-ant-api03-abcdefabcdefabcdefabcdef" });
 	assert.equal(r.ok, false);
-	const hits = await s.recall("", "both", 10);
+	const { hits } = await s.recall("", "both", 10);
 	assert.equal(hits.length, 0, "nothing was persisted");
 });
 
@@ -60,7 +60,7 @@ test("forget removes a memory across tiers", async () => {
 	assert.ok(r.ok);
 	const removed = await s.forget(r.ok ? r.entry.id : "");
 	assert.equal(removed.removed, 1);
-	assert.equal((await s.recall("temporary", "both", 10)).length, 0);
+	assert.equal((await s.recall("temporary", "both", 10)).hits.length, 0);
 });
 
 test("shared long-term memory is visible to every persona; private memory is not", async () => {
@@ -68,11 +68,11 @@ test("shared long-term memory is visible to every persona; private memory is not
 	await svc("shared", "elite", now).remember({ term: "long", kind: "convention", text: "user is on Windows", toShared: true });
 	await svc("shared", "elite", now).remember({ term: "long", kind: "note", text: "elite-only tactic" });
 
-	const eliteSees = (await svc("shared", "elite", now).recall("", "both", 20)).map((e) => e.text);
+	const eliteSees = (await svc("shared", "elite", now).recall("", "both", 20)).hits.map((e) => e.text);
 	assert.ok(eliteSees.includes("user is on Windows"));
 	assert.ok(eliteSees.includes("elite-only tactic"));
 
-	const devSees = (await svc("shared", "dev", now).recall("", "both", 20)).map((e) => e.text);
+	const devSees = (await svc("shared", "dev", now).recall("", "both", 20)).hits.map((e) => e.text);
 	assert.ok(devSees.includes("user is on Windows"), "dev sees shared");
 	assert.ok(!devSees.includes("elite-only tactic"), "dev does not see elite's private memory");
 });
@@ -110,6 +110,30 @@ test("buildInjection composes long-term + working-context + open backlog", async
 	assert.match(block, /prefers verbose recon/);
 	assert.match(block, /auth refactor on branch x/);
 	assert.match(block, /revisit the SMB share/);
+});
+
+test("promote graduates a short-term memory into durable long-term", async () => {
+	const now = 1_000_000;
+	const s = svc("promote", "elite", now);
+	const r = await s.remember({ term: "short", kind: "note", text: "this became important", ttlHours: 12 });
+	assert.ok(r.ok);
+	const id = r.ok ? r.entry.id : "";
+	const p = await s.promote(id);
+	assert.ok(p.ok);
+	// it now survives past the old short-term ttl (long-term never decays)
+	const later = svc("promote", "elite", now + 100 * H);
+	const hits = (await later.recall("important", "long", 10)).hits;
+	assert.equal(hits.length, 1, "found in long-term after its short-term ttl would have expired");
+	assert.equal((await later.recall("important", "short", 10)).hits.length, 0, "gone from short-term");
+});
+
+test("recall reports the total number of matches, not just the returned page", async () => {
+	const now = 1_000_000;
+	const s = svc("total", "elite", now);
+	for (let i = 0; i < 5; i++) await s.remember({ term: "long", kind: "note", text: `smb detail ${i}` });
+	const { hits, total } = await s.recall("smb", "long", 2);
+	assert.equal(hits.length, 2, "page honored");
+	assert.equal(total, 5, "total exposed for a withheld-count footer");
 });
 
 test("summary counts live long-term, non-expired short-term, and open backlog", async () => {

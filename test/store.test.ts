@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile, stat, utimes } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 
@@ -107,6 +107,33 @@ test("quarantineCorrupt moves a file aside to the first free suffix", async () =
 	assert.equal(dest, `${p}.corrupt-0`);
 	assert.ok(!existsSync(p), "original moved");
 	assert.ok(existsSync(`${p}.corrupt-0`), "preserved at suffix 0");
+});
+
+test("load recovers from the .bak last-known-good when the live file is torn", async () => {
+	const p = join(dir, "bak.json");
+	const store = itemStore(p);
+	await store.update((es) => [...es, { id: "a", n: 1 }]);
+	await store.update((es) => [...es, { id: "b", n: 2 }]); // .bak now holds the previous good [a]
+	await writeFile(p, "{ corrupt now", "utf8");
+	const s = await store.load();
+	assert.deepEqual(
+		s.entries.map((e) => e.id),
+		["a"],
+		"recovered the previous good version instead of going empty",
+	);
+	assert.ok(!existsSync(`${p}.corrupt-0`), "no quarantine when a good backup exists");
+});
+
+test("update steals a dead-pid lock immediately (before the stale window)", async () => {
+	const p = join(dir, "deadpid.json");
+	const store = itemStore(p);
+	await store.update((es) => [...es, { id: "a", n: 1 }]);
+	const lock = `${p}.lock`;
+	await writeFile(lock, `${hostname()}:999999-0`, "utf8"); // dead local pid, FRESH mtime
+	const started = Date.now();
+	const s = await store.update((es) => [...es, { id: "b", n: 2 }]);
+	assert.equal(s.entries.length, 2);
+	assert.ok(Date.now() - started < 2000, "did not wait for the 10s stale window — recognized the holder is dead");
 });
 
 test("update steals a stale lock left by a crashed writer", async () => {
