@@ -190,9 +190,19 @@ export class MindService {
 		return { ltm: ltm.length, stm: pruneExpired(stm.entries, now).length, backlogOpen: openItems(backlog.entries).length };
 	}
 
-	/** Assemble the deterministic `<persona-mind>` block (long-term ⊕ working-context ⊕ open backlog). */
-	async buildInjection(): Promise<string> {
+	/**
+	 * Assemble the deterministic `<persona-mind>` block. Full mode = long-term ⊕ working-context ⊕
+	 * open backlog. `lean` mode (a DELEGATED worker leg) = the north-star + durable identity (long-term)
+	 * ONLY, dropping the supervisor's working-context (STM) and backlog: a one-shot worker is not the
+	 * persona, so it inherits who the persona IS but not the supervisor's project state or deferred
+	 * intent. (The caller also withholds the write tools + wakes from a leg — see index.ts.)
+	 */
+	async buildInjection(opts: { lean?: boolean } = {}): Promise<string> {
 		const now = this.now();
+		if (opts.lean) {
+			const ltm = await this.longMemories();
+			return renderMind({ persona: this.scope.persona, ltm, stm: [], backlog: [], now, ...(this.budget ? { budget: this.budget } : {}) });
+		}
 		const [ltm, stmRaw, backlogRaw] = await Promise.all([this.longMemories(), this.stm.load(), this.backlog.load()]);
 		return renderMind({
 			persona: this.scope.persona,

@@ -102,8 +102,20 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	const ownerToken = `${hostname()}:${process.pid}:${++ownerInstanceSeq}`;
 	const getMind = (ctx: ExtensionContext): MindService => new MindService(resolveScope(agentDir, ctx.cwd));
 
-	registerMemoryTool(pi, getMind);
-	registerBacklogTool(pi, getMind);
+	// A DELEGATED worker leg? pi-persona disables ITSELF in sub-agent sessions (fork-bomb guard) via
+	// PI_PERSONA_DISABLE (in-process, set transiently around session creation) / PI_PERSONA_CHILD
+	// (child process, set for its whole lifetime). Sampled HERE at factory time because the in-process
+	// flag is popped before the turn runs. A worker is not the persona: it inherits only the lean mind
+	// (north-star + identity — see buildInjection), and must NOT manage the supervisor's memory or fire
+	// its wakes. Absent the flags (the normal supervisor), everything runs full — behavior is unchanged.
+	const isDelegatedLeg = process.env.PI_PERSONA_DISABLE === "1" || process.env.PI_PERSONA_CHILD === "1";
+
+	// Withhold the write tools from a worker: a leg reading/writing the supervisor persona's LTM/STM/
+	// backlog is exactly the bleed we prevent. It still INHERITS the lean block below (read-only, curated).
+	if (!isDelegatedLeg) {
+		registerMemoryTool(pi, getMind);
+		registerBacklogTool(pi, getMind);
+	}
 
 	// Backlog wake timers — only the elected owner session arms/fires them, so concurrent sessions
 	// never double-deliver. In-memory, unref'd, re-armed from disk on session start; cleared on shutdown.
@@ -173,7 +185,8 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	pi.on("before_agent_start", async (event, ctx) => {
 		// (rank 7) Deterministic, model-free capture nudge: if the user's message signals a durable
 		// preference/instruction, surface a gentle hint on the status line (no LLM, no auto-write).
-		if (nudgeEnabled) {
+		// Supervisor-only: a worker has no memory tools to act on it, and its "prompt" is a task packet.
+		if (nudgeEnabled && !isDelegatedLeg) {
 			const cue = detectCaptureCue(event.prompt);
 			if (cue) {
 				try {
@@ -185,7 +198,8 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		}
 		let block = "";
 		try {
-			block = await withDeadline(getMind(ctx).buildInjection(), INJECT_DEADLINE_MS, "");
+			// A worker inherits the LEAN mind (north-star + identity only); the supervisor gets it all.
+			block = await withDeadline(getMind(ctx).buildInjection({ lean: isDelegatedLeg }), INJECT_DEADLINE_MS, "");
 		} catch {
 			/* a mind failure must never break the supervisor's turn */
 		}
@@ -194,6 +208,8 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		// A worker never arms/fires the supervisor's backlog wakes (nor shows a status line).
+		if (isDelegatedLeg) return;
 		await armWakes(ctx);
 		await refreshStatus(ctx);
 	});

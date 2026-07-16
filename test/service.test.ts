@@ -154,3 +154,23 @@ test("dueBacklog returns open items whose wake time has passed", async () => {
 	assert.equal(due.length, 1);
 	assert.equal(due[0]?.text, "re-run nmap after reset");
 });
+
+test("buildInjection lean mode = north-star + identity only (a delegated worker drops STM + backlog)", async () => {
+	const s = svc("lean", "elite", 5_000_000);
+	await s.remember({ term: "long", kind: "objective", text: "root every box on the range" });
+	await s.remember({ term: "long", kind: "preference", text: "prefers verbose recon" });
+	await s.remember({ term: "short", kind: "note", text: "prod db is read-only right now" });
+	await s.backlogAdd({ text: "revisit the SMB share on 10.0.0.5" });
+
+	const full = await s.buildInjection();
+	assert.match(full, /root every box/, "full: north-star");
+	assert.match(full, /verbose recon/, "full: identity");
+	assert.match(full, /prod db is read-only/, "full: working context");
+	assert.match(full, /revisit the SMB share/, "full: backlog");
+
+	const lean = await s.buildInjection({ lean: true });
+	assert.match(lean, /root every box/, "lean keeps the north-star");
+	assert.match(lean, /verbose recon/, "lean keeps durable identity");
+	assert.doesNotMatch(lean, /prod db is read-only/, "lean drops the supervisor's working context");
+	assert.doesNotMatch(lean, /revisit the SMB share/, "lean drops the supervisor's backlog");
+});

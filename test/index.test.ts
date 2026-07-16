@@ -125,6 +125,49 @@ test("a durable-preference user message raises the capture nudge on the status l
 	assert.ok(status.some((s) => /worth remembering/.test(s)), "the nudge was surfaced");
 });
 
+test("a delegated worker leg (PI_PERSONA_CHILD) withholds tools + wakes and injects only the lean mind", async () => {
+	const agentDir = join(dir, "leg", "agent");
+	const cwd = join(dir, "leg", "proj");
+
+	// The supervisor seeds its mind: north-star + identity (LTM), working-context (STM), and a due backlog.
+	const sup = mockPi();
+	createExtension(sup.pi, { agentDir });
+	const supCtx = ctxFor(cwd);
+	await sup.tools.get("memory")?.execute("t1", { action: "remember", term: "long", kind: "objective", text: "root every box on the range" }, undefined, undefined, supCtx);
+	await sup.tools.get("memory")?.execute("t2", { action: "remember", term: "long", kind: "preference", text: "prefers verbose recon" }, undefined, undefined, supCtx);
+	await sup.tools.get("memory")?.execute("t3", { action: "remember", term: "short", kind: "note", text: "prod db is read-only right now" }, undefined, undefined, supCtx);
+	await sup.tools.get("backlog")?.execute("t4", { action: "add", text: "revisit the SMB share", dueInSeconds: -60 }, undefined, undefined, supCtx);
+
+	// A delegated leg — the flag is sampled at factory time, so set it only around createExtension.
+	const prev = process.env.PI_PERSONA_CHILD;
+	process.env.PI_PERSONA_CHILD = "1";
+	const leg = mockPi();
+	try {
+		createExtension(leg.pi, { agentDir });
+	} finally {
+		if (prev === undefined) delete process.env.PI_PERSONA_CHILD;
+		else process.env.PI_PERSONA_CHILD = prev;
+	}
+
+	// No write tools in a worker — it cannot read/mutate the supervisor persona's stores.
+	assert.equal(leg.tools.has("memory"), false, "a leg registers no memory tool");
+	assert.equal(leg.tools.has("backlog"), false, "a leg registers no backlog tool");
+
+	// Lean injection: it inherits the north-star + identity but NOT the supervisor's project state.
+	const before = leg.handlers.get("before_agent_start");
+	assert.ok(before);
+	const res = (await before({ systemPrompt: "BASE", prompt: "do the assigned task" }, ctxFor(cwd))) as { systemPrompt?: string } | undefined;
+	assert.ok(res?.systemPrompt, "the leg inherits a lean mind block");
+	assert.match(res.systemPrompt, /root every box/, "leg inherits the north-star");
+	assert.match(res.systemPrompt, /verbose recon/, "leg inherits durable identity");
+	assert.doesNotMatch(res.systemPrompt, /prod db is read-only/, "leg does NOT inherit working context");
+	assert.doesNotMatch(res.systemPrompt, /revisit the SMB share/, "leg does NOT inherit the backlog");
+
+	// A worker never arms/fires the supervisor's backlog wakes.
+	await leg.handlers.get("session_start")?.({}, ctxFor(cwd));
+	assert.equal(leg.messages.filter((t) => /came due/.test(t)).length, 0, "a leg fires no backlog wakes");
+});
+
 test("the backlog tool queues and lists an item through the Pi surface", async () => {
 	const m = mockPi();
 	createExtension(m.pi, { agentDir: join(dir, "bl", "agent") });
