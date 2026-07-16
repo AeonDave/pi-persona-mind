@@ -127,6 +127,15 @@ test("promote graduates a short-term memory into durable long-term", async () =>
 	assert.equal((await later.recall("important", "short", 10)).hits.length, 0, "gone from short-term");
 });
 
+test("recall does not double-count a fact stored in both tiers", async () => {
+	const s = svc("dedup", "elite", 1_000_000);
+	await s.remember({ term: "long", kind: "note", text: "same fact both tiers" });
+	await s.remember({ term: "short", kind: "note", text: "same fact both tiers" });
+	const { hits, total } = await s.recall("same fact", "both", 10);
+	assert.equal(total, 1, "the cross-tier duplicate is collapsed by id, not counted twice");
+	assert.equal(hits.length, 1);
+});
+
 test("recall reports the total number of matches, not just the returned page", async () => {
 	const now = 1_000_000;
 	const s = svc("total", "elite", now);

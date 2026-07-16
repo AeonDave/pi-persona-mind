@@ -108,8 +108,10 @@ export class MindService {
 		const found = stm.entries.find((e) => e.id === id);
 		if (!found) return { ok: false };
 		const promoted = promoteToLong(found, this.now());
-		await this.stm.update((es) => es.filter((e) => e.id !== id));
+		// Write the durable tier FIRST, then remove from short-term: a crash between the two leaves a
+		// harmless duplicate (collapsed by id on recall/inject) rather than losing the entry entirely.
 		await this.ltm.update((es) => upsertMemory(es, promoted));
+		await this.stm.update((es) => es.filter((e) => e.id !== id));
 		return { ok: true, entry: promoted };
 	}
 
@@ -128,7 +130,15 @@ export class MindService {
 		const pool: MemoryEntry[] = [];
 		if (term === "long" || term === "both") pool.push(...(await this.longMemories()));
 		if (term === "short" || term === "both") pool.push(...pruneExpired((await this.stm.load()).entries, this.now()));
-		const all = recall(pool, query, this.now(), { max: Number.MAX_SAFE_INTEGER });
+		// A fact can live in both tiers under the same content id (e.g. after a promote crash, or an
+		// explicit re-record) — collapse by id (keep the most-recently-seen) so it is neither returned
+		// twice nor double-counted in `total`.
+		const byId = new Map<string, MemoryEntry>();
+		for (const e of pool) {
+			const prev = byId.get(e.id);
+			if (!prev || Date.parse(e.lastSeenAt) > Date.parse(prev.lastSeenAt)) byId.set(e.id, e);
+		}
+		const all = recall([...byId.values()], query, this.now(), { max: Number.MAX_SAFE_INTEGER });
 		return { hits: all.slice(0, max), total: all.length };
 	}
 
