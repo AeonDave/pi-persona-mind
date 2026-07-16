@@ -36,13 +36,20 @@ export interface StoreFile<E> {
 let tmpCounter = 0;
 let lockSeq = 0;
 
+export interface AtomicWriteOptions {
+	/** Refresh the `.bak` sidecar from the current live file only when this returns true for its
+	 *  bytes. Guards against copying a torn file — one that load() just recovered FROM `.bak` — over
+	 *  the only good backup, which would destroy the sole recoverable copy. Absent ⇒ always refresh. */
+	backupIf?: (currentRaw: string) => boolean;
+}
+
 /**
  * Write `data` to `path` atomically: to a sibling temp file, flushed to disk (`fsync`), then
  * moved into place with a single atomic `rename`. A crash before the rename leaves the previous
  * file untouched. The directory fsync is best-effort — Windows rejects it, and the data fsync
  * already bounds the loss.
  */
-export async function atomicWriteFile(path: string, data: string): Promise<void> {
+export async function atomicWriteFile(path: string, data: string, opts: AtomicWriteOptions = {}): Promise<void> {
 	const dir = dirname(path);
 	await mkdir(dir, { recursive: true });
 	const tmp = join(dir, `.${basename(path)}.tmp-${process.pid}-${tmpCounter++}`);
@@ -57,8 +64,14 @@ export async function atomicWriteFile(path: string, data: string): Promise<void>
 		}
 		// Preserve the current (known-good) file as a last-known-good sidecar BEFORE we overwrite it,
 		// so a later torn/truncated live file can be rolled back to it (JsonStore.load consults .bak
-		// before quarantining). Best-effort: absent (first write) or unbackupable ⇒ skip.
-		await copyFile(path, `${path}.bak`).catch(() => {});
+		// before quarantining). But never clobber a good .bak with a live file that isn't itself good
+		// (a torn file we just recovered FROM .bak): that would destroy the only recoverable copy.
+		try {
+			const current = await readFile(path, "utf-8");
+			if (!opts.backupIf || opts.backupIf(current)) await copyFile(path, `${path}.bak`);
+		} catch {
+			/* no current file (first write) — nothing to preserve */
+		}
 		await rename(tmp, path);
 		renamed = true;
 	} finally {
@@ -111,11 +124,39 @@ async function holderIsDeadLocal(lockPath: string): Promise<boolean> {
 }
 
 /**
- * Run `fn` while holding a per-file advisory lock (exclusive-create lockfile, polled, with a
- * stale-steal for a crashed holder). The lock carries an ownership token and is released only if
- * still ours, so a hold stolen as stale (e.g. a long GC pause) is never wrongly deleted.
+ * The mirror of {@link holderIsDeadLocal}: is the lock held by a LOCAL process that is still alive?
+ * Such a holder is legitimately inside its critical section (the lock is only ever held around `fn`)
+ * and must be protected from a time-based steal — stealing it would race two writers and lose one.
  */
-async function withCommitLock<T>(lockPath: string, fn: () => Promise<T>): Promise<T> {
+async function holderIsLiveLocal(lockPath: string): Promise<boolean> {
+	let content: string;
+	try {
+		content = await readFile(lockPath, "utf-8");
+	} catch {
+		return false;
+	}
+	const colon = content.indexOf(":");
+	if (colon < 0 || content.slice(0, colon) !== hostname()) return false;
+	const pid = Number.parseInt(content.slice(colon + 1), 10);
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true; // exists (alive)
+	} catch (err) {
+		return (err as NodeJS.ErrnoException).code !== "ESRCH"; // ESRCH ⇒ dead; EPERM ⇒ alive
+	}
+}
+
+/** Thrown internally when the commit lock was stolen mid-critical-section; {@link casUpdate} re-acquires. */
+class LockLostError extends Error {}
+
+/**
+ * Run `fn` while holding a per-file advisory lock (exclusive-create lockfile, polled, with a
+ * stale-steal for a crashed holder). The lock carries an ownership token — passed to `fn` so it can
+ * re-verify ownership before committing — and is released only if still ours, so a hold stolen as
+ * stale (e.g. a long GC pause) is never wrongly deleted.
+ */
+async function withCommitLock<T>(lockPath: string, fn: (token: string) => Promise<T>): Promise<T> {
 	await mkdir(dirname(lockPath), { recursive: true });
 	const token = `${hostname()}:${process.pid}-${lockSeq++}`;
 	const start = Date.now();
@@ -127,20 +168,24 @@ async function withCommitLock<T>(lockPath: string, fn: () => Promise<T>): Promis
 			break;
 		} catch (err) {
 			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-			// A crashed LOCAL holder is stolen at once (no 10s wait); otherwise fall back to the
-			// time-based stale rule for a holder we cannot probe (another host) or one still alive.
+			// A crashed LOCAL holder is stolen at once (no 10s wait).
 			if (await holderIsDeadLocal(lockPath)) {
 				await unlink(lockPath).catch(() => {});
 				continue;
 			}
-			try {
-				const s = await stat(lockPath);
-				if (Date.now() - s.mtimeMs > LOCK_STALE_MS) {
-					await unlink(lockPath).catch(() => {});
-					continue;
+			// A LIVE local holder is genuinely mid-critical-section — never time-steal it, or two
+			// writers race and one committed write is lost. Fall back to the time-based stale rule only
+			// for a holder we cannot probe (another host / unparseable token).
+			if (!(await holderIsLiveLocal(lockPath))) {
+				try {
+					const s = await stat(lockPath);
+					if (Date.now() - s.mtimeMs > LOCK_STALE_MS) {
+						await unlink(lockPath).catch(() => {});
+						continue;
+					}
+				} catch {
+					continue; // lock vanished between open and stat — retry
 				}
-			} catch {
-				continue; // lock vanished between open and stat — retry
 			}
 			if (Date.now() - start > LOCK_MAX_WAIT_MS) {
 				throw new Error(
@@ -152,7 +197,7 @@ async function withCommitLock<T>(lockPath: string, fn: () => Promise<T>): Promis
 		}
 	}
 	try {
-		return await fn();
+		return await fn(token);
 	} finally {
 		try {
 			if ((await readFile(lockPath, "utf-8")) === token) await unlink(lockPath).catch(() => {});
@@ -173,15 +218,35 @@ export async function casUpdate<T extends { sequence: number }>(opts: {
 	load: () => Promise<T>;
 	mutate: (current: T) => T;
 	serialize: (next: T) => string;
+	/** Forwarded to atomicWriteFile: gate the `.bak` refresh on the current live file being valid. */
+	backupIf?: (currentRaw: string) => boolean;
 }): Promise<T> {
 	const lockPath = `${opts.storePath}.lock`;
-	return withCommitLock(lockPath, async () => {
-		const current = await opts.load();
-		const merged = opts.mutate(current);
-		const next: T = { ...merged, sequence: current.sequence + 1 };
-		await atomicWriteFile(opts.storePath, opts.serialize(next));
-		return next;
-	});
+	for (let attempt = 0; ; attempt++) {
+		try {
+			return await withCommitLock(lockPath, async (token) => {
+				const current = await opts.load();
+				const merged = opts.mutate(current);
+				const next: T = { ...merged, sequence: current.sequence + 1 };
+				// Re-verify ownership before committing: a stale-steal (a >10s stall of an unprobeable
+				// holder, or a post-crash dual-steal) could have handed the lock to another writer while
+				// we loaded/mutated — writing now would overwrite their committed entry with our stale
+				// snapshot. If we no longer own the lock, drop this attempt and re-acquire.
+				let owner: string | undefined;
+				try {
+					owner = await readFile(lockPath, "utf-8");
+				} catch {
+					owner = undefined;
+				}
+				if (owner !== token) throw new LockLostError();
+				await atomicWriteFile(opts.storePath, opts.serialize(next), opts.backupIf ? { backupIf: opts.backupIf } : {});
+				return next;
+			});
+		} catch (err) {
+			if (err instanceof LockLostError && attempt < 5) continue; // re-acquire and retry
+			throw err;
+		}
+	}
 }
 
 async function pathExists(p: string): Promise<boolean> {
@@ -319,6 +384,9 @@ export class JsonStore<E> {
 			load: () => this.load(),
 			mutate: (current) => ({ ...current, updatedAt: new Date(this.now()).toISOString(), entries: mutate(current.entries) }),
 			serialize: (next) => `${JSON.stringify(next, null, 2)}\n`,
+			// Only refresh the .bak from a live file that still parses — never let a torn file we just
+			// recovered from .bak overwrite that good backup.
+			backupIf: (raw) => this.parseStore(raw) !== null,
 		});
 	}
 }

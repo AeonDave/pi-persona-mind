@@ -150,3 +150,47 @@ test("update steals a stale lock left by a crashed writer", async () => {
 	assert.equal(s.entries.length, 2);
 	await stat(p); // still a valid file
 });
+
+test("a live local holder's lock is not time-stolen (protects an in-flight writer)", async () => {
+	const p = join(dir, "livelocal.json");
+	const store = itemStore(p);
+	await store.update((es) => [...es, { id: "seed", n: 0 }]);
+	const lock = `${p}.lock`;
+	// Our OWN (alive) pid holds the lock, with an ancient mtime the old time-steal would have fired on.
+	await writeFile(lock, `${hostname()}:${process.pid}-0`, "utf8");
+	const old = new Date(Date.now() - 60_000);
+	await utimes(lock, old, old);
+	const upd = store.update((es) => [...es, { id: "X", n: 1 }]);
+	const raced = await Promise.race([upd.then(() => "done"), new Promise((r) => setTimeout(() => r("waiting"), 400))]);
+	assert.equal(raced, "waiting", "did not steal a lock held by a live local process");
+	await rm(lock, { force: true }); // release; the writer can now acquire
+	await upd;
+	assert.ok((await store.load()).entries.some((e) => e.id === "X"), "completed once the holder released");
+});
+
+test("two writers stealing the same dead lock both commit (no lost write)", async () => {
+	const p = join(dir, "dualsteal.json");
+	const store = itemStore(p);
+	await store.update((es) => [...es, { id: "seed", n: 0 }]);
+	await writeFile(`${p}.lock`, `${hostname()}:999999-0`, "utf8"); // a crashed (dead-pid) holder both will steal
+	const [ra, rb] = await Promise.allSettled([
+		store.update((es) => [...es, { id: "A", n: 1 }]),
+		store.update((es) => [...es, { id: "B", n: 2 }]),
+	]);
+	assert.equal(ra.status, "fulfilled");
+	assert.equal(rb.status, "fulfilled");
+	const ids = (await store.load()).entries.map((e) => e.id).sort();
+	assert.deepEqual(ids, ["A", "B", "seed"], "both concurrent steals landed — neither overwrote the other");
+});
+
+test("a recovery write does not clobber the last-known-good .bak", async () => {
+	const p = join(dir, "recover.json");
+	const store = itemStore(p);
+	await store.update((es) => [...es, { id: "a", n: 1 }]);
+	await store.update((es) => [...es, { id: "b", n: 2 }]); // .bak now holds the good [a]
+	await writeFile(p, "{ torn now", "utf8"); // live corrupt — load() will recover from .bak
+	await store.update((es) => [...es, { id: "c", n: 3 }]); // the recovery write
+	const bak = readFileSync(`${p}.bak`, "utf8");
+	assert.doesNotThrow(() => JSON.parse(bak), "the good .bak was not overwritten with the torn live file");
+	assert.ok((await store.load()).entries.some((e) => e.id === "c"), "the recovery write itself landed");
+});

@@ -46,17 +46,24 @@ function isAlive(pid: number): boolean {
 	}
 }
 
-function ownerIsStale(path: string, token: string): boolean {
+export function ownerIsStale(path: string, token: string): boolean {
 	try {
 		const content = readFileSync(path, "utf8");
 		if (content === token) return false; // ours
 		const colon = content.indexOf(":");
 		const host = colon < 0 ? "" : content.slice(0, colon);
 		const pid = colon < 0 ? NaN : Number.parseInt(content.slice(colon + 1), 10);
-		if (host === hostname() && Number.isInteger(pid) && pid > 0 && !isAlive(pid)) return true; // dead local holder
+		if (host === hostname() && Number.isInteger(pid) && pid > 0) {
+			// A LOCAL owner: stale iff its process is gone. Never time-steal a LIVE local owner — that is
+			// the >120s double-fire (a second session opened later in the same project would steal the
+			// still-alive owner's lock and both would then fire the same backlog wakes).
+			return !isAlive(pid);
+		}
+		// Foreign host / unparseable token (network FS, legacy): fall back to the mtime rule.
 		return Date.now() - statSync(path).mtimeMs > OWNER_STALE_MS;
-	} catch {
-		return true; // vanished between checks
+	} catch (err) {
+		// Vanished ⇒ claimable; a transient read error (AV lock, EPERM) must NOT steal a live owner.
+		return (err as NodeJS.ErrnoException).code === "ENOENT";
 	}
 }
 
@@ -67,7 +74,14 @@ function claimWakeOwner(path: string, token: string): boolean {
 			const fd = openSync(path, "wx");
 			writeSync(fd, token);
 			closeSync(fd);
-			return true;
+			// Confirm our token actually stuck: a racing stealer's unlink+recreate could have replaced
+			// it between our create and now. If the lock isn't ours, we do NOT own the wakes — retry.
+			try {
+				if (readFileSync(path, "utf8") === token) return true;
+			} catch {
+				/* vanished — retry */
+			}
+			continue;
 		} catch (err) {
 			if ((err as NodeJS.ErrnoException).code !== "EEXIST") return false;
 			try {
@@ -162,11 +176,17 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			if (delay <= 0 || timers.has(item.id)) continue;
 			const t = setTimeout(() => {
 				timers.delete(item.id);
-				try {
-					pi.sendUserMessage(`[pi-persona-mind] backlog due — ${item.text} (id ${item.id}). Use \`backlog take ${item.id}\` to act on it, or \`backlog drop ${item.id}\`.`);
-				} catch {
-					/* raced shutdown */
-				}
+				// Re-check state at fire time: nothing cancels this timer when the item is done/dropped,
+				// so reload and only nag if the item is still unfinished — never act on dead intent.
+				void (async () => {
+					try {
+						const live = (await mind.backlogList({ all: true })).find((e) => e.id === item.id);
+						if (!live || (live.state !== "open" && live.state !== "taken")) return;
+						pi.sendUserMessage(`[pi-persona-mind] backlog due — ${live.text} (id ${live.id}). Use \`backlog take ${live.id}\` to act on it, or \`backlog drop ${live.id}\`.`);
+					} catch {
+						/* raced shutdown / read error */
+					}
+				})();
 			}, delay);
 			t.unref?.();
 			timers.set(item.id, t);

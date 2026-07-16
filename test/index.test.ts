@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
+import { utimesSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 
-import { createExtension } from "../src/index.ts";
+import { createExtension, ownerIsStale } from "../src/index.ts";
 
 // A minimal ExtensionAPI stand-in that records what the factory wires up and lets tests drive it.
 interface ToolLike {
@@ -191,6 +192,32 @@ test("a blocked delegated leg surfaces a backlog nudge on both delivery paths", 
 	status.length = 0;
 	onResult({ toolName: "read", content: [{ type: "text", text: "the file literally contains [BLOCKED: x]" }] }, ctx);
 	assert.equal(status.length, 0, "a non-delegation tool result never nudges");
+});
+
+test("ownerIsStale protects a live local wake-owner and reclaims a dead one", () => {
+	const lock = join(dir, "owner.lock");
+	writeFileSync(lock, `${hostname()}:${process.pid}:7`, "utf8"); // us — an alive local owner
+	const old = new Date(Date.now() - 5 * 60_000);
+	utimesSync(lock, old, old); // even 5 minutes old — well past OWNER_STALE_MS
+	assert.equal(ownerIsStale(lock, "someone:1:1"), false, "a live local owner is never time-stolen (no >120s double-fire)");
+	writeFileSync(lock, `${hostname()}:999999:1`, "utf8"); // a dead pid
+	assert.equal(ownerIsStale(lock, "someone:1:1"), true, "a dead local owner is reclaimable");
+});
+
+test("an armed wake does not fire for a backlog item dropped before it comes due", async () => {
+	const m = mockPi();
+	const agentDir = join(dir, "stalefire", "agent");
+	createExtension(m.pi, { agentDir });
+	const ctx = ctxFor(join(dir, "stalefire", "proj"));
+	const backlog = m.tools.get("backlog");
+	assert.ok(backlog);
+	const add = await backlog.execute("t1", { action: "add", text: "ping CI", dueInSeconds: 0.2 }, undefined, undefined, ctx);
+	const id = (add.details as { id?: string }).id;
+	assert.ok(id, "the add returned an id");
+	await m.handlers.get("session_start")?.({}, ctx); // arms the ~200ms timer
+	await backlog.execute("t2", { action: "drop", id }, undefined, undefined, ctx); // close it before it fires
+	await new Promise((r) => setTimeout(r, 400)); // let the timer elapse
+	assert.ok(!m.messages.some((t) => /backlog due/.test(t) && /ping CI/.test(t)), "no stale wake fired for a dropped item");
 });
 
 test("the backlog tool queues and lists an item through the Pi surface", async () => {
