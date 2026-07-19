@@ -78,11 +78,27 @@ test("recall ranks keyword matches first, then recency; empty query returns rece
 	assert.equal(recent[0]?.text, "another SMB detail", "recency first when no query");
 });
 
-test("ageLabel renders compact durations", () => {
-	assert.equal(ageLabel(new Date(T0).toISOString(), T0 + 30_000), "just now");
-	assert.equal(ageLabel(new Date(T0).toISOString(), T0 + 5 * 60_000), "5m");
-	assert.equal(ageLabel(new Date(T0).toISOString(), T0 + 3 * H), "3h");
-	assert.equal(ageLabel(new Date(T0).toISOString(), T0 + 50 * H), "2d");
+test("ageLabel is a coarse, prompt-cache-stable label (sub-day → one bucket, then day+)", () => {
+	const rec = new Date(T0).toISOString();
+	// Sub-day collapses to a single stable bucket — no per-minute/hour churn.
+	assert.equal(ageLabel(rec, T0 + 30_000), "today");
+	assert.equal(ageLabel(rec, T0 + 5 * 60_000), "today");
+	assert.equal(ageLabel(rec, T0 + 3 * H), "today");
+	// Day granularity where recency is load-bearing, then weeks/months/years.
+	assert.equal(ageLabel(rec, T0 + 50 * H), "2d");
+	assert.equal(ageLabel(rec, T0 + 12 * 24 * H), "12d");
+	assert.equal(ageLabel(rec, T0 + 20 * 24 * H), "2w");
+	assert.equal(ageLabel(rec, T0 + 70 * 24 * H), "2mo");
+	assert.equal(ageLabel(rec, T0 + 400 * 24 * H), "1y");
+});
+
+test("ageLabel is byte-stable across a session's turns (the prompt-cache guarantee)", () => {
+	const rec = new Date(T0).toISOString();
+	// Old rendering churned every minute ("29m"→"30m"…); now a whole day is one identical bucket.
+	const within = [29 * 60_000, 30 * 60_000, 55 * 60_000, 5 * H, 23 * H].map((d) => ageLabel(rec, T0 + d));
+	assert.deepEqual(within, ["today", "today", "today", "today", "today"]);
+	// Two nearby turns on a multi-day-old entry render identically (no sub-day drift).
+	assert.equal(ageLabel(rec, T0 + 3 * 24 * H + 60_000), ageLabel(rec, T0 + 3 * 24 * H + 40 * 60_000));
 });
 
 test("validateMemory accepts a well-formed entry and rejects junk", () => {

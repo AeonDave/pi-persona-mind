@@ -169,13 +169,23 @@ export function recall(entries: readonly MemoryEntry[], query: string, _now: num
 	return scored.slice(0, opts.max).map((x) => x.e);
 }
 
-/** Compact age label from an ISO timestamp: "just now", "5m", "3h", "2d". */
+/**
+ * A COARSE, prompt-cache-stable age label: "today", "2d", "3w", "5mo", "1y".
+ *
+ * The injected `<persona-mind>` block is folded into the system prompt every turn. A minute/hour
+ * granular age ("29m" → "30m" a minute later) would mutate that block every minute and bust provider
+ * prompt-caching of the whole system prefix — for zero real signal, since a durable memory is not a
+ * log line and never needed sub-day precision. So the entire sub-day range collapses to ONE stable
+ * bucket ("today") and the rest steps at day granularity or coarser: the label now flips at most
+ * once per day, keeping the block byte-identical across a working session's turns.
+ */
 export function ageLabel(recordedAt: string, now: number): string {
-	const sec = Math.max(0, Math.floor((now - Date.parse(recordedAt)) / 1000));
-	if (sec < 60) return "just now";
-	if (sec < 3600) return `${Math.floor(sec / 60)}m`;
-	if (sec < 86_400) return `${Math.floor(sec / 3600)}h`;
-	return `${Math.floor(sec / 86_400)}d`;
+	const days = Math.floor(Math.max(0, now - Date.parse(recordedAt)) / 86_400_000);
+	if (days < 1) return "today";
+	if (days < 14) return `${days}d`; // day granularity where recency is load-bearing
+	if (days < 60) return `${Math.floor(days / 7)}w`;
+	if (days < 365) return `${Math.floor(days / 30)}mo`;
+	return `${Math.floor(days / 365)}y`;
 }
 
 function isKind(v: unknown): v is MemoryKind {
