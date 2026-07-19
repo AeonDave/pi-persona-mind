@@ -17,7 +17,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 import { detectBlockedLeg } from "./core/blocked.ts";
 import { detectCaptureCue } from "./core/capture.ts";
-import { EMPTY_MIND_MARKER } from "./core/inject.ts";
+import { EMPTY_HINT_PREFIX } from "./core/inject.ts";
 import { preferredAgentDir, resolveScope } from "./core/scope.ts";
 import { MindService } from "./core/service.ts";
 import { registerBacklogTool } from "./tools/backlog.ts";
@@ -268,9 +268,10 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			/* a mind failure must never break the supervisor's turn */
 		}
 		// The empty-mind hint announces the faculty ONCE per session, then goes quiet even if the mind
-		// stays empty — a state indicator, not a per-turn nag. (Real memory content never carries the
-		// marker, so this only ever suppresses the announcement itself.)
-		if (block.includes(EMPTY_MIND_MARKER)) {
+		// stays empty — a state indicator, not a per-turn nag. Matched by PREFIX: a content block starts
+		// with `<persona-mind …` and a memory's text sits inside the fence, so this only ever recognises
+		// the announcement itself — never a real memory that happens to quote the phrase.
+		if (block.startsWith(EMPTY_HINT_PREFIX)) {
 			if (emptyAnnounced) block = "";
 			else emptyAnnounced = true;
 		}

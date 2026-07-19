@@ -181,6 +181,7 @@ export function recall(entries: readonly MemoryEntry[], query: string, _now: num
  */
 export function ageLabel(recordedAt: string, now: number): string {
 	const days = Math.floor(Math.max(0, now - Date.parse(recordedAt)) / 86_400_000);
+	if (!Number.isFinite(days)) return "?"; // corrupt/unparseable timestamp — never render "NaN…"
 	if (days < 1) return "today";
 	if (days < 14) return `${days}d`; // day granularity where recency is load-bearing
 	if (days < 60) return `${Math.floor(days / 7)}w`;

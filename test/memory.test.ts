@@ -90,6 +90,9 @@ test("ageLabel is a coarse, prompt-cache-stable label (sub-day → one bucket, t
 	assert.equal(ageLabel(rec, T0 + 20 * 24 * H), "2w");
 	assert.equal(ageLabel(rec, T0 + 70 * 24 * H), "2mo");
 	assert.equal(ageLabel(rec, T0 + 400 * 24 * H), "1y");
+	// A corrupt/unparseable timestamp must never render "NaN…".
+	assert.equal(ageLabel("not-a-date", T0), "?");
+	assert.equal(ageLabel("", T0), "?");
 });
 
 test("ageLabel is byte-stable across a session's turns (the prompt-cache guarantee)", () => {

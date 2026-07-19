@@ -89,6 +89,26 @@ test("an EMPTY supervisor mind injects one soft discoverability line (an unseen 
 	assert.doesNotMatch(again?.systemPrompt ?? "", /this mind is empty/);
 });
 
+test("a memory whose TEXT quotes the empty-hint phrase is NOT mistaken for the announcement (no suppression)", async () => {
+	// Regression: the announcement is matched by PREFIX, not by a substring of the block. A substring
+	// check would see "this mind is empty" inside a real memory and suppress the whole content block on
+	// later turns — silent memory loss from injection.
+	const m = mockPi();
+	createExtension(m.pi, { agentDir: join(dir, "collision", "agent") });
+	const ctx = ctxFor(join(dir, "collision", "proj"));
+	await m.tools.get("memory")?.execute("t1", { action: "remember", term: "long", kind: "note", text: "we discussed that this mind is empty as a discoverability phrase" }, undefined, undefined, ctx);
+	const before = m.handlers.get("before_agent_start");
+	assert.ok(before);
+	// The content block must inject on BOTH turns — not suppressed on the second.
+	for (const prompt of ["hi", "again"]) {
+		const r = (await before({ systemPrompt: "BASE", prompt }, ctx)) as { systemPrompt?: string } | undefined;
+		const sp = r?.systemPrompt;
+		assert.ok(sp, `content block injected on '${prompt}'`);
+		assert.match(sp, /<persona-mind persona=/);
+		assert.match(sp, /as a discoverability phrase/);
+	}
+});
+
 test("a backlog item due while offline is delivered on session_start", async () => {
 	const m = mockPi();
 	const agentDir = join(dir, "wakes", "agent");

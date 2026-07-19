@@ -27,13 +27,18 @@ const NOTE =
  * capture ("use them when genuinely worth it; otherwise ignore"). Plugin-authored guidance, so it
  * sits OUTSIDE the untrusted-memory fence.
  */
-/** Stable marker inside the empty-mind hint, so index.ts can recognise it and announce it ONCE per
- *  session (not every turn while empty) without coupling to the exact wording. */
-export const EMPTY_MIND_MARKER = "this mind is empty";
+/**
+ * Distinctive LEADING sentinel of the empty-mind announcement. index.ts recognises the announcement
+ * by this PREFIX, never by a substring of the block: a CONTENT block always starts with
+ * `<persona-mind …`, and a memory's text lives INSIDE that fence, so it can never make a content
+ * block start with this. A substring check would collide — a memory whose text happened to contain
+ * the marker phrase would be mistaken for the announcement and get the whole block suppressed.
+ */
+export const EMPTY_HINT_PREFIX = "⟢ pi-persona-mind (";
 
 function emptyMindHint(persona: string): string {
 	return (
-		`⟢ pi-persona-mind (${persona}) — ${EMPTY_MIND_MARKER}. \`memory\` keeps durable preferences/lessons ` +
+		`${EMPTY_HINT_PREFIX}${persona}) — this mind is empty. \`memory\` keeps durable preferences/lessons ` +
 		"and decaying project notes; `backlog` holds leads to revisit — both survive compaction and restart. " +
 		"Reach for them when something is genuinely worth carrying to the next session; otherwise ignore this line."
 	);
