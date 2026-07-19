@@ -8,8 +8,24 @@ import { makeMemory } from "../src/core/memory.ts";
 const T0 = Date.parse("2026-07-16T00:00:00.000Z");
 const H = 3_600_000;
 
-test("renders nothing when the mind is empty", () => {
-	assert.equal(renderMind({ persona: "elite", ltm: [], stm: [], backlog: [], now: T0 }), "");
+test("empty supervisor mind shows one soft discoverability line (faculty is unseen otherwise)", () => {
+	const block = renderMind({ persona: "elite", ltm: [], stm: [], backlog: [], now: T0 });
+	assert.match(block, /this mind is empty/);
+	assert.match(block, /`memory`/);
+	assert.match(block, /`backlog`/);
+	assert.match(block, /otherwise ignore/i); // optional, never obligatory
+	assert.doesNotMatch(block, /<persona-mind/); // plugin guidance, not the untrusted-memory fence
+});
+
+test("empty WORKER (lean) mind renders nothing — no discoverability line, no memory tools", () => {
+	assert.equal(renderMind({ persona: "elite", ltm: [], stm: [], backlog: [], now: T0, lean: true }), "");
+});
+
+test("once the mind has content, the empty-mind line is gone (fades, never an every-turn directive)", () => {
+	const ltm = [makeMemory({ term: "long", kind: "preference", text: "prefers verbose recon" }, T0)];
+	const block = renderMind({ persona: "elite", ltm, stm: [], backlog: [], now: T0 });
+	assert.doesNotMatch(block, /this mind is empty/);
+	assert.match(block, /^<persona-mind/);
 });
 
 test("wraps content in a fenced <persona-mind> block naming the persona, with a drift caveat", () => {

@@ -18,6 +18,21 @@ test("detects durable preference/instruction cues and suggests a kind", () => {
 	assert.equal(c.kind, "note");
 });
 
+test("marks EXPLICIT persist-intent as strong; casual phrasing as soft (governs prompt vs status-line)", () => {
+	// Strong: an explicit intent to establish something for the future.
+	for (const s of ["From now on, use verbose recon logs.", "Remember that the prod DB is read-only.", "For future reference, the VPN is eu-1."]) {
+		const cue = detectCaptureCue(s);
+		assert.ok(cue, s);
+		assert.equal(cue.strong, true, s);
+	}
+	// Soft: casual turns of phrase that should NOT push a hint into the model's context.
+	for (const s of ["I prefer tabs over spaces", "always check the logs first", "we use pnpm here"]) {
+		const cue = detectCaptureCue(s);
+		assert.ok(cue, s);
+		assert.equal(cue.strong, false, s);
+	}
+});
+
 test("ignores ordinary messages with no durable cue", () => {
 	assert.equal(detectCaptureCue("what does this function do?"), null);
 	assert.equal(detectCaptureCue("run the tests and show me the output"), null);

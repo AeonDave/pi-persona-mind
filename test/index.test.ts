@@ -73,13 +73,20 @@ test("a remembered fact is injected into the next turn's system prompt", async (
 	assert.match(result.systemPrompt, /prefers verbose recon/);
 });
 
-test("before_agent_start injects nothing when the mind is empty", async () => {
+test("an EMPTY supervisor mind injects one soft discoverability line (an unseen faculty is unused)", async () => {
 	const m = mockPi();
 	createExtension(m.pi, { agentDir: join(dir, "empty", "agent") });
 	const before = m.handlers.get("before_agent_start");
 	assert.ok(before);
 	const result = await before({ systemPrompt: "BASE", prompt: "hi" }, ctxFor(join(dir, "empty", "proj")));
-	assert.equal(result, undefined, "no memory ⇒ prompt untouched");
+	assert.ok(result, "an empty supervisor mind is now discoverable, not silent");
+	const sp = (result as { systemPrompt: string }).systemPrompt;
+	assert.match(sp, /^BASE\n\n/);
+	assert.match(sp, /this mind is empty/);
+	assert.match(sp, /otherwise ignore this line/); // optional, never obligatory
+	// Announced ONCE per session: a second turn with the mind still empty does NOT re-show the line.
+	const again = (await before({ systemPrompt: "BASE", prompt: "still here" }, ctxFor(join(dir, "empty", "proj")))) as { systemPrompt?: string } | undefined;
+	assert.doesNotMatch(again?.systemPrompt ?? "", /this mind is empty/);
 });
 
 test("a backlog item due while offline is delivered on session_start", async () => {
@@ -122,8 +129,29 @@ test("a durable-preference user message raises the capture nudge on the status l
 	const ctx = { cwd: join(dir, "nudge", "proj"), mode: "tui", hasUI: true, ui: { setStatus: (_k: string, v: string) => status.push(v), notify: () => {}, theme: { fg: (_c: string, s: string) => s } } };
 	const before = m.handlers.get("before_agent_start");
 	assert.ok(before);
-	await before({ systemPrompt: "BASE", prompt: "From now on, always use verbose recon logs." }, ctx);
-	assert.ok(status.some((s) => /worth remembering/.test(s)), "the nudge was surfaced");
+	const result = await before({ systemPrompt: "BASE", prompt: "From now on, always use verbose recon logs." }, ctx);
+	assert.ok(status.some((s) => /worth remembering/.test(s)), "the status nudge was surfaced");
+	// A STRONG cue ("from now on") ALSO lands a soft, optional hint in the prompt — the model can't read
+	// the status line — so capture is actually reachable, without forcing it.
+	assert.ok(result, "a strong cue injects a prompt hint");
+	const sp = (result as { systemPrompt: string }).systemPrompt;
+	assert.match(sp, /reads like a durable/);
+	assert.match(sp, /optional, your call/);
+	// Hinted ONCE: the same snippet next turn does NOT re-inject the cue (no per-turn nag).
+	const again = (await before({ systemPrompt: "BASE", prompt: "From now on, always use verbose recon logs." }, ctx)) as { systemPrompt?: string } | undefined;
+	assert.doesNotMatch(again?.systemPrompt ?? "", /reads like a durable/);
+});
+
+test("a SOFT cue (casual 'I prefer') stays status-only — no hint pushed into the model's context", async () => {
+	const m = mockPi();
+	const status: string[] = [];
+	createExtension(m.pi, { agentDir: join(dir, "soft", "agent") });
+	const ctx = { cwd: join(dir, "soft", "proj"), mode: "tui", hasUI: true, ui: { setStatus: (_k: string, v: string) => status.push(v), notify: () => {}, theme: { fg: (_c: string, s: string) => s } } };
+	const before = m.handlers.get("before_agent_start");
+	assert.ok(before);
+	const result = (await before({ systemPrompt: "BASE", prompt: "I prefer tabs over spaces." }, ctx)) as { systemPrompt?: string } | undefined;
+	assert.ok(status.some((s) => /worth remembering/.test(s)), "soft cue still gets the gentle status nudge");
+	assert.doesNotMatch(result?.systemPrompt ?? "", /reads like a durable/); // but never the prompt hint
 });
 
 test("a delegated worker leg (PI_PERSONA_CHILD) withholds tools + wakes and injects only the lean mind", async () => {

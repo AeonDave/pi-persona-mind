@@ -17,6 +17,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 import { detectBlockedLeg } from "./core/blocked.ts";
 import { detectCaptureCue } from "./core/capture.ts";
+import { EMPTY_MIND_MARKER } from "./core/inject.ts";
 import { preferredAgentDir, resolveScope } from "./core/scope.ts";
 import { MindService } from "./core/service.ts";
 import { registerBacklogTool } from "./tools/backlog.ts";
@@ -218,13 +219,21 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		}
 	};
 
+	// Cue snippets already surfaced as a PROMPT hint this session: a strong persist-intent cue is
+	// hinted at most once, so it stays a one-time gentle nudge rather than a per-turn nag.
+	const cueHinted = new Set<string>();
+	// The empty-mind discoverability line is an ANNOUNCEMENT — shown once per session, not a banner that
+	// persists every turn while the mind stays empty (that would be the nag we avoid).
+	let emptyAnnounced = false;
+
 	// Inject the mind into every turn. before_agent_start re-fires after compaction, so this is also
 	// how memory survives compaction: it re-injects from disk. Fail-open: a stalled read (slow disk,
 	// lock contention) degrades to no injection rather than hanging the turn.
 	pi.on("before_agent_start", async (event, ctx) => {
-		// (rank 7) Deterministic, model-free capture nudge: if the user's message signals a durable
-		// preference/instruction, surface a gentle hint on the status line (no LLM, no auto-write).
+		// Deterministic, model-free capture nudge: if the user's message signals a durable
+		// preference/instruction, surface a gentle hint (no LLM, no auto-write, never obligatory).
 		// Supervisor-only: a worker has no memory tools to act on it, and its "prompt" is a task packet.
+		let cueHint = "";
 		if (nudgeEnabled && !isDelegatedLeg) {
 			// A delegated leg that came back BLOCKED arrives HERE on the v1.5.0 async/background-default
 			// path: pi-persona delivers the completion report as a fresh follow-up user message, so it
@@ -241,6 +250,13 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 					} catch {
 						/* cosmetic */
 					}
+					// A STRONG, explicit persist-intent cue ("from now on", "remember that") ALSO gets a soft
+					// one-line hint in the PROMPT — the model can't read the status line — once per snippet,
+					// worded as optional. A casual "always"/"I prefer" stays status-only, so this never nags.
+					if (cue.strong && !cueHinted.has(cue.snippet)) {
+						cueHinted.add(cue.snippet);
+						cueHint = `⟢ pi-persona-mind — that reads like a durable ${cue.kind} ("${cue.snippet}"). If it should outlive this session, \`memory remember\` (term=long) — optional, your call.`;
+					}
 				}
 			}
 		}
@@ -251,7 +267,15 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		} catch {
 			/* a mind failure must never break the supervisor's turn */
 		}
-		if (block) return { systemPrompt: `${event.systemPrompt}\n\n${block}` };
+		// The empty-mind hint announces the faculty ONCE per session, then goes quiet even if the mind
+		// stays empty — a state indicator, not a per-turn nag. (Real memory content never carries the
+		// marker, so this only ever suppresses the announcement itself.)
+		if (block.includes(EMPTY_MIND_MARKER)) {
+			if (emptyAnnounced) block = "";
+			else emptyAnnounced = true;
+		}
+		const injected = [block, cueHint].filter(Boolean).join("\n\n");
+		if (injected) return { systemPrompt: `${event.systemPrompt}\n\n${injected}` };
 		return;
 	});
 

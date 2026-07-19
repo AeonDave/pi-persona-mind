@@ -17,6 +17,11 @@ export interface CaptureCue {
 	kind: MemoryKind;
 	/** Durable cues suggest long-term. */
 	term: "long";
+	/** True only for EXPLICIT persist-intent phrasing ("from now on", "remember that", "for future
+	 *  reference") — as opposed to casual "always/never"/"I prefer". The caller surfaces a strong cue
+	 *  a little more visibly (a one-line prompt hint) and a soft one only on the status line, so a
+	 *  casual turn of phrase never pushes a hint into the model's context. */
+	strong: boolean;
 }
 
 interface CuePattern {
@@ -31,6 +36,11 @@ const CUES: CuePattern[] = [
 	{ re: /\b(?:remember\s+that|keep\s+in\s+mind|note\s+that|don'?t\s+forget|for\s+future\s+reference|make\s+sure\s+to)\b/i, kind: "note" },
 	{ re: /\b(?:the\s+user\s+is|i\s+am\s+(?:on|using)|i'm\s+(?:on|using)|we\s+use|my\s+\w+\s+is)\b/i, kind: "preference" },
 ];
+
+// Orthogonal to the kind: explicit intent to establish a durable rule/fact for the FUTURE. A
+// sentence can match a kind cue (below) yet still be casual; only these phrasings mean "persist this".
+const STRONG_INTENT =
+	/\b(?:from\s+now\s+on|going\s+forward|for\s+future\s+reference|remember\s+that|keep\s+in\s+mind|note\s+that|don'?t\s+forget|make\s+sure\s+to)\b/i;
 
 const MAX_SNIPPET = 200;
 
@@ -49,7 +59,7 @@ export function detectCaptureCue(userText: string): CaptureCue | null {
 		for (const cue of CUES) {
 			if (cue.re.test(sentence)) {
 				const snippet = sentence.length > MAX_SNIPPET ? `${sentence.slice(0, MAX_SNIPPET - 1)}…` : sentence;
-				return { snippet, kind: cue.kind, term: "long" };
+				return { snippet, kind: cue.kind, term: "long", strong: STRONG_INTENT.test(sentence) };
 			}
 		}
 	}
