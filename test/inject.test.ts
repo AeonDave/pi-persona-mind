@@ -94,11 +94,41 @@ test("objective entries beyond budget report a hidden-count footer", () => {
 	assert.match(block, /\+10 objective/, "silently dropped north-star objectives are accounted for");
 });
 
+test("long-term budget is shared by pinned objectives and ordinary entries", () => {
+	const objectives = Array.from({ length: 3 }, (_, i) => makeMemory({ term: "long", kind: "objective", text: `objective ${i}` }, T0 - i * H));
+	const rest = Array.from({ length: 3 }, (_, i) => makeMemory({ term: "long", kind: "note", text: `ordinary ${i}` }, T0 - i * H));
+	const block = renderMind({ persona: "p", ltm: [...objectives, ...rest], stm: [], backlog: [], now: T0, budget: { ltm: 2, stm: 5, backlog: 5 } });
+	assert.equal((block.match(/^- /gm) ?? []).length, 2, "ltm budget is not spent twice");
+	assert.match(block, /\+1 objective/);
+	assert.match(block, /\+3 long-term/);
+});
+
+test("an exhausted long-term budget still reports hidden entries", () => {
+	const entry = makeMemory({ term: "long", kind: "note", text: "hidden fact" }, T0);
+	const block = renderMind({ persona: "p", ltm: [entry], stm: [], backlog: [], now: T0, budget: { ltm: 0, stm: 0, backlog: 0 } });
+	assert.match(block, /\+1 long-term/);
+	assert.doesNotMatch(block, /this mind is empty/);
+});
+
 test("a lean block omits the tool-hint footer a worker cannot act on", () => {
 	const many = Array.from({ length: 30 }, (_, i) => makeMemory({ term: "long", kind: "note", text: `fact ${i}` }, T0 - i * H));
 	const block = renderMind({ persona: "p", ltm: many, stm: [], backlog: [], now: T0, budget: { ltm: 5, stm: 5, backlog: 5 }, lean: true });
 	assert.ok(block.length > 0, "the lean block still renders its inherited long-term memory");
 	assert.ok(!/memory recall|backlog list/.test(block), "a worker with those tools withheld is not told to call them");
+});
+
+test("a lean block renders nothing when every inherited item is outside its budget", () => {
+	const entry = makeMemory({ term: "long", kind: "note", text: "hidden identity" }, T0);
+	const block = renderMind({
+		persona: "p",
+		ltm: [entry],
+		stm: [],
+		backlog: [],
+		now: T0,
+		budget: { ltm: 0, stm: 0, backlog: 0 },
+		lean: true,
+	});
+	assert.equal(block, "", "do not inject an empty XML-shaped block into a worker prompt");
 });
 
 test("multi-line / tag-bracket text is flattened to a single safe line", () => {

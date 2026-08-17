@@ -13,7 +13,7 @@
  */
 
 import type { BacklogEntry } from "./backlog.ts";
-import { ageLabel, type MemoryEntry, type MemoryKind, nearExpiry } from "./memory.ts";
+import { ageLabel, compactMemoryText, type MemoryEntry, type MemoryKind, nearExpiry } from "./memory.ts";
 import { scanContent } from "./scanner.ts";
 
 const NOTE =
@@ -72,19 +72,10 @@ export interface RenderMindInput {
 	lean?: boolean;
 }
 
-/** Flatten to one prompt-safe line: no newlines, no nested fence tag, length-capped. */
-function oneLine(text: string, cap = 240): string {
-	const flat = text
-		.replace(/<\/?persona-mind>?/gi, "[persona-mind]")
-		.replace(/\s+/g, " ")
-		.trim();
-	return flat.length > cap ? `${flat.slice(0, cap - 1)}…` : flat;
-}
-
 /** Scan an entry's text on the way OUT; withhold it with a placeholder if it looks unsafe to inject. */
 function safeText(text: string): string {
 	const scan = scanContent(text);
-	return scan.ok ? oneLine(text) : `[withheld — flagged: ${scan.reason ?? "unsafe content"}]`;
+	return scan.ok ? compactMemoryText(text) : `[withheld — flagged: ${scan.reason ?? "unsafe content"}]`;
 }
 
 function attr(value: string): string {
@@ -108,7 +99,8 @@ export function renderMind(input: RenderMindInput): string {
 	const objectives = input.ltm.filter((e) => e.kind === "objective").sort(byRecency);
 	const rest = input.ltm.filter((e) => e.kind !== "objective");
 
-	const shownObjectives = objectives.slice(0, budget.ltm);
+	const ltmBudget = Number.isFinite(budget.ltm) ? Math.max(0, Math.floor(budget.ltm)) : 0;
+	const shownObjectives = objectives.slice(0, ltmBudget);
 	if (shownObjectives.length > 0) {
 		const lines = shownObjectives.map((e) => `- ${safeText(e.text)}`);
 		sections.push(`## Objective (${input.persona})\n${lines.join("\n")}`);
@@ -116,14 +108,16 @@ export function renderMind(input: RenderMindInput): string {
 	// A pinned north-star silently vanishing is worse than any other overflow — account for it too.
 	if (objectives.length > shownObjectives.length) hidden.push(`+${objectives.length - shownObjectives.length} objective`);
 
-	const ltm = [...rest].sort((a, b) => KIND_PRIORITY[a.kind] - KIND_PRIORITY[b.kind] || byRecency(a, b)).slice(0, budget.ltm);
+	const remainingLtm = Math.max(0, ltmBudget - shownObjectives.length);
+	const ltm = [...rest].sort((a, b) => KIND_PRIORITY[a.kind] - KIND_PRIORITY[b.kind] || byRecency(a, b)).slice(0, remainingLtm);
 	if (ltm.length > 0) {
 		const lines = ltm.map((e) => `- [${e.kind}] ${safeText(e.text)} (${ageLabel(e.recordedAt, input.now)})`);
 		sections.push(`## Long-term (${input.persona})\n${lines.join("\n")}`);
 	}
 	if (rest.length > ltm.length) hidden.push(`+${rest.length - ltm.length} long-term`);
 
-	const stm = [...input.stm].sort(byRecency).slice(0, budget.stm);
+	const stmBudget = Number.isFinite(budget.stm) ? Math.max(0, Math.floor(budget.stm)) : 0;
+	const stm = [...input.stm].sort(byRecency).slice(0, stmBudget);
 	if (stm.length > 0) {
 		const lines = stm.map((e) => {
 			const flag = nearExpiry(e, input.now, NEAR_EXPIRY_MS) ? "⚠️ verify — " : "";
@@ -133,7 +127,8 @@ export function renderMind(input: RenderMindInput): string {
 	}
 	if (input.stm.length > stm.length) hidden.push(`+${input.stm.length - stm.length} working`);
 
-	const backlog = input.backlog.slice(0, budget.backlog);
+	const backlogBudget = Number.isFinite(budget.backlog) ? Math.max(0, Math.floor(budget.backlog)) : 0;
+	const backlog = input.backlog.slice(0, backlogBudget);
 	if (backlog.length > 0) {
 		const lines = backlog.map((e) => `- [${e.id}] ${safeText(e.text)}`);
 		sections.push(`## Backlog (open)\n${lines.join("\n")}`);
@@ -143,9 +138,10 @@ export function renderMind(input: RenderMindInput): string {
 	// Empty mind: a worker gets nothing; a supervisor gets ONE soft discoverability line (fades the
 	// moment anything is captured — never an every-turn directive). No standing "capture protocol" is
 	// added when the mind HAS content: the content itself shows the faculty is live.
-	if (sections.length === 0) return input.lean ? "" : emptyMindHint(input.persona);
+	if (sections.length === 0 && hidden.length === 0) return input.lean ? "" : emptyMindHint(input.persona);
 	// A lean (worker) block has the memory/backlog tools withheld and can't recall the overflow, so
 	// don't advertise them — omit the budget footer entirely rather than point at unusable tools.
+	if (sections.length === 0 && input.lean) return "";
 	if (hidden.length > 0 && !input.lean) sections.push(`… ${hidden.join(", ")} not shown — use \`memory recall\` / \`backlog list\``);
 	return `<persona-mind persona="${attr(input.persona)}" note="${NOTE}">\n${sections.join("\n")}\n</persona-mind>`;
 }

@@ -27,3 +27,10 @@ test("caps a very long marker snippet", () => {
 	assert.ok(cue);
 	assert.ok(cue.snippet.length <= 160, "snippet is length-capped for the status line");
 });
+
+test("sanitizes control characters before echoing an untrusted child marker to the status line", () => {
+	const cue = detectBlockedLeg("[BLOCKED: wait\u001b[2J\u0007 for operator]");
+	assert.ok(cue);
+	assert.doesNotMatch(cue.snippet, /[\u0000-\u001f\u007f-\u009f]/u);
+	assert.match(cue.snippet, /wait.*for operator/);
+});

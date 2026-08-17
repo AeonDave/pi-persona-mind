@@ -13,9 +13,9 @@
  *   backlog/<project>.json      backlog, per project
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, realpathSync, readSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, win32 } from "node:path";
 
 export const DEFAULT_PERSONA = "_default";
 export const SHARED_SCOPE = "_shared";
@@ -38,17 +38,46 @@ export interface Scope {
 	paths: ScopePaths;
 }
 
+/** A marker reading: whether pi-persona's state file could be understood at all, the persona it named,
+ *  and an identity stamp for the bytes behind it. Three states, not two:
+ *    - ABSENT      — pi-persona has persisted nothing. That IS understandable information ("no persona
+ *                    is remembered"), so it is readable with a null persona and an empty stamp. It is
+ *                    also the modal first-run condition, so mistaking it for "unreadable" would swallow
+ *                    the first mid-session switch of every fresh install.
+ *    - UNREADABLE  — oversized/torn/unstattable. No information at all; never evidence of a switch.
+ *    - READABLE    — a parsed marker; `persona: null` is an explicit "no persona" (`/persona off`).
+ *  The stamp exists because pi-persona rewrites the marker on EVERY user gesture, including a
+ *  re-selection of the name it already held — a change the name alone cannot show. */
+interface MarkerReading {
+	readable: boolean;
+	persona: string | null;
+	/** mtime/size/inode identity of the marker file; "" when it is absent or unreadable. */
+	stamp: string;
+}
+
+function readPersonaState(raw: string | undefined): MarkerReading {
+	if (raw === undefined) return { readable: false, persona: null, stamp: "" };
+	try {
+		const parsed = JSON.parse(raw) as { lastPersona?: unknown };
+		return { readable: true, persona: typeof parsed.lastPersona === "string" && parsed.lastPersona.trim() ? parsed.lastPersona : null, stamp: "" };
+	} catch {
+		return { readable: false, persona: null, stamp: "" };
+	}
+}
+
+/** Read the marker from disk, keeping "absent" distinct from "unreadable" and carrying the stamp. */
+function readMarker(path: string): MarkerReading {
+	const read = tryRead(path);
+	if (read.kind === "absent") return { readable: true, persona: null, stamp: "" };
+	if (read.kind === "unreadable") return { readable: false, persona: null, stamp: "" };
+	return { ...readPersonaState(read.raw), stamp: read.stamp };
+}
+
 /** Read pi-persona's `{ lastPersona }` marker; the selected persona NAME, or null when none is
  *  selected / the marker is missing or invalid (the caller maps null to the {@link DEFAULT_PERSONA}
  *  scope). Kept distinct from a persona literally *named* `_default`, which must not merge with it. */
 export function parsePersonaState(raw: string | undefined): string | null {
-	if (raw === undefined) return null;
-	try {
-		const parsed = JSON.parse(raw) as { lastPersona?: unknown };
-		return typeof parsed.lastPersona === "string" && parsed.lastPersona.trim() ? parsed.lastPersona : null;
-	} catch {
-		return null;
-	}
+	return readPersonaState(raw).persona;
 }
 
 /** The internal scope names a real persona must never be allowed to occupy (they back the shared
@@ -59,9 +88,13 @@ const RESERVED_SCOPES: ReadonlySet<string> = new Set([DEFAULT_PERSONA, SHARED_SC
 /** Windows reserved device base names: `NUL.json`/`CON.json`/… resolve to the device (a silent
  *  write-to-void) in legacy Win32 path resolution, so a persona named after one must not be a filename. */
 const WIN_RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+const MAX_PERSONA_STATE_BYTES = 64 * 1024;
+const MAX_CANONICAL_CACHE_ENTRIES = 256;
+const canonicalProjectCache = new Map<string, string>();
 
 function isReservedSegment(s: string): boolean {
-	return RESERVED_SCOPES.has(s.toLowerCase()) || WIN_RESERVED.test(s);
+	const deviceBase = s.split(".", 1)[0] ?? s;
+	return RESERVED_SCOPES.has(s.toLowerCase()) || WIN_RESERVED.test(deviceBase);
 }
 
 /** A stable 12-hex content id for a persona name, used when it has no filesystem-safe characters. */
@@ -74,13 +107,15 @@ function personaHash(name: string): string {
  *  merge every such persona (and the no-persona scope) — it gets a stable content-derived segment; and a
  *  name that lands on an internal sentinel or a Windows device name is prefixed so it can never hijack
  *  that reserved store. */
-export function sanitizePersona(name: string): string {
+export function sanitizePersona(name: string, platform: NodeJS.Platform | string = process.platform): string {
 	const s = name
 		.replace(/[^a-zA-Z0-9._-]+/g, "-")
 		.replace(/^[-.]+|[-.]+$/g, "")
 		.slice(0, 64);
 	if (!s) return `persona-${personaHash(name)}`;
-	return isReservedSegment(s) ? `persona-${s}` : s;
+	const lossy = s !== name || (platform === "win32" && s !== s.toLowerCase());
+	if (isReservedSegment(s)) return `persona-${s}-${personaHash(name)}`;
+	return lossy ? `${s}-${personaHash(name)}` : s;
 }
 
 /**
@@ -109,25 +144,140 @@ export function preferredAgentDir(explicit: string | undefined, env: NodeJS.Proc
 }
 
 /**
- * The persona the mind should scope to, mirroring pi-persona's own restore precedence
- * (`defaultPersona ?? (persist ? readLastPersona() : undefined)`): the `PI_PERSONA_DEFAULT` env pin
- * wins, else the on-disk marker when persistence is on (`PI_PERSONA_PERSIST` ≠ "off"), else the default
- * scope. Mirroring it keeps the mind from injecting or writing a different persona's memory than the one
- * pi-persona actually activated (an env-pinned or persist-off session would otherwise trust a stale marker).
+ * Read Pi's `--persona` string flag from raw CLI arguments without registering a duplicate flag in
+ * this extension (Pi rejects duplicate declarations when pi-persona is loaded too). `-p/--print`
+ * consumes its next argument, so a prompt literally equal to `--persona` is never misclassified.
+ * Repeated flags follow Pi's map semantics: the last well-formed value wins.
  */
-export function activePersona(agentDir: string, env: NodeJS.ProcessEnv = process.env): string {
-	const pin = env.PI_PERSONA_DEFAULT?.trim();
-	const persist = env.PI_PERSONA_PERSIST?.trim().toLowerCase() !== "off";
-	const named = pin ? pin : persist ? parsePersonaState(tryRead(personaStateFile(agentDir, env))) : null;
+export function personaFromCliArgs(args: readonly string[]): string | undefined {
+	let selected: string | undefined;
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "-p" || arg === "--print") {
+			const next = args[i + 1];
+			// Match Pi's parser: a normal value (or the special `---`-prefixed form) is the print
+			// payload; another flag remains available to the argument loop.
+			if (next !== undefined && !next.startsWith("@") && (!next.startsWith("-") || next.startsWith("---"))) i++;
+			continue;
+		}
+		if (arg?.startsWith("--persona=")) {
+			const value = arg.slice("--persona=".length).trim();
+			if (value) selected = value;
+			continue;
+		}
+		if (arg !== "--persona") continue;
+		const value = args[i + 1];
+		if (value !== undefined && !value.startsWith("-")) {
+			const trimmed = value.trim();
+			if (trimmed) selected = trimmed;
+			i++;
+		}
+	}
+	return selected;
+}
+
+/**
+ * The persona the mind should scope to, mirroring pi-persona's own restore precedence
+ * (`flag ?? defaultPersona ?? (persist ? readLastPersona() : undefined)`): the live `--persona` flag
+ * wins, else the `PI_PERSONA_DEFAULT` env pin, else the on-disk marker when persistence is on
+ * (`PI_PERSONA_PERSIST` ≠ "off"), else the default scope — EXCEPT that flag and pin are only
+ * session-start seeds, so a marker pi-persona rewrote mid-session (`/persona <name>`, the F8 cycle,
+ * `/persona off`) outranks them from that turn on. Mirroring both stages keeps the mind from injecting
+ * or writing a different persona's memory than the one pi-persona actually activated.
+ */
+export function activePersona(agentDir: string, env: NodeJS.ProcessEnv = process.env, cliPersona?: string): string {
+	const named = rawActivePersona(agentDir, env, cliPersona);
 	return named ? sanitizePersona(named) : DEFAULT_PERSONA;
 }
 
+/**
+ * The marker as this process FIRST observed it, per marker path, plus whether it has changed since.
+ * `--persona` and `PI_PERSONA_DEFAULT` are session-start SEEDS: pi-persona activates them without
+ * persisting anything, so a marker that changes afterwards can only be a live `/persona` switch (or
+ * `/persona off`), which pi-persona DOES persist. The change is latched, so switching back to the
+ * name the marker originally held is still recognised as a switch rather than read as the seed.
+ */
+const personaMarkers = new Map<string, { baseline: string | null; stamp: string; switched: boolean }>();
+
+/** Has pi-persona rewritten its marker since this process started? Only a READABLE (or ABSENT) marker
+ *  counts — an oversized or torn one is no evidence of a switch and must never demote the seed. Both
+ *  the named persona AND the file identity are compared: pi-persona persists only on a user gesture
+ *  (`/persona <name>`, the F8 cycle, `/persona off`), so ANY rewrite it made is a live selection, even
+ *  when it re-selects the name the marker already held. */
+function markerSwitched(path: string, marker: MarkerReading): boolean {
+	const seen = personaMarkers.get(path);
+	if (seen === undefined) {
+		if (marker.readable) personaMarkers.set(path, { baseline: marker.persona, stamp: marker.stamp, switched: false });
+		return false;
+	}
+	if (seen.switched) return true;
+	if (!marker.readable) return false;
+	if (seen.baseline === marker.persona && seen.stamp === marker.stamp) return false;
+	seen.switched = true;
+	return true;
+}
+
+/**
+ * Return the unsanitized persona selected by pi-persona's precedence rules, or — once pi-persona has
+ * rewritten its marker mid-session — the persona it switched TO. Initialization also uses this to
+ * reconcile old filenames before the current collision-proof segment is applied.
+ */
+export function rawActivePersona(agentDir: string, env: NodeJS.ProcessEnv = process.env, cliPersona?: string): string | null {
+	const live = cliPersona?.trim();
+	const pin = env.PI_PERSONA_DEFAULT?.trim();
+	const persist = env.PI_PERSONA_PERSIST?.trim().toLowerCase() !== "off";
+	const seed = live ? live : pin ? pin : null;
+	// persist=off: pi-persona neither reads nor writes the marker, so there is no live signal to follow.
+	if (!persist) return seed;
+	const path = personaStateFile(agentDir, env);
+	const marker = readMarker(path);
+	return seed === null || markerSwitched(path, marker) ? marker.persona : seed;
+}
+
+export interface ProjectSlugOptions {
+	/** Injectable for tests and alternate filesystem providers; defaults to realpathSync.native. */
+	realpath?: (path: string) => string;
+	/** Injectable platform seam; defaults to the current Node platform. */
+	platform?: NodeJS.Platform | string;
+}
+
+/** Canonical project identity: resolved, realpathed, and case-folded on Windows. */
+export function canonicalProjectIdentity(projectRoot: string, opts: ProjectSlugOptions = {}): string {
+	const platform = opts.platform ?? process.platform;
+	const resolved = platform === "win32" ? win32.resolve(projectRoot) : resolve(projectRoot);
+	// The default realpath provider is stable for a live project root and is the only path we cache.
+	// Injectable providers stay uncached so tests and alternate filesystems observe every call.
+	const cacheKey = opts.realpath === undefined ? `${platform}\0${platform === "win32" ? resolved.toLowerCase() : resolved}` : undefined;
+	if (cacheKey !== undefined) {
+		const cached = canonicalProjectCache.get(cacheKey);
+		if (cached !== undefined) return cached;
+	}
+	let canonical: string;
+	let cacheable = false;
+	try {
+		canonical = (opts.realpath ?? ((path: string) => realpathSync.native(path)))(resolved);
+		cacheable = true;
+	} catch {
+		canonical = resolved;
+	}
+	if (platform === "win32") canonical = canonical.toLowerCase();
+	if (cacheKey !== undefined && cacheable) {
+		if (canonicalProjectCache.size >= MAX_CANONICAL_CACHE_ENTRIES) {
+			const oldest = canonicalProjectCache.keys().next().value;
+			if (oldest !== undefined) canonicalProjectCache.delete(oldest);
+		}
+		canonicalProjectCache.set(cacheKey, canonical);
+	}
+	return canonical;
+}
+
 /** A stable per-project store name: sanitized basename + a 24-hex hash of the canonical path. */
-export function projectSlug(projectRoot: string): string {
-	const canonical = resolve(projectRoot);
+export function projectSlug(projectRoot: string, opts: ProjectSlugOptions = {}): string {
+	const canonical = canonicalProjectIdentity(projectRoot, opts);
 	const hash = createHash("sha256").update(canonical).digest("hex").slice(0, 24);
+	const baseName = (opts.platform ?? process.platform) === "win32" ? win32.basename(canonical) : basename(canonical);
 	const base =
-		(basename(canonical) || "project")
+		(baseName || "project")
 			.replace(/[^a-zA-Z0-9._-]+/g, "-")
 			.replace(/^-+|-+$/g, "")
 			.slice(0, 48) || "project";
@@ -156,17 +306,58 @@ export function mindPaths(agentDir: string, persona: string, slug: string): Scop
 	};
 }
 
-function tryRead(path: string): string | undefined {
+
+type MarkerRead = { kind: "absent" } | { kind: "unreadable" } | { kind: "present"; raw: string; stamp: string };
+
+const ABSENT: MarkerRead = { kind: "absent" };
+const UNREADABLE: MarkerRead = { kind: "unreadable" };
+
+/**
+ * Read a marker only after a bounded stat, with a second stat guarding replacement/growth. A missing
+ * file is reported as ABSENT rather than folded into "unreadable": the two mean opposite things to
+ * {@link markerSwitched} — absence is pi-persona's own "nothing persisted yet", while an unreadable
+ * marker is no evidence at all. The stamp is the file identity a later read is compared against.
+ */
+function tryRead(path: string): MarkerRead {
+	let fd: number | undefined;
 	try {
-		return readFileSync(path, "utf8");
+		let listed;
+		try {
+			listed = statSync(path);
+		} catch (err) {
+			return (err as NodeJS.ErrnoException).code === "ENOENT" ? ABSENT : UNREADABLE;
+		}
+		if (!listed.isFile() || !Number.isSafeInteger(listed.size) || listed.size > MAX_PERSONA_STATE_BYTES) return UNREADABLE;
+		fd = openSync(path, "r");
+		const opened = fstatSync(fd);
+		if (!opened.isFile() || opened.size !== listed.size || opened.size > MAX_PERSONA_STATE_BYTES) return UNREADABLE;
+		const bytes = Buffer.allocUnsafe(opened.size);
+		let offset = 0;
+		while (offset < bytes.length) {
+			const read = readSync(fd, bytes, offset, bytes.length - offset, offset);
+			if (read === 0) return UNREADABLE;
+			offset += read;
+		}
+		const final = fstatSync(fd);
+		if (!final.isFile() || final.size !== opened.size) return UNREADABLE;
+		return { kind: "present", raw: bytes.toString("utf8"), stamp: `${final.mtimeMs}:${final.size}:${final.ino}:${final.dev}` };
 	} catch {
-		return undefined;
+		return UNREADABLE;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
 	}
 }
 
+export interface ScopeResolutionOptions {
+	/** Live pi-persona `--persona` value. It outranks env and the persisted marker. */
+	cliPersona?: string;
+	/** Injectable process environment for tests/embedders. */
+	env?: NodeJS.ProcessEnv;
+}
+
 /** Resolve the full scope for a turn: active persona, project root, and the store paths. */
-export function resolveScope(agentDir: string, cwd: string): Scope {
-	const persona = activePersona(agentDir);
+export function resolveScope(agentDir: string, cwd: string, opts: ScopeResolutionOptions = {}): Scope {
+	const persona = activePersona(agentDir, opts.env ?? process.env, opts.cliPersona);
 	const projectRoot = findProjectRoot(resolve(cwd), (d) => existsSync(join(d, ".git")));
 	const slug = projectSlug(projectRoot);
 	return { persona, projectRoot, slug, paths: mindPaths(agentDir, persona, slug) };

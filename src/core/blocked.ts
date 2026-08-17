@@ -18,12 +18,21 @@ export interface BlockedCue {
 const MARKERS: readonly RegExp[] = [/\[BLOCKED\b[^\]\n]*\]?/i, /\bFLAG:\s*UNKNOWN\b/i];
 const MAX_SNIPPET = 160;
 
+function safeStatusText(text: string): string {
+	return text
+		.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+		.replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ")
+		.replace(/\s+/g, " ")
+		.trim()
+		.slice(0, MAX_SNIPPET);
+}
+
 /** The first blocked/unknown marker in `text`, or null when the report is clean or not a string. */
 export function detectBlockedLeg(text: string): BlockedCue | null {
 	if (typeof text !== "string" || !text.trim()) return null;
 	for (const re of MARKERS) {
 		const m = re.exec(text);
-		if (m) return { snippet: m[0].trim().slice(0, MAX_SNIPPET) };
+		if (m) return { snippet: safeStatusText(m[0]) };
 	}
 	return null;
 }

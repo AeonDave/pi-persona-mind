@@ -25,6 +25,7 @@
   },
   "files": [
     "src",
+    "docs",
     "README.md",
     "LICENSE"
   ],
@@ -34,7 +35,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test test/*.test.ts",
+    "test": "node --import tsx --import ./test/setup/hermetic-env.ts --test test/*.test.ts",
     "verify": "npm run typecheck && npm test"
   },
   "pi": {
@@ -55,7 +56,7 @@
     }
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.80.9",
+    "@earendil-works/pi-coding-agent": "0.84.2",
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typebox": "*",

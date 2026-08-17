@@ -9,7 +9,7 @@
  * and ranks entries; rendering lives in inject.ts, persistence in store.ts.
  */
 
-import { contentId } from "./ids.ts";
+import { compatibleContentIds, contentId } from "./ids.ts";
 
 export const MEMORY_KINDS = ["objective", "invariant", "preference", "convention", "gotcha", "rationale", "note"] as const;
 export type MemoryKind = (typeof MEMORY_KINDS)[number];
@@ -17,6 +17,40 @@ export type MemoryTerm = "long" | "short";
 
 /** Default life of a short-term memory before it decays out of view. */
 export const DEFAULT_TTL_HOURS = 48;
+export const DEFAULT_RECALL_MAX = 8;
+export const MAX_RECALL_MAX = 50;
+export const MAX_RECALL_QUERY_CHARS = 512;
+export const MAX_MEMORY_TEXT_CHARS = 8_192;
+export const MAX_MEMORY_TAGS = 64;
+export const MAX_MEMORY_TAG_CHARS = 256;
+export const MAX_MEMORY_SOURCE_CHARS = 1_024;
+export const MAX_MEMORY_DERIVED_IDS = 64;
+export const MAX_MEMORY_ID_CHARS = 128;
+const MAX_MEMORY_PERSONA_CHARS = 128;
+const SAFE_MEMORY_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+
+/** IDs are echoed by tools and may arrive from migrated/out-of-band stores; keep them one safe token. */
+export function isMemoryId(value: unknown): value is string {
+	return typeof value === "string" && value.length <= MAX_MEMORY_ID_CHARS && SAFE_MEMORY_ID.test(value);
+}
+
+/** Clamp a user-facing recall page to a small, finite range. */
+export function clampRecallMax(max: number | undefined): number {
+	if (max === undefined || Number.isNaN(max)) return DEFAULT_RECALL_MAX;
+	if (max === Number.POSITIVE_INFINITY) return MAX_RECALL_MAX;
+	if (max === Number.NEGATIVE_INFINITY) return 1;
+	return Math.max(1, Math.min(MAX_RECALL_MAX, Math.floor(max)));
+}
+
+/** Flatten and fence text before putting a persisted entry in a tool result. */
+export function compactMemoryText(text: string, cap = 240): string {
+	const safeCap = Number.isFinite(cap) && cap >= 2 ? Math.floor(cap) : 240;
+	const flat = text
+		.replace(/<\/?persona-mind\b[^>]*>/gi, "[persona-mind]")
+		.replace(/\s+/g, " ")
+		.trim();
+	return flat.length > safeCap ? `${flat.slice(0, safeCap - 1)}…` : flat;
+}
 
 export interface MemoryEntry {
 	/** Content-addressed (kind + text + tags): re-recording the same fact updates in place. */
@@ -25,7 +59,7 @@ export interface MemoryEntry {
 	text: string;
 	tags: string[];
 	recordedAt: string;
-	/** Bumped on recall/injection — drives recency ranking. */
+	/** Bumped when the fact is re-recorded or promoted; reads stay write-free. */
 	lastSeenAt: string;
 	/** The id this entry retires (kept as lineage; the retired entry is removed from the active set). */
 	supersedes?: string;
@@ -50,6 +84,28 @@ export interface MemoryInput {
 	persona?: string;
 	source?: string;
 	derivedFrom?: string[];
+}
+
+function normalizeText(text: string): string {
+	return text.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function normalizeTags(tags: readonly string[]): string[] {
+	return [...new Set(tags.map((t) => t.trim().toLowerCase()).filter(Boolean))].sort();
+}
+
+/** Semantic equality deliberately ignores historical ID encoding and presentation noise. */
+export function memoryContentKey(entry: Pick<MemoryEntry, "kind" | "text" | "tags">): string {
+	return JSON.stringify([entry.kind, normalizeText(entry.text), normalizeTags(entry.tags)]);
+}
+
+export function sameMemoryContent(a: MemoryEntry, b: MemoryEntry): boolean {
+	return memoryContentKey(a) === memoryContentKey(b);
+}
+
+/** True when an id can address this entry under either the current or migrated encoding. */
+export function memoryIdMatches(entry: MemoryEntry, id: string): boolean {
+	return entry.id === id || compatibleContentIds(entry.kind, entry.text, entry.tags).includes(id);
 }
 
 function iso(now: number): string {
@@ -115,22 +171,42 @@ export function nearExpiry(entry: MemoryEntry, now: number, windowMs: number): b
 	return Date.parse(entry.expiresAt) - now <= windowMs;
 }
 
-/**
- * Insert `entry`, deduping by content id (an update-in-place that preserves the original
- * `recordedAt` and bumps `lastSeenAt`) and retiring any entry named by `entry.supersedes`.
- */
-export function upsertMemory(entries: readonly MemoryEntry[], entry: MemoryEntry): MemoryEntry[] {
-	const existing = entries.find((e) => e.id === entry.id);
-	const merged: MemoryEntry = existing
-		? { ...entry, recordedAt: existing.recordedAt, lastSeenAt: entry.recordedAt }
-		: entry;
-	return [...entries.filter((e) => e.id !== entry.id && e.id !== entry.supersedes), merged];
+export interface SupersedeTargets {
+	/** The entries the id may retire — empty when it addresses nothing, or more than one fact. */
+	targets: MemoryEntry[];
+	/** The id names two or more semantically distinct facts, so it cannot pick between them. */
+	ambiguous: boolean;
 }
 
-/** Mark entries as seen now (bumps lastSeenAt) — returns a new array, never mutates the input. */
-export function touch(entries: readonly MemoryEntry[], ids: ReadonlySet<string>, now: number): MemoryEntry[] {
-	if (ids.size === 0) return [...entries];
-	return entries.map((e) => (ids.has(e.id) ? { ...e, lastSeenAt: iso(now) } : e));
+/**
+ * Which entries a `supersedes` id is allowed to retire. Ids are matched across the v1/v2 encodings
+ * (see {@link memoryIdMatches}), so one historical handle can name several distinct facts — the v1
+ * comma-join erased the tag boundary. When it does, NOTHING is retired: this is the same refusal the
+ * delete path makes (`MindService.forget` → `ambiguous_id`), for the same reason — a shared handle is
+ * no evidence about which fact the caller meant, and guessing destroys a durable memory.
+ */
+export function supersedeTargets(entries: readonly MemoryEntry[], id: string): SupersedeTargets {
+	const targets = entries.filter((e) => memoryIdMatches(e, id));
+	const distinct = new Set(targets.map((e) => memoryContentKey(e)));
+	return distinct.size > 1 ? { targets: [], ambiguous: true } : { targets, ambiguous: false };
+}
+
+/**
+ * Insert `entry`, deduping by content id (an update-in-place that preserves the original
+ * `recordedAt` and bumps `lastSeenAt`) and retiring the entry named by `entry.supersedes` — unless
+ * that id is ambiguous, in which case it retires nothing (see {@link supersedeTargets}).
+ */
+export function upsertMemory(entries: readonly MemoryEntry[], entry: MemoryEntry): MemoryEntry[] {
+	const key = memoryContentKey(entry);
+	const existing = entries.find((e) => memoryContentKey(e) === key);
+	const merged: MemoryEntry = existing
+		? { ...entry, id: existing.id, recordedAt: existing.recordedAt, lastSeenAt: entry.recordedAt }
+		: entry;
+	// Retire the previous copy under the SAME semantic key it was found by, never by its id: an id
+	// carried over from a migrated store can be shared with an unrelated fact, and dropping every
+	// entry holding it would erase that fact too.
+	const retired = new Set(entry.supersedes ? supersedeTargets(entries, entry.supersedes).targets : []);
+	return [...entries.filter((e) => memoryContentKey(e) !== key && !retired.has(e)), merged];
 }
 
 export interface RecallOptions {
@@ -138,10 +214,7 @@ export interface RecallOptions {
 }
 
 function queryTerms(query: string): string[] {
-	return query
-		.toLowerCase()
-		.split(/[^a-z0-9]+/)
-		.filter((t) => t.length > 0);
+	return query.toLowerCase().match(/[\p{L}\p{N}\p{M}]+/gu) ?? [];
 }
 
 function haystack(e: MemoryEntry): string {
@@ -197,17 +270,54 @@ function isStringArray(v: unknown): v is string[] {
 	return Array.isArray(v) && v.every((x) => typeof x === "string");
 }
 
+function isBoundedStringArray(v: unknown, maxItems: number, maxChars: number): v is string[] {
+	return isStringArray(v) && v.length <= maxItems && v.every((value) => value.length <= maxChars);
+}
+
+/** A persisted timestamp must be a non-empty string understood by the platform date parser. */
+export function isValidTimestamp(v: unknown): v is string {
+	return typeof v === "string" && v.length > 0 && Number.isFinite(Date.parse(v));
+}
+
 /** Runtime validation for one persisted entry (used as JsonStore.validateEntry). null ⇒ drop. */
 export function validateMemory(raw: unknown): MemoryEntry | null {
 	if (!raw || typeof raw !== "object") return null;
 	const o = raw as Record<string, unknown>;
-	if (typeof o.id !== "string" || !isKind(o.kind) || typeof o.text !== "string") return null;
-	if (!isStringArray(o.tags) || typeof o.recordedAt !== "string" || typeof o.lastSeenAt !== "string") return null;
+	if (!isMemoryId(o.id) || !isKind(o.kind)) return null;
+	if (typeof o.text !== "string" || o.text.length === 0 || o.text.length > MAX_MEMORY_TEXT_CHARS) return null;
+	if (!isBoundedStringArray(o.tags, MAX_MEMORY_TAGS, MAX_MEMORY_TAG_CHARS) || !isValidTimestamp(o.recordedAt) || !isValidTimestamp(o.lastSeenAt)) return null;
 	const entry: MemoryEntry = { id: o.id, kind: o.kind, text: o.text, tags: o.tags, recordedAt: o.recordedAt, lastSeenAt: o.lastSeenAt };
-	if (typeof o.supersedes === "string") entry.supersedes = o.supersedes;
-	if (typeof o.persona === "string") entry.persona = o.persona;
-	if (typeof o.expiresAt === "string") entry.expiresAt = o.expiresAt;
-	if (typeof o.source === "string") entry.source = o.source;
-	if (isStringArray(o.derivedFrom)) entry.derivedFrom = o.derivedFrom;
+	if (o.supersedes !== undefined) {
+		if (!isMemoryId(o.supersedes)) return null;
+		entry.supersedes = o.supersedes;
+	}
+	if (o.persona !== undefined) {
+		if (typeof o.persona !== "string" || o.persona.length === 0 || o.persona.length > MAX_MEMORY_PERSONA_CHARS) return null;
+		entry.persona = o.persona;
+	}
+	if (o.expiresAt !== undefined) {
+		if (!isValidTimestamp(o.expiresAt)) return null;
+		entry.expiresAt = o.expiresAt;
+	}
+	if (o.source !== undefined) {
+		if (typeof o.source !== "string" || o.source.length > MAX_MEMORY_SOURCE_CHARS) return null;
+		entry.source = o.source;
+	}
+	if (o.derivedFrom !== undefined) {
+		if (!isBoundedStringArray(o.derivedFrom, MAX_MEMORY_DERIVED_IDS, MAX_MEMORY_ID_CHARS) || o.derivedFrom.some((id) => !isMemoryId(id))) return null;
+		entry.derivedFrom = o.derivedFrom;
+	}
 	return entry;
+}
+
+/** Validator for the durable tier: an LTM record must not carry short-term expiry metadata. */
+export function validateLongMemory(raw: unknown): MemoryEntry | null {
+	const entry = validateMemory(raw);
+	return entry && entry.expiresAt === undefined ? entry : null;
+}
+
+/** Validator for the working tier: an STM record must carry a valid expiry timestamp. */
+export function validateShortMemory(raw: unknown): MemoryEntry | null {
+	const entry = validateMemory(raw);
+	return entry && entry.expiresAt !== undefined ? entry : null;
 }

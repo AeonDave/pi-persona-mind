@@ -5,20 +5,23 @@
  * block into the system prompt every turn (so memory survives compaction + restart), re-arms
  * durable backlog wake timers on session start AND delivers any that came due while offline, and
  * offers a read-only `/mind` view. All heavy lifting lives in the pure core; this factory is thin.
- * The only coupling to pi-persona is a best-effort read of its active-persona marker (see
- * core/scope.ts); absent it, everything runs under a `_default` scope.
+ * The only coupling to pi-persona is a best-effort read of its live CLI selector / active-persona
+ * marker (see core/scope.ts); absent both, everything runs under a `_default` scope.
  */
 
-import { closeSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, lstatSync, openSync, readSync, unlinkSync, writeSync } from "node:fs";
 import { hostname } from "node:os";
+import { join } from "node:path";
 
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { detectBlockedLeg } from "./core/blocked.ts";
-import { detectCaptureCue } from "./core/capture.ts";
+import { captureMode, detectCaptureCues, type CaptureCue } from "./core/capture.ts";
 import { EMPTY_HINT_PREFIX } from "./core/inject.ts";
-import { preferredAgentDir, resolveScope } from "./core/scope.ts";
+import { compactMemoryText } from "./core/memory.ts";
+import { inspectStoreFile, migrateCurrentScopeAliases, migrateLegacyRoot, type MigrationReport, type StoreDiagnostic } from "./core/migrate.ts";
+import { personaFromCliArgs, preferredAgentDir, rawActivePersona, resolveScope } from "./core/scope.ts";
 import { MindService } from "./core/service.ts";
 import { registerBacklogTool } from "./tools/backlog.ts";
 import { registerMemoryTool } from "./tools/memory.ts";
@@ -26,9 +29,12 @@ import { registerMemoryTool } from "./tools/memory.ts";
 const STATUS_KEY = "pi-persona-mind";
 /** A stalled read must never freeze a turn: injection degrades to nothing past this deadline. */
 const INJECT_DEADLINE_MS = 750;
-/** A wake-owner lock older than this (with no liveness signal) is considered abandoned. */
-const OWNER_STALE_MS = 120_000;
-
+const MIGRATION_AWAIT_MS = 100;
+const MAX_TIMER_DELAY_MS = 2_147_000_000;
+const MAX_WAKE_REMINDERS = 20;
+const MAX_WAKE_TEXT_CHARS = 200;
+const MAX_WAKE_OWNER_BYTES = 1024;
+type WakeState = Awaited<ReturnType<MindService["backlogList"]>>;
 // Unique per extension instance (not just per process): two instances in one process must not both
 // believe they own the wake lock. Date/random are fine in the real runtime (unlike workflow scripts).
 let ownerInstanceSeq = 0;
@@ -36,6 +42,14 @@ let ownerInstanceSeq = 0;
 export interface ExtensionOptions {
 	/** Override the agent dir (tests). Defaults to Pi's getAgentDir(). */
 	agentDir?: string;
+	/** Maximum time lifecycle hooks wait for migration; the migration continues in the background. */
+	migrationAwaitMs?: number;
+	/** Injectable timer ceiling for testing long wake delays. */
+	wakeTimerMaxDelayMs?: number;
+	/** Narrow lifecycle seam for deterministic wake read/race tests. */
+	wakeStateReader?: (mind: MindService) => Promise<WakeState>;
+	/** Raw Pi CLI args seam. Defaults to process.argv.slice(2); used for the one-shot --persona selector. */
+	cliArgs?: readonly string[];
 }
 
 function isAlive(pid: number): boolean {
@@ -47,9 +61,41 @@ function isAlive(pid: number): boolean {
 	}
 }
 
-export function ownerIsStale(path: string, token: string): boolean {
+type WakeOwnerRead =
+	| { status: "ok"; token: string }
+	| { status: "missing" | "unreadable" | "nonregular" | "oversized" };
+
+/** Read only a tiny, regular wake-owner file; owner locks are coordination metadata, not a data file. */
+function readWakeOwner(path: string): WakeOwnerRead {
+	let fd: number | undefined;
 	try {
-		const content = readFileSync(path, "utf8");
+		const linkStat = lstatSync(path);
+		if (linkStat.isSymbolicLink() || !linkStat.isFile()) return { status: "nonregular" };
+		fd = openSync(path, "r");
+		if (!fstatSync(fd).isFile()) return { status: "nonregular" };
+		const bytes = Buffer.allocUnsafe(MAX_WAKE_OWNER_BYTES + 1);
+		const length = readSync(fd, bytes, 0, bytes.length, 0);
+		if (length > MAX_WAKE_OWNER_BYTES) return { status: "oversized" };
+		return { status: "ok", token: bytes.subarray(0, length).toString("utf8") };
+	} catch (err) {
+		return { status: (err as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unreadable" };
+	} finally {
+		if (fd !== undefined) {
+			try {
+				closeSync(fd);
+			} catch {
+				/* raced close */
+			}
+		}
+	}
+}
+
+export function ownerIsStale(path: string, token: string): boolean {
+	const owner = readWakeOwner(path);
+	if (owner.status === "missing") return true;
+	if (owner.status !== "ok") return false;
+	try {
+		const content = owner.token;
 		if (content === token) return false; // ours
 		const colon = content.indexOf(":");
 		const host = colon < 0 ? "" : content.slice(0, colon);
@@ -60,55 +106,116 @@ export function ownerIsStale(path: string, token: string): boolean {
 			// still-alive owner's lock and both would then fire the same backlog wakes).
 			return !isAlive(pid);
 		}
-		// Foreign host / unparseable token (network FS, legacy): fall back to the mtime rule.
-		return Date.now() - statSync(path).mtimeMs > OWNER_STALE_MS;
-	} catch (err) {
-		// Vanished ⇒ claimable; a transient read error (AV lock, EPERM) must NOT steal a live owner.
-		return (err as NodeJS.ErrnoException).code === "ENOENT";
+		// Foreign host / unparseable token cannot be proven dead. Fail closed: time-stealing a live
+		// foreign owner can make two sessions deliver the same wake. Manual cleanup is safer.
+		return false;
+	} catch {
+		return false;
 	}
 }
 
 /** Non-blocking claim of the per-project wake-firer lock. Only the owner arms/fires wakes. */
 function claimWakeOwner(path: string, token: string): boolean {
 	for (let attempt = 0; attempt < 2; attempt++) {
+		let fd: number | undefined;
+		let created = false;
+		let createError: unknown;
 		try {
-			const fd = openSync(path, "wx");
+			fd = openSync(path, "wx");
+			created = true;
 			writeSync(fd, token);
-			closeSync(fd);
+		} catch (err) {
+			createError = err;
+		} finally {
+			if (fd !== undefined) {
+				try {
+					closeSync(fd);
+				} catch {
+					/* best effort; the create error remains authoritative */
+				}
+			}
+		}
+		if (created && createError !== undefined) {
+			// A failed write can strand an empty file. Remove it only while it is still empty; a
+			// non-empty replacement may belong to a racing claimant and must be left untouched.
+			const current = readWakeOwner(path);
+			if (current.status === "ok" && current.token === "") {
+				try {
+					unlinkSync(path);
+				} catch {
+					/* raced */
+				}
+			}
+			return false;
+		}
+		if (created) {
 			// Confirm our token actually stuck: a racing stealer's unlink+recreate could have replaced
 			// it between our create and now. If the lock isn't ours, we do NOT own the wakes — retry.
-			try {
-				if (readFileSync(path, "utf8") === token) return true;
-			} catch {
-				/* vanished — retry */
-			}
+			const current = readWakeOwner(path);
+			if (current.status === "ok" && current.token === token) return true;
 			continue;
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code !== "EEXIST") return false;
-			try {
-				if (readFileSync(path, "utf8") === token) return true; // re-claim ours
-			} catch {
-				/* fall through */
-			}
-			if (!ownerIsStale(path, token)) return false; // a live holder owns it
-			try {
-				unlinkSync(path);
-			} catch {
-				/* raced */
-			}
+		}
+		if ((createError as NodeJS.ErrnoException | undefined)?.code !== "EEXIST") return false;
+		const current = readWakeOwner(path);
+		if (current.status === "ok" && current.token === token) return true; // re-claim ours
+		if (!ownerIsStale(path, token)) return false; // a live holder owns it
+		try {
+			unlinkSync(path);
+		} catch {
+			/* raced */
 		}
 	}
 	return false;
 }
 
-function withDeadline<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
-	return Promise.race([
-		p,
-		new Promise<T>((res) => {
-			const t = setTimeout(() => res(fallback), ms);
-			t.unref?.();
-		}),
-	]);
+/** Explain an owner lock that cannot be safely claimed; live local owners remain quiet by design. */
+function wakeOwnerWarning(path: string, token: string): string | undefined {
+	const owner = readWakeOwner(path);
+	if (owner.status === "missing") return undefined;
+	if (owner.status === "oversized") return "wake owner lock is oversized; wakes are suppressed until it is removed (see /mind doctor)";
+	if (owner.status !== "ok") return "wake owner lock is unreadable or non-regular; wakes are suppressed until it is removed (see /mind doctor)";
+	const content = owner.token;
+	if (!content) {
+		return "wake owner lock is malformed; wakes are suppressed until it is removed (see /mind doctor)";
+	}
+	if (content === token) return undefined;
+	const fields = content.split(":");
+	const pid = fields.length === 3 ? Number.parseInt(fields[1] ?? "", 10) : NaN;
+	if (fields.length !== 3 || !fields[0] || !Number.isInteger(pid) || pid <= 0 || !fields[2]) {
+		return "wake owner lock is malformed; wakes are suppressed until it is removed (see /mind doctor)";
+	}
+	if (fields[0] !== hostname()) {
+		const safeHost = fields[0].replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64) || "unknown";
+		return `wake owner lock belongs to foreign host '${safeHost}'; wakes are suppressed until it is removed (see /mind doctor)`;
+	}
+	return undefined;
+}
+
+function withDeadline<T>(p: Promise<T>, ms: number, fallback: T, onTimeout?: () => void): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		let settled = false;
+		const timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			onTimeout?.();
+			resolve(fallback);
+		}, ms);
+		timer.unref?.();
+		void p.then(
+			(value) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				resolve(value);
+			},
+			(err: unknown) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				reject(err);
+			},
+		);
+	});
 }
 
 /** Build the extension. Exported (separately from the default factory) so tests can inject agentDir. */
@@ -118,8 +225,154 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	// called when neither an explicit override (tests) nor PI_AGENT_DIR is set.
 	const agentDir = preferredAgentDir(opts.agentDir) ?? getAgentDir();
 	const nudgeEnabled = process.env.PI_PERSONA_MIND_NUDGE !== "off";
+	const capturePolicy = captureMode();
+	// pi-persona's one-shot `--persona` selector deliberately does not update its persisted marker.
+	// Pi scopes getFlag() to the extension that registered a flag and rejects duplicate declarations,
+	// so a companion extension must mirror this CLI-only selector from argv. Persona names stay opaque.
+	const liveCliPersona = (): string | undefined => personaFromCliArgs(opts.cliArgs ?? process.argv.slice(2));
+	const resolveMindScope = (ctx: ExtensionContext) => {
+		const cliPersona = liveCliPersona();
+		return cliPersona === undefined ? resolveScope(agentDir, ctx.cwd) : resolveScope(agentDir, ctx.cwd, { cliPersona });
+	};
+	const rawMindPersona = (): string | null => rawActivePersona(agentDir, process.env, liveCliPersona());
+	const migrationWaitMs = Math.max(0, opts.migrationAwaitMs ?? MIGRATION_AWAIT_MS);
+	const wakeTimerMaxDelayMs = Math.min(MAX_TIMER_DELAY_MS, Math.max(1, opts.wakeTimerMaxDelayMs ?? MAX_TIMER_DELAY_MS));
 	const ownerToken = `${hostname()}:${process.pid}:${++ownerInstanceSeq}`;
-	const getMind = (ctx: ExtensionContext): MindService => new MindService(resolveScope(agentDir, ctx.cwd));
+	const warnings = new Set<string>();
+	let warningStatusActive = false;
+	const setStatus = (ctx: ExtensionContext, value: string, color: "warning" | "dim" | "accent" = "dim"): void => {
+		try {
+			ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme ? ctx.ui.theme.fg(color, value) : value);
+		} catch {
+			/* cosmetic */
+		}
+	};
+	const surfaceWarning = (ctx: ExtensionContext, message: string): void => {
+		if (warnings.has(message)) return;
+		warnings.add(message);
+		warningStatusActive = true;
+		try {
+			ctx.ui.notify(`[pi-persona-mind] ${message}`, "warning");
+		} catch {
+			/* a diagnostic must not break the host */
+		}
+		setStatus(ctx, "mind warning · /mind doctor", "warning");
+	};
+	const getMind = (ctx: ExtensionContext): MindService =>
+		new MindService(resolveMindScope(ctx), { onWarn: (message) => surfaceWarning(ctx, message) });
+	let rootMigration: Promise<MigrationReport> | undefined;
+	let backgroundMigration: Promise<MigrationReport> | undefined;
+	let backgroundMigrationKey: string | undefined;
+	const aliasMigrations = new Map<string, Promise<MigrationReport>>();
+	let migrationNoticeShown = false;
+	let migrationGeneration = 0;
+	let sessionActive = false;
+	let sessionStarting = false;
+	let lastArmedMigrationGeneration = 0;
+
+	const mergeReports = (a: MigrationReport, b: MigrationReport): MigrationReport => ({
+		filesScanned: a.filesScanned + b.filesScanned,
+		filesSkipped: a.filesSkipped + b.filesSkipped,
+		filesMigrated: a.filesMigrated + b.filesMigrated,
+		entriesSeen: a.entriesSeen + b.entriesSeen,
+		entriesAdded: a.entriesAdded + b.entriesAdded,
+		conflicts: a.conflicts + b.conflicts,
+		invalidEntries: a.invalidEntries + b.invalidEntries,
+		warnings: [...a.warnings, ...b.warnings],
+	});
+	const reportMigration = (ctx: ExtensionContext, report: MigrationReport): void => {
+		if (report.warnings.length === 1) surfaceWarning(ctx, report.warnings[0] ?? "legacy memory migration reported a warning");
+		else if (report.warnings.length > 1) {
+			const shown = report.warnings.slice(0, 4).join(" | ");
+			surfaceWarning(ctx, `legacy memory migration reported ${report.warnings.length} warnings: ${shown}${report.warnings.length > 4 ? ` | +${report.warnings.length - 4} more` : ""}`);
+		}
+		if (report.entriesAdded > 0 && !migrationNoticeShown) {
+			migrationNoticeShown = true;
+			try {
+				ctx.ui.notify(
+					`[pi-persona-mind] Imported/reconciled ${report.entriesAdded} stored entr${report.entriesAdded === 1 ? "y" : "ies"} from legacy scope paths; source files were left untouched.`,
+					"info",
+				);
+			} catch {
+				/* headless/no UI */
+			}
+		}
+	};
+	const runMigration = async (ctx: ExtensionContext, includeAmbiguousPersonaAlias: boolean): Promise<MigrationReport> => {
+		const rootReport = await (rootMigration ??= migrateLegacyRoot(agentDir));
+		const scope = resolveMindScope(ctx);
+		const rawPersona = rawMindPersona();
+		const aliasKey = JSON.stringify([rawPersona, scope.projectRoot, includeAmbiguousPersonaAlias]);
+		let aliasPromise = aliasMigrations.get(aliasKey);
+		if (!aliasPromise) {
+			aliasPromise = migrateCurrentScopeAliases(agentDir, rawPersona, scope.projectRoot, { includeAmbiguousPersonaAlias });
+			aliasMigrations.set(aliasKey, aliasPromise);
+		}
+		return mergeReports(rootReport, await aliasPromise);
+	};
+	const rearmAfterMigration = (ctx: ExtensionContext): void => {
+		if (!sessionActive || sessionStarting || migrationGeneration <= lastArmedMigrationGeneration) return;
+		const scope = resolveMindScope(ctx);
+		if (activeScopeKey !== JSON.stringify([scope.persona, scope.projectRoot])) return;
+		void (async () => {
+			try {
+				await armWakes(ctx);
+				lastArmedMigrationGeneration = migrationGeneration;
+				await refreshStatus(ctx);
+			} catch (err) {
+				surfaceWarning(ctx, `could not refresh after memory migration: ${err instanceof Error ? err.message : String(err)}`);
+			}
+		})();
+	};
+	const startBackgroundMigration = (ctx: ExtensionContext): Promise<MigrationReport> => {
+		const scope = resolveMindScope(ctx);
+		const key = JSON.stringify([rawMindPersona(), scope.projectRoot]);
+		if (backgroundMigration && backgroundMigrationKey === key) return backgroundMigration;
+		const task = runMigration(ctx, false);
+		backgroundMigration = task;
+		backgroundMigrationKey = key;
+		void task.then(
+			(report) => {
+				reportMigration(ctx, report);
+				migrationGeneration++;
+				rearmAfterMigration(ctx);
+			},
+			(err: unknown) => {
+				backgroundMigration = undefined;
+				backgroundMigrationKey = undefined;
+				rootMigration = undefined;
+				aliasMigrations.clear();
+				surfaceWarning(ctx, `legacy memory migration failed; continuing and will retry: ${err instanceof Error ? err.message : String(err)}`);
+			},
+		).catch((err: unknown) => {
+			backgroundMigration = undefined;
+			backgroundMigrationKey = undefined;
+			surfaceWarning(ctx, `legacy memory migration completion failed; continuing and will retry: ${err instanceof Error ? err.message : String(err)}`);
+		});
+		return task;
+	};
+	const ensureLegacyMigrated = async (ctx: ExtensionContext, includeAmbiguousPersonaAlias = false, awaitCompletion = false): Promise<void> => {
+		if (isDelegatedLeg) return;
+		const task = includeAmbiguousPersonaAlias ? runMigration(ctx, true) : startBackgroundMigration(ctx);
+		try {
+			if (includeAmbiguousPersonaAlias || awaitCompletion) {
+				const report = await task;
+				if (includeAmbiguousPersonaAlias || awaitCompletion) reportMigration(ctx, report);
+				return;
+			}
+			await withDeadline(task, migrationWaitMs, undefined, () =>
+				surfaceWarning(ctx, `legacy memory migration is still running; continuing this turn and will retry in the background`),
+			);
+		} catch (err) {
+			if (!includeAmbiguousPersonaAlias) {
+				backgroundMigration = undefined;
+				backgroundMigrationKey = undefined;
+			}
+			rootMigration = undefined;
+			aliasMigrations.clear();
+			surfaceWarning(ctx, `legacy memory migration failed; continuing and will retry: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	};
 
 	// A DELEGATED worker leg? pi-persona (≥ 1.5.2) marks its sub-agent sessions with a DEDICATED marker,
 	// PI_PERSONA_LEG=1 — the in-process fork-bomb guard sets it transiently around session creation, and
@@ -143,67 +396,131 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	// never double-deliver. In-memory, unref'd, re-armed from disk on session start; cleared on shutdown.
 	const timers = new Map<string, ReturnType<typeof setTimeout>>();
 	let ownerPath: string | undefined;
+	let wakeGeneration = 0;
+	const readWakeState = opts.wakeStateReader ?? ((mind: MindService): Promise<WakeState> => mind.backlogList({ all: true }));
 	const clearTimers = (): void => {
 		for (const t of timers.values()) clearTimeout(t);
 		timers.clear();
 	};
-	const armWakes = async (ctx: ExtensionContext): Promise<void> => {
+	const releaseWakeOwner = (): void => {
+		if (!ownerPath) return;
+		try {
+			const owner = readWakeOwner(ownerPath);
+			if (owner.status === "ok" && owner.token === ownerToken) unlinkSync(ownerPath);
+		} catch {
+			/* already released */
+		}
+		ownerPath = undefined;
+	};
+	const armWakes = async (ctx: ExtensionContext, deliverPastDue = true): Promise<void> => {
+		const generation = ++wakeGeneration;
 		clearTimers();
-		const scope = resolveScope(agentDir, ctx.cwd);
-		ownerPath = `${scope.paths.backlog}.wakeowner`;
-		if (!claimWakeOwner(ownerPath, ownerToken)) {
-			ownerPath = undefined; // another live session owns the wakes; we still inject, just don't fire
+		const scope = resolveMindScope(ctx);
+		const nextOwnerPath = `${scope.paths.backlog}.wakeowner`;
+		ownerPath = nextOwnerPath;
+		if (!claimWakeOwner(nextOwnerPath, ownerToken)) {
+			const warning = wakeOwnerWarning(nextOwnerPath, ownerToken);
+			if (warning) surfaceWarning(ctx, warning);
+			if (wakeGeneration === generation && ownerPath === nextOwnerPath) ownerPath = undefined; // another live session owns the wakes; we still inject, just don't fire
 			return;
 		}
-		const mind = new MindService(scope);
-		const now = Date.now();
+		const mind = getMind(ctx);
 		let all: Awaited<ReturnType<MindService["backlogList"]>>;
-		let due: Awaited<ReturnType<MindService["dueBacklog"]>>;
 		try {
-			[all, due] = await Promise.all([mind.backlogList({ all: true }), mind.dueBacklog()]);
-		} catch {
+			all = await readWakeState(mind);
+		} catch (err) {
+			if (sessionActive && wakeGeneration === generation && ownerPath === nextOwnerPath) {
+				surfaceWarning(ctx, `could not load backlog wake state: ${err instanceof Error ? err.message : String(err)}`);
+			}
+			if (wakeGeneration === generation && ownerPath === nextOwnerPath) releaseWakeOwner();
+			return;
+		}
+		const now = Date.now();
+		if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) {
+			if (wakeGeneration === generation && ownerPath === nextOwnerPath) releaseWakeOwner();
 			return;
 		}
 		// (rank 3) Deliver items that came due while offline as ONE combined reminder, instead of dropping them.
-		if (due.length > 0) {
+		const due = all.filter((item) => item.dueAtEpochMs !== undefined && item.dueAtEpochMs <= now);
+		if (deliverPastDue && due.length > 0) {
 			try {
-				const list = due.map((e) => `• ${e.text} (id ${e.id})`).join("\n");
-				pi.sendUserMessage(`[pi-persona-mind] ${due.length} backlog item(s) came due while you were away:\n${list}\nUse \`backlog take <id>\` or \`backlog drop <id>\`.`);
+				const shown = due.slice(0, MAX_WAKE_REMINDERS);
+				const list = shown.map((e) => `• ${compactMemoryText(e.text, MAX_WAKE_TEXT_CHARS)} (id ${e.id})`).join("\n");
+				const omitted = due.length - shown.length;
+				const more = omitted > 0 ? `\n… +${omitted} more due item(s); use \`backlog list\` to review them.` : "";
+				if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
+				pi.sendUserMessage(`[pi-persona-mind] ${due.length} backlog item(s) came due while you were away:\n${list}${more}\nUse \`backlog take <id>\` or \`backlog drop <id>\`.`, { deliverAs: "followUp" });
 			} catch {
 				/* raced shutdown */
 			}
 		}
 		// Schedule the future ones.
-		for (const item of all) {
-			if ((item.state !== "open" && item.state !== "taken") || item.dueAtEpochMs === undefined) continue;
-			const delay = item.dueAtEpochMs - now;
-			if (delay <= 0 || timers.has(item.id)) continue;
+		const scheduleWake = (item: (typeof all)[number], remainingMs: number): void => {
+			if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
+			const delay = Math.min(Math.max(1, remainingMs), wakeTimerMaxDelayMs);
 			const t = setTimeout(() => {
+				if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
 				timers.delete(item.id);
-				// Re-check state at fire time: nothing cancels this timer when the item is done/dropped,
-				// so reload and only nag if the item is still unfinished — never act on dead intent.
+				// Re-check at every chunk. This avoids Node's ~24.8-day timer overflow and also notices
+				// a completed/dropped item before re-arming the next chunk.
 				void (async () => {
 					try {
-						const live = (await mind.backlogList({ all: true })).find((e) => e.id === item.id);
-						if (!live || (live.state !== "open" && live.state !== "taken")) return;
-						pi.sendUserMessage(`[pi-persona-mind] backlog due — ${live.text} (id ${live.id}). Use \`backlog take ${live.id}\` to act on it, or \`backlog drop ${live.id}\`.`);
-					} catch {
-						/* raced shutdown / read error */
+						if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
+						const live = (await mind.backlogList({ all: true })).find((entry) => entry.id === item.id);
+						if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
+						if (!live || (live.state !== "open" && live.state !== "taken") || live.dueAtEpochMs === undefined) return;
+						const left = live.dueAtEpochMs - Date.now();
+						if (left > 0) {
+							scheduleWake(live, left);
+							return;
+						}
+						if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
+						pi.sendUserMessage(`[pi-persona-mind] backlog due — ${compactMemoryText(live.text, MAX_WAKE_TEXT_CHARS)} (id ${live.id}). Use \`backlog take ${live.id}\` to act on it, or \`backlog drop ${live.id}\`.`, { deliverAs: "followUp" });
+					} catch (err) {
+						if (sessionActive && wakeGeneration === generation && ownerPath === nextOwnerPath) surfaceWarning(ctx, `could not re-check due backlog item ${item.id}: ${err instanceof Error ? err.message : String(err)}`);
 					}
 				})();
 			}, delay);
 			t.unref?.();
 			timers.set(item.id, t);
+		};
+		for (const item of all) {
+			if ((item.state !== "open" && item.state !== "taken") || item.dueAtEpochMs === undefined) continue;
+			const delay = item.dueAtEpochMs - now;
+			if (delay <= 0 || timers.has(item.id)) continue;
+			scheduleWake(item, delay);
+		}
+	};
+	let activeScopeKey: string | undefined;
+	const reconcileScope = async (ctx: ExtensionContext): Promise<void> => {
+		const scope = resolveMindScope(ctx);
+		const nextKey = JSON.stringify([scope.persona, scope.projectRoot]);
+		if (activeScopeKey === undefined) {
+			activeScopeKey = nextKey;
+			return;
+		}
+		if (activeScopeKey === nextKey) return;
+		clearTimers();
+		releaseWakeOwner();
+		activeScopeKey = nextKey;
+		if (sessionActive && !isDelegatedLeg) {
+			await armWakes(ctx);
+			lastArmedMigrationGeneration = migrationGeneration;
+			await refreshStatus(ctx);
 		}
 	};
 
 	const refreshStatus = async (ctx: ExtensionContext): Promise<void> => {
 		try {
 			const s = await getMind(ctx).summary();
+			if (warningStatusActive) {
+				setStatus(ctx, "mind warning · /mind doctor", "warning");
+				return;
+			}
 			const label = `mind ${s.ltm}L·${s.stm}S · backlog ${s.backlogOpen}`;
-			ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme ? ctx.ui.theme.fg("dim", label) : label);
-		} catch {
-			/* status is cosmetic — never break a turn for it */
+			setStatus(ctx, label);
+		} catch (err) {
+			surfaceWarning(ctx, `could not refresh memory status: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	};
 
@@ -218,44 +535,180 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			/* cosmetic */
 		}
 	};
+	const isDelegatedReport = (prompt: string): boolean => /^\[pi-persona\]\s+\d+\s+async runs? settled\b/i.test(prompt);
 
-	// Cue snippets already surfaced as a PROMPT hint this session: a strong persist-intent cue is
-	// hinted at most once, so it stays a one-time gentle nudge rather than a per-turn nag.
+	interface CaptureNotice {
+		hint: string;
+	}
+	let pendingCaptureNotice: CaptureNotice | undefined;
+	let pendingInputProvenance: { source: "interactive" | "rpc" | "extension" } | undefined;
+	let latestDirectInputPrompt: string | undefined;
+	const directInputPrompts = new Set<string>();
+	const rememberDirectInputPrompt = (prompt: string): void => {
+		directInputPrompts.delete(prompt);
+		directInputPrompts.add(prompt);
+		while (directInputPrompts.size > 128) {
+			const oldest = directInputPrompts.values().next().value as string | undefined;
+			if (oldest === undefined) break;
+			directInputPrompts.delete(oldest);
+		}
+	};
+	// Cue snippets already surfaced in the prompt this session: at most once per direct statement.
 	const cueHinted = new Set<string>();
+	const rememberCueHint = (snippet: string): void => {
+		cueHinted.delete(snippet);
+		cueHinted.add(snippet);
+		while (cueHinted.size > 128) {
+			const oldest = cueHinted.values().next().value as string | undefined;
+			if (oldest === undefined) break;
+			cueHinted.delete(oldest);
+		}
+	};
 	// The empty-mind discoverability line is an ANNOUNCEMENT — shown once per session, not a banner that
 	// persists every turn while the mind stays empty (that would be the nag we avoid).
 	let emptyAnnounced = false;
+	const captureDirectCues = async (text: string, ctx: ExtensionContext): Promise<CaptureNotice | undefined> => {
+		await ensureLegacyMigrated(ctx);
+		await reconcileScope(ctx);
+		const cues = detectCaptureCues(text);
+		if (cues.length === 0) return undefined;
+		const explicit = capturePolicy === "auto" ? cues.filter((cue) => cue.strong) : [];
+		const stored: string[] = [];
+		const failures: string[] = [];
+		if (explicit.length > 0) {
+			const mind = getMind(ctx);
+			for (const cue of explicit) {
+				const label = cue.kind === "preference" ? "User preference" : cue.kind === "rationale" ? "Durable user decision" : "User explicitly asked to retain";
+				const result = await mind.remember({
+					term: cue.term,
+					kind: cue.kind,
+					text: `${label}: ${cue.candidate}`,
+					tags: ["auto-captured"],
+					source: "direct user persistence cue",
+				});
+				if (result.ok) stored.push(result.entry.id);
+				else failures.push(result.reason);
+				rememberCueHint(cue.snippet);
+			}
+		}
+
+		let hint = "";
+		if (stored.length > 0) {
+			hint = `⟢ pi-persona-mind — already captured ${stored.length} explicit user memor${stored.length === 1 ? "y" : "ies"} (${stored.join(", ")}); do not duplicate ${stored.length === 1 ? "it" : "them"}.`;
+			try {
+				ctx.ui.notify(`[pi-persona-mind] Captured ${stored.length} explicit memor${stored.length === 1 ? "y" : "ies"}.`, "info");
+			} catch {
+				/* headless/no UI */
+			}
+			await refreshStatus(ctx);
+		}
+		if (failures.length > 0) {
+			const reason = failures[0] ?? "unknown storage failure";
+			const retryHint = `⚠ pi-persona-mind could not auto-capture one explicit user memory: ${reason}. Before final, retry once with a safe declarative \`memory remember\` entry.`;
+			hint = [hint, retryHint].filter(Boolean).join("\n\n");
+			surfaceWarning(ctx, `automatic capture failed: ${reason}`);
+		}
+		if (!hint && nudgeEnabled) {
+			const cue = cues[0];
+			if (cue) {
+				rememberCueHint(cue.snippet);
+				hint = `⟢ pi-persona-mind — possible durable ${cue.kind} detected in direct user input. Save one safe declarative memory only if it should outlive this task.`;
+				try {
+					ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme ? ctx.ui.theme.fg("accent", `💡 worth remembering? memory remember (${cue.kind})`) : `💡 worth remembering? (${cue.kind})`);
+				} catch {
+					/* cosmetic */
+				}
+			}
+		}
+		return hint ? { hint } : undefined;
+	};
+
+	// Capture only INPUT owned by the user. Extension-authored follow-ups and delegated reports are
+	// foreign data; before_agent_start cannot distinguish them, but the input event can. Direct,
+	// explicit persist-intent is safe to commit deterministically before the model runs. Everything
+	// softer remains a model-visible candidate governed by the standing tool guideline.
+	pi.on("input", async (event, ctx) => {
+		pendingInputProvenance = { source: event.source };
+		if (event.source === "extension") {
+			pendingCaptureNotice = undefined;
+			return;
+		}
+		if (isDelegatedLeg || capturePolicy === "off") {
+			pendingCaptureNotice = undefined;
+			return;
+		}
+		latestDirectInputPrompt = event.text;
+		rememberDirectInputPrompt(event.text);
+		pendingCaptureNotice = await captureDirectCues(event.text, ctx);
+	});
+
+	const customMessageText = (content: unknown): string => {
+		if (typeof content === "string") return content;
+		if (!Array.isArray(content)) return "";
+		return content
+			.map((part) => (part && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string" ? (part as { text: string }).text : ""))
+			.filter(Boolean)
+			.join("\n");
+	};
+
+	// pi-persona's custom follow-ups call Pi's sendMessage(), which bypasses BOTH the input and
+	// before_agent_start hooks. Observe their attributed message type directly: a deferred input is
+	// still the user's own text and may be auto-captured; async child/exocom reports remain foreign.
+	pi.on("message_start", async (event, ctx) => {
+		const message = event.message;
+		if (message.role !== "custom") return;
+		pendingInputProvenance = { source: "extension" };
+		pendingCaptureNotice = undefined;
+		const text = customMessageText(message.content);
+		if (!text) return;
+		if (message.customType === "pi-persona") {
+			const blocked = nudgeEnabled ? detectBlockedLeg(text) : undefined;
+			if (blocked) nudgeBlocked(ctx, blocked.snippet);
+			return;
+		}
+		if (message.customType !== "pi-persona-deferred-input" || isDelegatedLeg || capturePolicy === "off") return;
+		latestDirectInputPrompt = text;
+		rememberDirectInputPrompt(text);
+		await captureDirectCues(text, ctx);
+	});
 
 	// Inject the mind into every turn. before_agent_start re-fires after compaction, so this is also
 	// how memory survives compaction: it re-injects from disk. Fail-open: a stalled read (slow disk,
 	// lock contention) degrades to no injection rather than hanging the turn.
 	pi.on("before_agent_start", async (event, ctx) => {
-		// Deterministic, model-free capture nudge: if the user's message signals a durable
-		// preference/instruction, surface a gentle hint (no LLM, no auto-write, never obligatory).
-		// Supervisor-only: a worker has no memory tools to act on it, and its "prompt" is a task packet.
+		await ensureLegacyMigrated(ctx);
+		await reconcileScope(ctx);
+		const provenance = pendingInputProvenance?.source;
+		pendingInputProvenance = undefined;
 		let cueHint = "";
-		if (nudgeEnabled && !isDelegatedLeg) {
+		if (!isDelegatedLeg) {
 			// A delegated leg that came back BLOCKED arrives HERE on the v1.5.0 async/background-default
 			// path: pi-persona delivers the completion report as a fresh follow-up user message, so it
 			// shows up as event.prompt (not a delegate tool_result). A blocked leg is deferred intent —
 			// nudge a backlog capture so the thread isn't lost. This takes precedence over the capture cue.
-			const blocked = detectBlockedLeg(event.prompt);
+			const blocked = nudgeEnabled && provenance === "extension" && isDelegatedReport(event.prompt) ? detectBlockedLeg(event.prompt) : undefined;
 			if (blocked) {
 				nudgeBlocked(ctx, blocked.snippet);
-			} else {
-				const cue = detectCaptureCue(event.prompt);
-				if (cue) {
-					try {
-						ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme ? ctx.ui.theme.fg("accent", `💡 worth remembering? memory remember (${cue.kind})`) : `💡 worth remembering? (${cue.kind})`);
-					} catch {
-						/* cosmetic */
-					}
-					// A STRONG, explicit persist-intent cue ("from now on", "remember that") ALSO gets a soft
-					// one-line hint in the PROMPT — the model can't read the status line — once per snippet,
-					// worded as optional. A casual "always"/"I prefer" stays status-only, so this never nags.
-					if (cue.strong && !cueHinted.has(cue.snippet)) {
-						cueHinted.add(cue.snippet);
-						cueHint = `⟢ pi-persona-mind — that reads like a durable ${cue.kind} ("${cue.snippet}"). If it should outlive this session, \`memory remember\` (term=long) — optional, your call.`;
+			} else if (capturePolicy !== "off") {
+				const notice = pendingCaptureNotice;
+				pendingCaptureNotice = undefined;
+				const promptBelongsToAnOlderDirectInput = directInputPrompts.has(event.prompt) && event.prompt !== latestDirectInputPrompt;
+				if (notice && (provenance === "interactive" || provenance === "rpc") && !promptBelongsToAnOlderDirectInput) {
+					cueHint = notice.hint;
+				} else if (nudgeEnabled && provenance !== "extension") {
+					// Compatibility fallback for host paths that do not emit `input`: nudge only. Never auto-write
+					// here because an extension-authored follow-up is indistinguishable from direct user input.
+					const cue: CaptureCue | undefined = detectCaptureCues(event.prompt)[0];
+					if (cue && !cueHinted.has(cue.snippet)) {
+						rememberCueHint(cue.snippet);
+						try {
+							ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme ? ctx.ui.theme.fg("accent", `💡 worth remembering? memory remember (${cue.kind})`) : `💡 worth remembering? (${cue.kind})`);
+						} catch {
+							/* cosmetic */
+						}
+						if (cue.strong) {
+							cueHint = "⟢ pi-persona-mind — an explicit persistence cue was detected, but its input provenance was unavailable. Save one safe declarative `memory remember` entry before final only if it came directly from the user.";
+						}
 					}
 				}
 			}
@@ -263,9 +716,11 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		let block = "";
 		try {
 			// A worker inherits the LEAN mind (north-star + identity only); the supervisor gets it all.
-			block = await withDeadline(getMind(ctx).buildInjection({ lean: isDelegatedLeg }), INJECT_DEADLINE_MS, "");
-		} catch {
-			/* a mind failure must never break the supervisor's turn */
+			block = await withDeadline(getMind(ctx).buildInjection({ lean: isDelegatedLeg }), INJECT_DEADLINE_MS, "", () =>
+				surfaceWarning(ctx, `memory injection exceeded ${INJECT_DEADLINE_MS}ms and was skipped for this turn`),
+			);
+		} catch (err) {
+			surfaceWarning(ctx, `memory injection failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
 		// The empty-mind hint announces the faculty ONCE per session, then goes quiet even if the mind
 		// stays empty — a state indicator, not a per-turn nag. Matched by PREFIX: a content block starts
@@ -284,8 +739,21 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	// marker (the async/background default lands in before_agent_start above). No result mutation — just a
 	// status-line nudge — so it composes cleanly alongside pi-persona's own tool_result hook.
 	const REPORT_TOOLS = new Set(["delegate", "council"]);
-	pi.on("tool_result", (event, ctx) => {
-		if (!nudgeEnabled || isDelegatedLeg) return undefined;
+	pi.on("tool_result", async (event, ctx) => {
+		if (isDelegatedLeg) return undefined;
+		if (event.toolName === "memory" || event.toolName === "backlog") {
+			const details = event.details && typeof event.details === "object" ? (event.details as Record<string, unknown>) : undefined;
+			if (details?.ok === false) return { isError: true };
+			if (details?.ok === true) {
+				await refreshStatus(ctx);
+				// A due item added during a running session must be armed now, not only after the next
+				// restart. Re-arm on every successful backlog mutation so take/done/drop also cancel
+				// stale timers. Existing overdue items are not re-announced by this maintenance pass.
+				if (event.toolName === "backlog" && sessionActive) await armWakes(ctx, false);
+			}
+			return undefined;
+		}
+		if (!nudgeEnabled) return undefined;
 		if (!REPORT_TOOLS.has(event.toolName)) return undefined;
 		const text = event.content.reduce((s, c) => (c.type === "text" ? s + c.text : s), "");
 		const blocked = detectBlockedLeg(text);
@@ -296,29 +764,80 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	pi.on("session_start", async (_event, ctx) => {
 		// A worker never arms/fires the supervisor's backlog wakes (nor shows a status line).
 		if (isDelegatedLeg) return;
-		await armWakes(ctx);
-		await refreshStatus(ctx);
+		sessionActive = true;
+		sessionStarting = true;
+		try {
+			await ensureLegacyMigrated(ctx);
+			await reconcileScope(ctx);
+			await armWakes(ctx);
+			lastArmedMigrationGeneration = migrationGeneration;
+			await refreshStatus(ctx);
+		} finally {
+			sessionStarting = false;
+			rearmAfterMigration(ctx);
+		}
 	});
 
 	pi.on("session_shutdown", () => {
+		sessionActive = false;
+		wakeGeneration++;
 		clearTimers();
-		if (ownerPath) {
-			try {
-				if (readFileSync(ownerPath, "utf8") === ownerToken) unlinkSync(ownerPath);
-			} catch {
-				/* already released */
-			}
-			ownerPath = undefined;
-		}
+		releaseWakeOwner();
 	});
 
 	// Read-only human view of what is currently in the mind (and injected each turn).
 	pi.registerCommand("mind", {
-		description: "Show this persona's mind — objective, long-term memory, working context, and open backlog",
-		handler: async (_args, ctx) => {
+		description: "Show this persona's mind, or run /mind doctor for storage and capture diagnostics",
+		handler: async (args, ctx) => {
+			const command = args.trim().toLowerCase();
+			if (command === "migrate-persona") {
+				const rawPersona = rawMindPersona();
+				await ensureLegacyMigrated(ctx, true, true);
+				surfaceWarning(
+					ctx,
+					rawPersona === null
+						? "AMBIGUOUS persona migration requested, but no active persona is selected; only project aliases were reconciled."
+						: `AMBIGUOUS persona migration imported the historical alias for '${rawPersona}'. Review the result; source files were left untouched.`,
+				);
+				return;
+			}
+			await ensureLegacyMigrated(ctx, false, command === "doctor");
+			const scope = resolveMindScope(ctx);
+			if (command === "doctor") {
+				const diagnostics: Array<[string, StoreDiagnostic]> = await Promise.all([
+					inspectStoreFile(scope.paths.ltm, "ltm").then((d): [string, StoreDiagnostic] => ["long-term", d]),
+					inspectStoreFile(scope.paths.shared, "ltm").then((d): [string, StoreDiagnostic] => ["shared", d]),
+					inspectStoreFile(scope.paths.stm, "stm").then((d): [string, StoreDiagnostic] => ["short-term", d]),
+					inspectStoreFile(scope.paths.backlog, "backlog").then((d): [string, StoreDiagnostic] => ["backlog", d]),
+				]);
+				const pathLine = ([label, diagnostic]: [string, StoreDiagnostic]): string => {
+					const suffix = diagnostic.status === "missing" ? "not created" : diagnostic.status === "ok" ? `ok (${diagnostic.validEntries} entries)` : `${diagnostic.status} (${diagnostic.message ?? `${diagnostic.invalidEntries} invalid entries`})`;
+					return `${label}: ${diagnostic.path} (${suffix})`;
+				};
+				const diagnosticWarnings = diagnostics.filter(([, diagnostic]) => diagnostic.status !== "missing" && diagnostic.status !== "ok").map(([label, diagnostic]) => `${label}: ${diagnostic.status} — ${diagnostic.message ?? "invalid store"}`);
+				const allWarnings = [...warnings, ...diagnosticWarnings];
+				const lines = [
+					"pi-persona-mind doctor",
+					`persona: ${scope.persona}`,
+					`project root: ${scope.projectRoot}`,
+					`project slug: ${scope.slug}`,
+					`capture: ${capturePolicy} (PI_PERSONA_MIND_CAPTURE)`,
+					pathLine(diagnostics[0]!),
+					pathLine(diagnostics[1]!),
+					pathLine(diagnostics[2]!),
+					pathLine(diagnostics[3]!),
+					`legacy root: ${join(agentDir, "persona-mind")} (${existsSync(join(agentDir, "persona-mind")) ? "detected; imported non-destructively" : "absent"})`,
+					`warnings: ${allWarnings.length === 0 ? "none" : allWarnings.join(" | ")}`,
+				];
+				warnings.clear();
+				warningStatusActive = false;
+				setStatus(ctx, allWarnings.length === 0 ? "mind doctor · healthy" : `mind doctor · ${allWarnings.length} warning(s) acknowledged`, allWarnings.length === 0 ? "dim" : "warning");
+				ctx.ui.notify(lines.join("\n"), allWarnings.length === 0 ? "info" : "warning");
+				return;
+			}
 			const mind = getMind(ctx);
 			const [summary, block] = await Promise.all([mind.summary(), mind.buildInjection()]);
-			const header = `pi-persona-mind — ${summary.ltm} long-term · ${summary.stm} short-term · ${summary.backlogOpen} open backlog`;
+			const header = `pi-persona-mind (${scope.persona}) — ${summary.ltm} long-term · ${summary.stm} short-term · ${summary.backlogOpen} open backlog`;
 			ctx.ui.notify(block ? `${header}\n\n${block}` : `${header}\n\n(empty)`, "info");
 		},
 	});

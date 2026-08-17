@@ -11,6 +11,25 @@ import { contentId } from "./ids.ts";
 
 export const BACKLOG_STATES = ["open", "taken", "done", "dropped"] as const;
 export type BacklogState = (typeof BACKLOG_STATES)[number];
+export const DEFAULT_BACKLOG_MAX = 20;
+export const MAX_BACKLOG_MAX = 50;
+export const MAX_BACKLOG_TEXT_CHARS = 8_192;
+export const MAX_BACKLOG_TAGS = 64;
+export const MAX_BACKLOG_TAG_CHARS = 256;
+export const MAX_BACKLOG_NOTE_CHARS = 1_024;
+export const MAX_BACKLOG_ID_CHARS = 128;
+/** Keep a bounded, deterministic terminal history while preserving every active item. */
+export const MAX_BACKLOG_TERMINAL_ENTRIES = 1_000;
+const MAX_BACKLOG_PERSONA_CHARS = 128;
+const SAFE_BACKLOG_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+
+/** Clamp a user-facing backlog page to a small, finite range. */
+export function clampBacklogMax(max: number | undefined): number {
+	if (max === undefined || Number.isNaN(max)) return DEFAULT_BACKLOG_MAX;
+	if (max === Number.POSITIVE_INFINITY) return MAX_BACKLOG_MAX;
+	if (max === Number.NEGATIVE_INFINITY) return 1;
+	return Math.max(1, Math.min(MAX_BACKLOG_MAX, Math.floor(max)));
+}
 
 export interface BacklogEntry {
 	id: string;
@@ -61,24 +80,79 @@ export function makeBacklog(input: BacklogInput, now: number): BacklogEntry {
 export interface TransitionResult {
 	ok: boolean;
 	entries: BacklogEntry[];
+	reason?: "not_found" | "invalid_transition";
 }
 
-/** Move one entry (by id) to a new state, optionally attaching a note. ok=false ⇒ id not found. */
+function legalTransition(from: BacklogState, to: BacklogState): boolean {
+	if (from === "open") return to === "taken" || to === "done" || to === "dropped";
+	if (from === "taken") return to === "done" || to === "dropped";
+	return false;
+}
+
+/** Move one entry (by id) through the legal state machine, optionally attaching a note. */
 export function transition(entries: readonly BacklogEntry[], id: string, state: BacklogState, note?: string): TransitionResult {
-	let found = false;
+	const found = entries.find((e) => e.id === id);
+	if (!found) return { ok: false, entries: [...entries], reason: "not_found" };
+	if (!legalTransition(found.state, state)) return { ok: false, entries: [...entries], reason: "invalid_transition" };
 	const next = entries.map((e) => {
 		if (e.id !== id) return e;
-		found = true;
 		const updated: BacklogEntry = { ...e, state };
 		if (note !== undefined) updated.note = note;
 		return updated;
 	});
-	return { ok: found, entries: next };
+	return { ok: true, entries: next };
 }
 
 /** Unfinished work: open + taken (excludes done/dropped). */
 export function openItems(entries: readonly BacklogEntry[]): BacklogEntry[] {
 	return entries.filter((e) => e.state === "open" || e.state === "taken");
+}
+
+/**
+ * Compact completed backlog history without ever dropping actionable work.
+ *
+ * Terminal entries are retained newest-first by creation time, with the id as a deterministic
+ * tie-breaker. The returned array keeps the source order so compaction does not perturb the normal
+ * backlog ordering; only terminal entries older than the explicit history limit are removed.
+ */
+export function compactTerminal(entries: readonly BacklogEntry[]): BacklogEntry[] {
+	const terminal = entries.filter((entry) => entry.state === "done" || entry.state === "dropped");
+	if (terminal.length <= MAX_BACKLOG_TERMINAL_ENTRIES) return [...entries];
+	const keep = new Set(
+		[...terminal]
+			.sort((a, b) => {
+				const createdB = Date.parse(b.createdAt);
+				const createdA = Date.parse(a.createdAt);
+				const created = (Number.isFinite(createdB) ? createdB : 0) - (Number.isFinite(createdA) ? createdA : 0);
+				return created !== 0 ? created : b.id.localeCompare(a.id);
+			})
+			.slice(0, MAX_BACKLOG_TERMINAL_ENTRIES),
+	);
+	return entries.filter((entry) => entry.state === "open" || entry.state === "taken" || keep.has(entry));
+}
+
+/** Deterministic actionable ordering: claimed work, due work, then most recently created. */
+export function orderBacklog(entries: readonly BacklogEntry[], now: number): BacklogEntry[] {
+	const stateRank = (state: BacklogState): number => (state === "taken" ? 0 : state === "open" ? 1 : state === "done" ? 2 : 3);
+	const dueRank = (entry: BacklogEntry): number => {
+		if (entry.dueAtEpochMs === undefined) return 2;
+		return entry.dueAtEpochMs <= now ? 0 : 1;
+	};
+	return [...entries].sort((a, b) => {
+		const state = stateRank(a.state) - stateRank(b.state);
+		if (state !== 0) return state;
+		const due = dueRank(a) - dueRank(b);
+		if (due !== 0) return due;
+		if (a.dueAtEpochMs !== undefined && b.dueAtEpochMs !== undefined) {
+			const dueTime = a.dueAtEpochMs - b.dueAtEpochMs;
+			if (Number.isFinite(dueTime) && dueTime !== 0) return dueTime;
+		}
+		const createdA = Date.parse(a.createdAt);
+		const createdB = Date.parse(b.createdAt);
+		const recency = (Number.isFinite(createdB) ? createdB : 0) - (Number.isFinite(createdA) ? createdA : 0);
+		if (recency !== 0) return recency;
+		return a.id.localeCompare(b.id);
+	});
 }
 
 /** The persona's view by default (its own entries); `all` shows every persona's. */
@@ -99,11 +173,22 @@ function isStringArray(v: unknown): v is string[] {
 export function validateBacklog(raw: unknown): BacklogEntry | null {
 	if (!raw || typeof raw !== "object") return null;
 	const o = raw as Record<string, unknown>;
-	if (typeof o.id !== "string" || typeof o.text !== "string" || !isState(o.state)) return null;
-	if (!isStringArray(o.tags) || typeof o.createdAt !== "string") return null;
+	if (typeof o.id !== "string" || o.id.length > MAX_BACKLOG_ID_CHARS || !SAFE_BACKLOG_ID.test(o.id) || !isState(o.state)) return null;
+	if (typeof o.text !== "string" || o.text.length === 0 || o.text.length > MAX_BACKLOG_TEXT_CHARS) return null;
+	if (!isStringArray(o.tags) || o.tags.length > MAX_BACKLOG_TAGS || o.tags.some((tag) => tag.length > MAX_BACKLOG_TAG_CHARS)) return null;
+	if (typeof o.createdAt !== "string" || !Number.isFinite(Date.parse(o.createdAt))) return null;
 	const entry: BacklogEntry = { id: o.id, text: o.text, state: o.state, tags: o.tags, createdAt: o.createdAt };
-	if (typeof o.persona === "string") entry.persona = o.persona;
-	if (typeof o.dueAtEpochMs === "number") entry.dueAtEpochMs = o.dueAtEpochMs;
-	if (typeof o.note === "string") entry.note = o.note;
+	if (o.persona !== undefined) {
+		if (typeof o.persona !== "string" || o.persona.length === 0 || o.persona.length > MAX_BACKLOG_PERSONA_CHARS) return null;
+		entry.persona = o.persona;
+	}
+	if (o.dueAtEpochMs !== undefined) {
+		if (typeof o.dueAtEpochMs !== "number" || !Number.isFinite(o.dueAtEpochMs)) return null;
+		entry.dueAtEpochMs = o.dueAtEpochMs;
+	}
+	if (o.note !== undefined) {
+		if (typeof o.note !== "string" || o.note.length > MAX_BACKLOG_NOTE_CHARS) return null;
+		entry.note = o.note;
+	}
 	return entry;
 }
