@@ -196,6 +196,10 @@ export function activePersona(agentDir: string, env: NodeJS.ProcessEnv = process
  * persisting anything, so a marker that changes afterwards can only be a live `/persona` switch (or
  * `/persona off`), which pi-persona DOES persist. The change is latched, so switching back to the
  * name the marker originally held is still recognised as a switch rather than read as the seed.
+ *
+ * Process-global and never cleared, by design: "a switch happened" is a fact about the SESSION, not
+ * about one call, so {@link activePersona} is deliberately not a pure function of its arguments
+ * across calls. An embedder that reuses one process for several sessions inherits the latch.
  */
 const personaMarkers = new Map<string, { baseline: string | null; stamp: string; switched: boolean }>();
 

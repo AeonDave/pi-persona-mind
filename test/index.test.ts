@@ -7,6 +7,7 @@ import { after, before, test } from "node:test";
 
 import { createExtension, ownerIsStale } from "../src/index.ts";
 import { makeBacklog } from "../src/core/backlog.ts";
+import { contentId, legacyContentId } from "../src/core/ids.ts";
 import { makeMemory } from "../src/core/memory.ts";
 import { projectSlug } from "../src/core/scope.ts";
 import type { MindService } from "../src/core/service.ts";
@@ -108,6 +109,78 @@ test("memory recall rejects an oversized query without echoing it into the tool 
 	);
 	assert.equal(result?.details.ok, false);
 	assert.ok((result?.content[0]?.text.length ?? Infinity) < 300, "the rejected query is not reflected verbatim");
+});
+
+test("a refused ambiguous forget hands the model an id it can actually delete with", async () => {
+	const m = mockPi();
+	const agentDir = join(dir, "ambiguous-forget-tool", "agent");
+	const ctx = ctxFor(join(dir, "ambiguous-forget-tool", "project"));
+	const ltmPath = join(agentDir, "pi-persona-mind", "memory", "ltm", "_default.json");
+	// Two distinct facts that a v1 comma-joined tag list hashed to ONE id: undeletable until the refusal
+	// itself names a per-fact handle.
+	const commaTagged = makeMemory({ term: "long", kind: "gotcha", text: "release checklist", tags: ["a,b"] }, 1_000_000);
+	const splitTagged = makeMemory({ term: "long", kind: "gotcha", text: "release checklist", tags: ["a", "b"] }, 1_000_000);
+	const legacy = legacyContentId("gotcha", "release checklist", ["a,b"]);
+	await mkdir(dirname(ltmPath), { recursive: true });
+	await writeFile(
+		ltmPath,
+		`${JSON.stringify({ version: 1, sequence: 1, updatedAt: new Date(1_000_000).toISOString(), entries: [{ ...commaTagged, id: legacy }, { ...splitTagged, id: legacy }] })}\n`,
+		"utf8",
+	);
+	createExtension(m.pi, { agentDir });
+
+	const refused = await m.tools.get("memory")?.execute("f", { action: "forget", id: legacy }, undefined, undefined, ctx);
+	assert.equal(refused?.details.ok, false);
+	assert.equal(refused?.details.reason, "ambiguous_id");
+	const usable = contentId("gotcha", "release checklist", ["a,b"]);
+	assert.ok(refused?.content[0]?.text.includes(usable), "the refusal names an id that resolves to one fact");
+
+	const removed = await m.tools.get("memory")?.execute("f2", { action: "forget", id: usable }, undefined, undefined, ctx);
+	assert.equal(removed?.details.removed, 1, "following the guidance deletes exactly the fact it named");
+	const after = await m.tools.get("memory")?.execute("f3", { action: "forget", id: legacy }, undefined, undefined, ctx);
+	assert.equal(after?.details.removed, 1, "and the shared handle resolves once the collision is gone");
+});
+
+test("promote says so when the lineage handle it carried over retired nothing", async () => {
+	const m = mockPi();
+	const agentDir = join(dir, "promote-ambiguous-tool", "agent");
+	const cwd = join(dir, "promote-ambiguous-tool", "project");
+	const ctx = ctxFor(cwd);
+	const now = Date.now();
+	const ltmPath = join(agentDir, "pi-persona-mind", "memory", "ltm", "_default.json");
+	const stmPath = join(agentDir, "pi-persona-mind", "memory", "stm", `${projectSlug(cwd)}.json`);
+	const commaTagged = makeMemory({ term: "long", kind: "gotcha", text: "release checklist", tags: ["a,b"] }, now);
+	const splitTagged = makeMemory({ term: "long", kind: "gotcha", text: "release checklist", tags: ["a", "b"] }, now);
+	const legacy = legacyContentId("gotcha", "release checklist", ["a,b"]);
+	const graduating = makeMemory({ term: "short", kind: "note", text: "graduating fact", supersedes: legacy }, now);
+	const envelope = (entries: unknown[]): string => `${JSON.stringify({ version: 1, sequence: 1, updatedAt: new Date(now).toISOString(), entries })}\n`;
+	await mkdir(dirname(ltmPath), { recursive: true });
+	await mkdir(dirname(stmPath), { recursive: true });
+	await writeFile(ltmPath, envelope([{ ...commaTagged, id: legacy }, { ...splitTagged, id: legacy }]), "utf8");
+	await writeFile(stmPath, envelope([graduating]), "utf8");
+	createExtension(m.pi, { agentDir });
+
+	const promoted = await m.tools.get("memory")?.execute("p", { action: "promote", id: graduating.id }, undefined, undefined, ctx);
+	assert.equal(promoted?.details.ok, true, "the graduation itself succeeds");
+	assert.equal(promoted?.details.ambiguousSupersedes, legacy);
+	assert.match(promoted?.content[0]?.text ?? "", /nothing was retired/i, "the skipped retirement is not reported as a success");
+});
+
+test("a store written by another build fails the memory tool loudly instead of throwing out of it", async () => {
+	const m = mockPi();
+	const agentDir = join(dir, "version-skew-tool", "agent");
+	const ctx = ctxFor(join(dir, "version-skew-tool", "project"));
+	const ltmPath = join(agentDir, "pi-persona-mind", "memory", "ltm", "_default.json");
+	await mkdir(dirname(ltmPath), { recursive: true });
+	await writeFile(ltmPath, `${JSON.stringify({ version: 2, sequence: 1, updatedAt: new Date(1_000_000).toISOString(), entries: [] })}\n`, "utf8");
+	createExtension(m.pi, { agentDir });
+
+	const recalled = await m.tools.get("memory")?.execute("r", { action: "recall", query: "anything" }, undefined, undefined, ctx);
+	assert.equal(recalled?.details.ok, false, "recall reports the skew the way remember already does");
+	assert.equal(recalled?.details.reason, "storage_error");
+	assert.match(recalled?.content[0]?.text ?? "", /version 2/, "and says which build wrote it");
+	const forgotten = await m.tools.get("memory")?.execute("f", { action: "forget", id: "abcdefabcdef" }, undefined, undefined, ctx);
+	assert.equal(forgotten?.details.reason, "storage_error", "forget degrades through the same surface");
 });
 
 test("session startup imports the legacy root without deleting it and surfaces migration problems", async () => {

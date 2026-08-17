@@ -192,7 +192,8 @@ test("forget explains when a historical id is ambiguous instead of claiming it i
 	await writeFile(scope.paths.ltm, `${JSON.stringify({ version: 1, updatedAt: new Date(1_000_000).toISOString(), sequence: 1, entries: [{ ...a, id: legacy }, { ...b, id: legacy }] })}\n`);
 
 	const result = await new MindService(scope, { now: () => 2_000_000 }).forget(legacy);
-	assert.deepEqual(result, { removed: 0, reason: "ambiguous_id" });
+	assert.equal(result.removed, 0);
+	assert.equal(result.reason, "ambiguous_id");
 });
 
 test("re-recording a fact leaves an unrelated fact that shares its legacy id on disk", async () => {
@@ -252,6 +253,54 @@ test("remember refuses an ambiguous supersedes that spans two tiers, exactly as 
 	assert.match(result.ok ? "" : result.reason, /ambiguous/i);
 	const persisted = JSON.parse(await readFile(scope.paths.ltm, "utf8")) as { entries: { text: string }[] };
 	assert.deepEqual(persisted.entries.map((e) => e.text), ["release checklist"], "nothing was retired and nothing was written");
+});
+
+test("a refused ambiguous forget hands back an id that resolves, so the collision is escapable", async () => {
+	const scope = scopeFor("ambiguous-escape", "elite");
+	const commaTagged = makeMemory({ term: "long", kind: "gotcha", text: "release checklist", tags: ["a,b"] }, 1_000_000);
+	const splitTagged = makeMemory({ term: "long", kind: "gotcha", text: "release checklist", tags: ["a", "b"] }, 1_000_000);
+	const legacy = legacyContentId("gotcha", "release checklist", ["a,b"]);
+	await mkdir(join(scope.paths.ltm, ".."), { recursive: true });
+	await writeFile(
+		scope.paths.ltm,
+		`${JSON.stringify({ version: 1, updatedAt: new Date(1_000_000).toISOString(), sequence: 1, entries: [{ ...commaTagged, id: legacy }, { ...splitTagged, id: legacy }] })}\n`,
+	);
+
+	const mind = new MindService(scope, { now: () => 2_000_000 });
+	const refused = await mind.forget(legacy);
+	assert.equal(refused.removed, 0);
+	assert.equal(refused.reason, "ambiguous_id");
+	assert.equal(refused.candidates?.length, 2, "both colliding facts are named");
+	const usable = (refused.candidates ?? []).filter((c) => c.resolves);
+	assert.deepEqual(
+		usable.map((c) => c.id),
+		[contentId("gotcha", "release checklist", ["a,b"])],
+		"the fact whose current id is no longer the shared handle is nameable right now",
+	);
+	assert.equal(usable[0]?.text, "release checklist");
+
+	assert.equal((await mind.forget(usable[0]!.id)).removed, 1, "the offered id deletes exactly that fact");
+	assert.equal((await mind.forget(legacy)).removed, 1, "and the shared handle resolves once the collision is gone");
+	assert.equal((await mind.recall("", "long", 10)).total, 0);
+});
+
+test("promote tells the caller when the supersedes it carried over retired nothing", async () => {
+	const scope = scopeFor("promote-ambiguous-supersedes", "elite");
+	const commaTagged = makeMemory({ term: "long", kind: "gotcha", text: "release checklist", tags: ["a,b"] }, 1_000_000);
+	const splitTagged = makeMemory({ term: "long", kind: "gotcha", text: "release checklist", tags: ["a", "b"] }, 1_000_000);
+	const legacy = legacyContentId("gotcha", "release checklist", ["a,b"]);
+	const graduating = makeMemory({ term: "short", kind: "note", text: "graduating fact", supersedes: legacy }, 1_000_000);
+	const envelope = (entries: unknown[]): string => `${JSON.stringify({ version: 1, updatedAt: new Date(1_000_000).toISOString(), sequence: 1, entries })}\n`;
+	await mkdir(join(scope.paths.ltm, ".."), { recursive: true });
+	await mkdir(join(scope.paths.stm, ".."), { recursive: true });
+	await writeFile(scope.paths.ltm, envelope([{ ...commaTagged, id: legacy }, { ...splitTagged, id: legacy }]));
+	await writeFile(scope.paths.stm, envelope([graduating]));
+
+	const mind = new MindService(scope, { now: () => 2_000_000 });
+	const promoted = await mind.promote(graduating.id);
+	assert.equal(promoted.ok, true, "the graduation itself still succeeds");
+	assert.equal(promoted.ok ? promoted.ambiguousSupersedes : undefined, legacy, "the skipped retirement is not silent");
+	assert.equal((await mind.recall("release checklist", "long", 10)).total, 2, "and indeed nothing was retired");
 });
 
 test("shared long-term memory is visible to every persona; private memory is not", async () => {

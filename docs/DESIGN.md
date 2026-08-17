@@ -322,3 +322,40 @@ pi-persona ≥ 1.5.2.
 - **No semantic transcript miner.** Facts without an explicit persistence request depend on the
   standing tool guideline. This is intentional: archiving arbitrary assistant/user prose would turn
   unverified claims and foreign instructions into durable context.
+
+## v0.5 — a mind that announces itself, without nagging
+
+Capture is explicit by design, so a fresh session — or a model that has never seen the faculty —
+never uses it. The plugin now announces ITSELF, deterministically and model-free, with no persona
+edits (built-in or custom) and without recreating nudge-fatigue:
+
+- **Self-announcement, once per session** — when a SUPERVISOR mind is empty, one soft, optional line
+  is injected saying that `memory`/`backlog` persist durable material across sessions. It is shown
+  once per session rather than as a banner that persists every turn while empty, never appears once
+  anything is captured, and never obliges a save. A worker (lean) mind stays silent.
+- **Strong-cue prompt hint** — an explicit persist-intent cue ("from now on", "remember that", "for
+  future reference") also lands a soft one-liner IN the prompt, once per snippet; the cue previously
+  only set a status line the model cannot read. Casual phrasing ("always", "I prefer") stays
+  status-only, so a turn of phrase never pushes a hint into context.
+
+Deliberately NOT added: an every-turn "capture protocol", a milestone `tool_result` nag, or any
+persona-side instruction — each recreates nudge-fatigue or forces per-persona edits. Capture stays
+natural, optional, and entirely self-contained in the plugin.
+
+**v0.5.1 — prompt-cache-stable age labels (`memory.ts` · `ageLabel`).** The `<persona-mind>` block is
+folded into the system prompt every turn, and minute/hour-granular ages mutated it every minute for
+no real signal, busting the provider's prompt-cache of the whole system prefix on the first turn of
+each new minute. The sub-day range now collapses to one bucket (`today`) and the rest steps at day
+granularity or coarser (`Nd` / `Nw` / `Nmo` / `Ny`), so the label flips at most once per day and the
+block stays byte-identical across a working session. A durable fact is not a log line and never
+needed sub-day precision; the STM near-expiry ⚠️ flag is kept (it flips at most once per entry).
+Deliberately not done: a persistent store parse-cache — injection is read-only and three tiny reads
+per turn are not worth a staleness surface on the correctness backbone.
+
+**v0.5.2 — collision-free announcement detection + a NaN guard.** The once-per-session announcement
+was recognised by a substring of its own prose, so a real memory whose TEXT quoted that phrase made
+a CONTENT block match and suppressed the whole block — memories included — on every later turn.
+Detection now keys on a distinctive LEADING sentinel (`EMPTY_HINT_PREFIX`, `inject.ts`): a content
+block always starts with `<persona-mind …` and a memory's text lives inside the fence, so the two
+can never collide. Separately, `ageLabel` returns `?` for an unparseable `recordedAt` instead of
+rendering `NaN…` into the block.

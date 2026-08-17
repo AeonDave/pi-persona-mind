@@ -44,7 +44,8 @@ export interface MigrationReport {
 	filesScanned: number;
 	/** Unchanged legacy files skipped from content read/parse by the durable source manifest. */
 	filesSkipped: number;
-	/** Recognized files from which at least one entry was committed. */
+	/** Files a commit touched: a recognized source that yielded at least one imported entry, or a
+	 *  current destination whose stored records were reconciled in place (see `entriesAdded`). */
 	filesMigrated: number;
 	/** Valid, source-semantic-unique legacy entries considered. */
 	entriesSeen: number;

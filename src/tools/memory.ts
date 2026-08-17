@@ -65,6 +65,11 @@ const MemoryParams = Type.Object({
 	id: Type.Optional(Type.String({ maxLength: MAX_MEMORY_ID_CHARS, description: "forget/promote: the id of the entry" })),
 });
 
+type MemoryToolParams = Type.Static<typeof MemoryParams>;
+
+/** How many colliding facts an ambiguity refusal names before it summarizes the rest. */
+const MAX_AMBIGUITY_CANDIDATES_SHOWN = 5;
+
 interface ToolResult {
 	content: { type: "text"; text: string }[];
 	details: Record<string, unknown>;
@@ -91,70 +96,103 @@ export function registerMemoryTool(pi: ExtensionAPI, getMind: GetMind): void {
 		].join(" "),
 		parameters: MemoryParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const mind = getMind(ctx);
-
-			if (params.action === "remember") {
-				if (!params.term || !params.kind || !params.text) {
-					return say("memory remember needs { term: long|short, kind, text }.", { ok: false, reason: "missing required fields" });
-				}
-				const input: RememberInput = { term: params.term, kind: params.kind, text: params.text };
-				if (params.tags) input.tags = params.tags;
-				if (params.ttlHours !== undefined) input.ttlHours = params.ttlHours;
-				if (params.supersedes) input.supersedes = params.supersedes;
-				if (params.shared) input.toShared = params.shared;
-				if (params.source) input.source = params.source;
-				if (params.derivedFrom) input.derivedFrom = params.derivedFrom;
-				const r = await mind.remember(input);
-				return r.ok
-					? say(`Remembered ${r.entry.id} — ${r.entry.expiresAt ? "short" : "long"}-term ${params.kind}. It will re-appear in your context.`, { id: r.entry.id, ok: true })
-					: say(`Not stored: ${r.reason}`, { ok: false, reason: r.reason });
+			try {
+				return await runMemoryAction(getMind(ctx), params);
+			} catch (err) {
+				// One loud surface for every action. `remember`/`promote` already convert a store failure into
+				// a result, but `recall`/`forget` let it throw — so a store written by a different build
+				// (StoreVersionError) escapes as a tool crash for two actions and reads as a tidy reason for
+				// the other two. The model reads this boundary, so it reports the same way either way.
+				const message = err instanceof Error ? err.message : String(err);
+				return say(`Memory is unavailable: ${message || "unknown persistence failure"}`, { ok: false, reason: "storage_error" });
 			}
-
-			if (params.action === "recall") {
-				const query = params.query ?? "";
-				if (query.length > MAX_RECALL_QUERY_CHARS) {
-					return say(`memory recall query exceeds the ${MAX_RECALL_QUERY_CHARS}-character limit.`, {
-						ok: false,
-						reason: "query_too_long",
-					});
-				}
-				const max = clampRecallMax(params.max);
-				const { hits, total, withheldUnsafe } = await mind.recall(query, params.scope ?? "both", max);
-				if (hits.length === 0) return say(query ? "No memory matches the supplied query." : "Your memory is empty.", { count: 0, ok: true });
-				const withheld = total - hits.length;
-				const more = [
-					withheld > 0 ? `… +${withheld} more match(es) — narrow the query or raise max.` : "",
-					withheldUnsafe > 0 ? `⚠ ${withheldUnsafe} stored entr${withheldUnsafe === 1 ? "y was" : "ies were"} withheld as unsafe.` : "",
-				]
-					.filter(Boolean)
-					.join("\n");
-				const lines = hits.map((e) => `- [${e.id}] (${e.kind}) ${compactMemoryText(e.text)}`);
-				return say(`${hits.length} recalled${withheld > 0 ? ` of ${total}` : ""}:\n${lines.join("\n")}${more ? `\n${more}` : ""}`, {
-					count: hits.length,
-					total,
-					max,
-					withheld,
-					withheldUnsafe,
-					ids: hits.map((e) => e.id),
-				});
-			}
-
-			if (params.action === "promote") {
-				if (!params.id) return say("memory promote needs { id } (a short-term memory to make durable).", { ok: false, reason: "missing id" });
-				const r = await mind.promote(params.id);
-				return r.ok
-					? say(`Promoted ${params.id} to long-term — it will no longer decay.`, { ok: true, id: params.id })
-					: say(r.reason ? `Not promoted: ${r.reason}` : `No live short-term memory with id "${params.id}".`, { ok: false, ...(r.reason ? { reason: r.reason } : {}) });
-			}
-
-			// forget
-			if (!params.id) return say("memory forget needs { id } (see recall).", { ok: false, reason: "missing id" });
-			const { removed, reason } = await mind.forget(params.id);
-			return removed > 0
-				? say(`Forgot ${params.id}.`, { ok: true, removed })
-				: reason === "ambiguous_id"
-					? say(`Memory id "${params.id}" is ambiguous after legacy migration; recall the entries and forget one by its current id. Nothing was deleted.`, { ok: false, removed: 0, reason })
-					: say(`No memory with id "${params.id}".`, { ok: false, removed: 0, reason: "not_found" });
 		},
 	});
+}
+
+async function runMemoryAction(mind: MindService, params: MemoryToolParams): Promise<ToolResult> {
+	if (params.action === "remember") {
+		if (!params.term || !params.kind || !params.text) {
+			return say("memory remember needs { term: long|short, kind, text }.", { ok: false, reason: "missing required fields" });
+		}
+		const input: RememberInput = { term: params.term, kind: params.kind, text: params.text };
+		if (params.tags) input.tags = params.tags;
+		if (params.ttlHours !== undefined) input.ttlHours = params.ttlHours;
+		if (params.supersedes) input.supersedes = params.supersedes;
+		if (params.shared) input.toShared = params.shared;
+		if (params.source) input.source = params.source;
+		if (params.derivedFrom) input.derivedFrom = params.derivedFrom;
+		const r = await mind.remember(input);
+		return r.ok
+			? say(`Remembered ${r.entry.id} — ${r.entry.expiresAt ? "short" : "long"}-term ${params.kind}. It will re-appear in your context.`, { id: r.entry.id, ok: true })
+			: say(`Not stored: ${r.reason}`, { ok: false, reason: r.reason });
+	}
+
+	if (params.action === "recall") {
+		const query = params.query ?? "";
+		if (query.length > MAX_RECALL_QUERY_CHARS) {
+			return say(`memory recall query exceeds the ${MAX_RECALL_QUERY_CHARS}-character limit.`, {
+				ok: false,
+				reason: "query_too_long",
+			});
+		}
+		const max = clampRecallMax(params.max);
+		const { hits, total, withheldUnsafe } = await mind.recall(query, params.scope ?? "both", max);
+		if (hits.length === 0) return say(query ? "No memory matches the supplied query." : "Your memory is empty.", { count: 0, ok: true });
+		const withheld = total - hits.length;
+		const more = [
+			withheld > 0 ? `… +${withheld} more match(es) — narrow the query or raise max.` : "",
+			withheldUnsafe > 0 ? `⚠ ${withheldUnsafe} stored entr${withheldUnsafe === 1 ? "y was" : "ies were"} withheld as unsafe.` : "",
+		]
+			.filter(Boolean)
+			.join("\n");
+		const lines = hits.map((e) => `- [${e.id}] (${e.kind}) ${compactMemoryText(e.text)}`);
+		return say(`${hits.length} recalled${withheld > 0 ? ` of ${total}` : ""}:\n${lines.join("\n")}${more ? `\n${more}` : ""}`, {
+			count: hits.length,
+			total,
+			max,
+			withheld,
+			withheldUnsafe,
+			ids: hits.map((e) => e.id),
+		});
+	}
+
+	if (params.action === "promote") {
+		if (!params.id) return say("memory promote needs { id } (a short-term memory to make durable).", { ok: false, reason: "missing id" });
+		const r = await mind.promote(params.id);
+		if (!r.ok) return say(r.reason ? `Not promoted: ${r.reason}` : `No live short-term memory with id "${params.id}".`, { ok: false, ...(r.reason ? { reason: r.reason } : {}) });
+		// The graduation stands, but the lineage handle it carried over may be one of the shared v1 ids the
+		// store refuses to act on — say so, or a bare "Promoted" reads as "and the old fact is retired".
+		const skipped = r.ambiguousSupersedes
+			? ` Its supersedes id ${r.ambiguousSupersedes} is shared by several stored memories, so nothing was retired — recall them and retire the one you meant by its own id.`
+			: "";
+		return say(`Promoted ${params.id} to long-term — it will no longer decay.${skipped}`, {
+			ok: true,
+			id: params.id,
+			...(r.ambiguousSupersedes ? { ambiguousSupersedes: r.ambiguousSupersedes } : {}),
+		});
+	}
+
+	// forget
+	if (!params.id) return say("memory forget needs { id } (see recall).", { ok: false, reason: "missing id" });
+	const { removed, reason, candidates } = await mind.forget(params.id);
+	if (removed > 0) return say(`Forgot ${params.id}.`, { ok: true, removed });
+	if (reason !== "ambiguous_id") return say(`No memory with id "${params.id}".`, { ok: false, removed: 0, reason: "not_found" });
+	// A refusal the caller cannot act on leaves a store nobody can ever repair, so name each colliding
+	// fact by an id of its own. The one still holding the shared handle becomes addressable once the
+	// others are gone — the collision shrinks by one with every delete.
+	const shown = (candidates ?? []).slice(0, MAX_AMBIGUITY_CANDIDATES_SHOWN);
+	const rest = (candidates?.length ?? 0) - shown.length;
+	const lines = shown.map((c) => `- [${c.id}] (${c.kind}) ${compactMemoryText(c.text, 120)}${c.resolves ? "" : " — still the shared handle; forget the others first"}`);
+	return say(
+		[
+			`Memory id "${params.id}" is a legacy handle shared by ${candidates?.length ?? 0} distinct memories, so nothing was deleted.`,
+			"Forget the one you meant by its own current id:",
+			...lines,
+			rest > 0 ? `… +${rest} more share that handle.` : "",
+		]
+			.filter(Boolean)
+			.join("\n"),
+		{ ok: false, removed: 0, reason, candidates: shown.map((c) => ({ id: c.id, kind: c.kind, resolves: c.resolves })) },
+	);
 }

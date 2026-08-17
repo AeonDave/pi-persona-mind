@@ -10,6 +10,7 @@
 
 import type { BacklogEntry, BacklogState } from "./backlog.ts";
 import { clampBacklogMax, compactTerminal, makeBacklog, openItems, orderBacklog, transition, validateBacklog, viewFor, MAX_BACKLOG_NOTE_CHARS, MAX_BACKLOG_TAGS, MAX_BACKLOG_TAG_CHARS, MAX_BACKLOG_TEXT_CHARS } from "./backlog.ts";
+import { contentId } from "./ids.ts";
 import type { MindBudget } from "./inject.ts";
 import { renderMind } from "./inject.ts";
 import type { MemoryEntry, MemoryInput, MemoryKind, MemoryTerm } from "./memory.ts";
@@ -19,6 +20,9 @@ import type { Scope } from "./scope.ts";
 import { JsonStore, type JsonStoreOptions, withFileLock } from "./store.ts";
 
 const STORE_VERSION = 1;
+
+/** How many per-fact ids an ambiguity refusal spells out before it summarizes the remainder. */
+const MAX_AMBIGUITY_IDS_IN_REASON = 5;
 
 export interface MindServiceOptions {
 	now?: () => number;
@@ -60,14 +64,52 @@ export interface BacklogListPage {
 
 export type Recallable = "long" | "short" | "both";
 
+/** One of the distinct facts a shared historical handle addresses, named by an id of its own. */
+export interface AmbiguousMemory {
+	/** This fact's CURRENT content id. Distinct facts always hash differently, so it names one entry. */
+	id: string;
+	kind: MemoryKind;
+	text: string;
+	/** False while this id is still the shared handle itself — the one legacy-encodable member of the
+	 *  collision keeps the ambiguous id as its own, and becomes addressable once the others are gone. */
+	resolves: boolean;
+}
+
 export type RememberResult = { ok: true; entry: MemoryEntry } | { ok: false; reason: string };
 export type BacklogAddResult = { ok: true; entry: BacklogEntry } | { ok: false; reason: string };
 export type BacklogSetResult = { ok: true; entry: BacklogEntry } | { ok: false; reason?: string };
-export type ForgetResult = { removed: number; reason?: "ambiguous_id" };
+export type ForgetResult = { removed: number; reason?: "ambiguous_id"; candidates?: AmbiguousMemory[] };
 
 function storageFailure(err: unknown): string {
 	const message = err instanceof Error ? err.message : String(err);
 	return `storage error: ${message || "unknown persistence failure"}`;
+}
+
+/**
+ * The distinct facts a shared handle addresses, each named by an id of its OWN. A refusal that offers
+ * no way forward is a dead end: destroying nothing is right, but the caller still has to be able to
+ * pick one. Distinct facts always hash to distinct current ids, so every member of a collision is
+ * nameable — except the single member whose v1 and v2 encodings coincide (that id IS the shared
+ * handle), which becomes addressable as soon as its neighbours are gone.
+ */
+function ambiguityCandidates(pool: readonly MemoryEntry[], id: string): AmbiguousMemory[] {
+	const distinct = new Map<string, MemoryEntry>();
+	for (const entry of pool) if (memoryIdMatches(entry, id)) distinct.set(memoryContentKey(entry), entry);
+	return [...distinct.values()]
+		.map((entry) => {
+			const handle = contentId(entry.kind, entry.text, entry.tags);
+			const reached = new Set(pool.filter((e) => memoryIdMatches(e, handle)).map((e) => memoryContentKey(e)));
+			return { id: handle, kind: entry.kind, text: entry.text, resolves: reached.size === 1 };
+		})
+		.sort((a, b) => Number(b.resolves) - Number(a.resolves));
+}
+
+function ambiguousSupersedesReason(id: string, candidates: readonly AmbiguousMemory[]): string {
+	// The reason is read by the model, so the offer list is bounded rather than as long as the collision.
+	const shown = candidates.slice(0, MAX_AMBIGUITY_IDS_IN_REASON);
+	const offers = shown.map((c) => (c.resolves ? c.id : `${c.id} (still the shared handle — usable once the others are gone)`)).join(", ");
+	const rest = candidates.length - shown.length;
+	return `memory supersedes id ${id} is ambiguous — it addresses ${candidates.length} distinct stored memories; supersede one of them by its own current id instead: ${offers}${rest > 0 ? `, and ${rest} more` : ""}`;
 }
 
 function safePersistedText(text: string): { text: string; withheld: boolean } {
@@ -203,7 +245,7 @@ export class MindService {
 		const store = term === "short" ? this.stm : input.toShared ? this.shared : this.ltm;
 		try {
 			let committed: MemoryEntry | undefined;
-			let ambiguous = false;
+			let ambiguous: { id: string; candidates: AmbiguousMemory[] } | undefined;
 			await withFileLock(this.memoryMutationLock, async () => {
 				if (entry.supersedes !== undefined) {
 					// Same contract as `forget`: a handle that addresses more than one fact retires none of
@@ -216,7 +258,7 @@ export class MindService {
 					const [ltm, shared, stm] = await Promise.all([this.ltm.load(), this.shared.load(), this.stm.load()]);
 					const visible = [...ltm.entries, ...shared.entries, ...pruneExpired(stm.entries, this.now())];
 					if (supersedeTargets(visible, entry.supersedes).ambiguous) {
-						ambiguous = true;
+						ambiguous = { id: entry.supersedes, candidates: ambiguityCandidates(visible, entry.supersedes) };
 						return;
 					}
 				}
@@ -224,7 +266,7 @@ export class MindService {
 				committed = updated.entries.find((candidate) => sameMemoryContent(candidate, entry));
 			});
 			if (ambiguous) {
-				return { ok: false, reason: `memory supersedes id ${entry.supersedes} is ambiguous — it addresses more than one stored memory; recall them and supersede one unambiguous id` };
+				return { ok: false, reason: ambiguousSupersedesReason(ambiguous.id, ambiguous.candidates) };
 			}
 			return { ok: true, entry: committed ?? entry };
 		} catch (err) {
@@ -233,7 +275,7 @@ export class MindService {
 	}
 
 	/** Graduate a short-term entry into the persona's long-term store (model-free consolidation). */
-	async promote(id: string): Promise<{ ok: true; entry: MemoryEntry } | { ok: false; reason?: string }> {
+	async promote(id: string): Promise<{ ok: true; entry: MemoryEntry; ambiguousSupersedes?: string } | { ok: false; reason?: string }> {
 		try {
 			return await withFileLock(this.memoryMutationLock, async () => {
 				const stm = await this.stm.load();
@@ -242,9 +284,18 @@ export class MindService {
 				const promoted = promoteToLong(found, this.now());
 				// Write the durable tier FIRST, then remove from short-term: a crash between the two leaves a
 				// harmless duplicate (collapsed by id on recall/inject) rather than losing the entry entirely.
-				const updated = await this.ltm.update((es) => upsertMemory(es, promoted));
+				let unretired: string | undefined;
+				const updated = await this.ltm.update((es) => {
+					// The lineage handle rides along from the short-term entry, so it can be one of the shared v1
+					// ids `upsertMemory` refuses to act on. The graduation still stands, but a caller told only
+					// "promoted" would believe the retirement happened. Re-derived per attempt: the store may
+					// replay this mutator after lock recovery, and only the committed attempt counts.
+					unretired = promoted.supersedes !== undefined && supersedeTargets(es, promoted.supersedes).ambiguous ? promoted.supersedes : undefined;
+					return upsertMemory(es, promoted);
+				});
 				await this.stm.update((es) => es.filter((e) => !sameMemoryContent(e, found)));
-				return { ok: true, entry: updated.entries.find((e) => sameMemoryContent(e, promoted)) ?? promoted } as const;
+				const entry = updated.entries.find((e) => sameMemoryContent(e, promoted)) ?? promoted;
+				return unretired === undefined ? ({ ok: true, entry } as const) : ({ ok: true, entry, ambiguousSupersedes: unretired } as const);
 			});
 		} catch (err) {
 			return { ok: false, reason: storageFailure(err) };
@@ -294,8 +345,11 @@ export class MindService {
 			const matches = loaded.flatMap((result) => result.entries.filter((entry) => memoryIdMatches(entry, id)));
 			const representatives = new Set(matches.map((entry) => memoryContentKey(entry)));
 			// A v1 id can be ambiguous because comma-joining erased the tag boundary. Never delete two
-			// different semantic facts merely because they share that historical handle.
-			if (representatives.size > 1) return { removed: 0, reason: "ambiguous_id" };
+			// different semantic facts merely because they share that historical handle — but hand back
+			// the per-fact ids that DO resolve, or the refusal is a store the caller can never repair.
+			if (representatives.size > 1) {
+				return { removed: 0, reason: "ambiguous_id", candidates: ambiguityCandidates(loaded.flatMap((result) => result.entries), id) };
+			}
 			let removed = 0;
 			for (let i = 0; i < stores.length; i++) {
 				if (!loaded[i]?.entries.some((entry) => memoryIdMatches(entry, id))) continue;
