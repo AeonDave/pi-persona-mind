@@ -133,6 +133,31 @@ test("short-term memory decays out of the injection after its ttl", async () => 
 	assert.match(soon, /prod db read-only today/);
 	const later = await svc("decay", "elite", t0 + 2 * H).buildInjection();
 	assert.ok(!later.includes("prod db read-only today"), "expired short-term is gone from context");
+	const persisted = JSON.parse(await readFile(scopeFor("decay", "elite").paths.stm, "utf8")) as { entries: Array<{ text: string }> };
+	assert.equal(persisted.entries.some((e) => e.text === "prod db read-only today"), false, "expired STM is removed from disk, not merely hidden");
+});
+
+test("expired backlog items are removed from injection and from the store", async () => {
+	const t0 = 2_500_000;
+	await svc("backlog-decay", "elite", t0).backlogAdd({ text: "retrieve Dance from PM01", ttlHours: 1 });
+	const soon = await svc("backlog-decay", "elite", t0 + 10_000).buildInjection();
+	assert.match(soon, /retrieve Dance/);
+	const later = await svc("backlog-decay", "elite", t0 + 2 * H).buildInjection();
+	assert.doesNotMatch(later, /retrieve Dance/);
+	const persisted = JSON.parse(await readFile(scopeFor("backlog-decay", "elite").paths.backlog, "utf8")) as { entries: Array<{ text: string }> };
+	assert.equal(persisted.entries.length, 0, "expired backlog auto-removes instead of lingering as a due wake");
+});
+
+test("an expired-due lead is still wakeable once, then sweepExpired deletes it from disk", async () => {
+	const t0 = 2_600_000;
+	await svc("last-wake", "elite", t0).backlogAdd({ text: "stale HTB lead", dueInSeconds: 60, ttlHours: 1 });
+	const due = await svc("last-wake", "elite", t0 + 2 * H).dueBacklog();
+	assert.equal(due.length, 1, "the last wake can still fire before deletion");
+	const swept = await svc("last-wake", "elite", t0 + 2 * H).sweepExpired();
+	assert.equal(swept.backlogRemoved, 1);
+	assert.equal((await svc("last-wake", "elite", t0 + 2 * H).dueBacklog()).length, 0);
+	const persisted = JSON.parse(await readFile(scopeFor("last-wake", "elite").paths.backlog, "utf8")) as { entries: unknown[] };
+	assert.equal(persisted.entries.length, 0);
 });
 
 test("forget removes a memory across tiers", async () => {
@@ -512,6 +537,71 @@ test("dueBacklog returns open items whose wake time has passed", async () => {
 	assert.equal(due[0]?.text, "re-run nmap after reset");
 });
 
+test("re-adding the same backlog text does not clobber a taken or closed item", async () => {
+	const now = 8_000_000;
+	const s = svc("backlog-clobber", "elite", now);
+	const add = await s.backlogAdd({ text: "retrieve Dance from PM01" });
+	assert.ok(add.ok);
+	const id = add.ok ? add.entry.id : "";
+	assert.ok((await s.backlogSet(id, "taken")).ok);
+	const again = await s.backlogAdd({ text: "retrieve Dance from PM01" });
+	assert.equal(again.ok, false, "a taken lead is not silently reopened");
+	assert.match(again.ok ? "" : again.reason, /taken/);
+	assert.equal((await s.backlogList())[0]?.state, "taken");
+	assert.ok((await s.backlogSet(id, "done", "shipped")).ok);
+	const afterDone = await s.backlogAdd({ text: "retrieve Dance from PM01" });
+	assert.equal(afterDone.ok, false);
+	assert.equal((await s.backlogList({ state: "done" }))[0]?.state, "done");
+});
+
+test("take on an already-taken item succeeds; closed items name the current state", async () => {
+	const now = 8_100_000;
+	const s = svc("backlog-take-ux", "elite", now);
+	const add = await s.backlogAdd({ text: "claim this lead" });
+	assert.ok(add.ok);
+	const id = add.ok ? add.entry.id : "";
+	assert.ok((await s.backlogSet(id, "taken")).ok);
+	const retake = await s.backlogSet(id, "taken");
+	assert.equal(retake.ok, true, "idempotent take");
+	assert.ok((await s.backlogSet(id, "done", "shipped")).ok);
+	const takeClosed = await s.backlogSet(id, "taken");
+	assert.equal(takeClosed.ok, false);
+	assert.match(takeClosed.reason ?? "", /done/);
+});
+
+test("acknowledgeDue clears the wake without closing the lead", async () => {
+	const t0 = 9_000_000;
+	await svc("ack-due", "elite", t0).backlogAdd({ text: "re-check the share", dueInSeconds: 60 });
+	const due = await svc("ack-due", "elite", t0 + 90_000).dueBacklog();
+	assert.equal(due.length, 1);
+	const n = await svc("ack-due", "elite", t0 + 90_000).acknowledgeDue(due.map((e) => e.id));
+	assert.equal(n, 1);
+	assert.equal((await svc("ack-due", "elite", t0 + 120_000).dueBacklog()).length, 0, "the alarm does not re-nag");
+	assert.equal((await svc("ack-due", "elite", t0 + 120_000).backlogList())[0]?.state, "open");
+});
+
+test("buildInjection uses the persona's backlog view, not every persona's leads", async () => {
+	const now = 9_500_000;
+	await svc("inject-view", "elite", now).backlogAdd({ text: "elite-only lead" });
+	await svc("inject-view", "dev", now).backlogAdd({ text: "dev-only lead" });
+	const elite = await svc("inject-view", "elite", now).buildInjection();
+	assert.match(elite, /elite-only lead/);
+	assert.doesNotMatch(elite, /dev-only lead/);
+});
+
+test("a home workspace injects identity only — no STM or backlog dump", async () => {
+	const now = 9_600_000;
+	const home = scopeFor("home-ws", "elite");
+	const s = new MindService({ ...home, homeWorkspace: true }, { now: () => now });
+	await s.remember({ term: "long", kind: "preference", text: "prefers verbose recon" });
+	await s.remember({ term: "short", kind: "note", text: "HTB box notes from a home session" });
+	await s.backlogAdd({ text: "retrieve Dance from PM01" });
+	const block = await s.buildInjection();
+	assert.match(block, /verbose recon/);
+	assert.doesNotMatch(block, /HTB box notes/);
+	assert.doesNotMatch(block, /retrieve Dance/);
+});
+
 test("buildInjection lean mode = north-star + identity only (a delegated worker drops STM + backlog)", async () => {
 	const s = svc("lean", "elite", 5_000_000);
 	await s.remember({ term: "long", kind: "objective", text: "root every box on the range" });
@@ -530,4 +620,37 @@ test("buildInjection lean mode = north-star + identity only (a delegated worker 
 	assert.match(lean, /verbose recon/, "lean keeps durable identity");
 	assert.doesNotMatch(lean, /prod db is read-only/, "lean drops the supervisor's working context");
 	assert.doesNotMatch(lean, /revisit the SMB share/, "lean drops the supervisor's backlog");
+});
+
+test("resetWorkspace clears this project's STM and backlog and leaves long-term identity alone", async () => {
+	const s = svc("reset-ws", "elite", 5_000_000);
+	await s.remember({ term: "long", kind: "preference", text: "prefers verbose recon" });
+	await s.remember({ term: "long", kind: "convention", text: "shared OS note", toShared: true });
+	await s.remember({ term: "short", kind: "note", text: "prod db is read-only right now" });
+	await s.remember({ term: "short", kind: "note", text: "vpn is down" });
+	const queued = await s.backlogAdd({ text: "revisit the SMB share" });
+	assert.equal(queued.ok, true);
+	if (queued.ok) await s.backlogSet(queued.entry.id, "done", "parked");
+	await s.backlogAdd({ text: "still open lead" });
+
+	const r = await s.resetWorkspace();
+	assert.equal(r.ok, true);
+	if (!r.ok) return;
+	assert.equal(r.stmRemoved, 2);
+	assert.equal(r.backlogRemoved, 2);
+	assert.equal(r.ltmKept, 2, "persona + shared long-term both survive");
+
+	assert.deepEqual(await s.summary(), { ltm: 2, stm: 0, backlogOpen: 0 });
+	const { hits: shortHits } = await s.recall("", "short", 50);
+	assert.equal(shortHits.length, 0);
+	const { hits: longHits } = await s.recall("", "long", 50);
+	assert.equal(longHits.length, 2);
+	assert.equal((await s.backlogList({ all: true, state: "done" })).length, 0, "terminal backlog history is wiped with the workspace");
+	const again = await s.resetWorkspace();
+	assert.equal(again.ok, true);
+	if (again.ok) {
+		assert.equal(again.stmRemoved, 0);
+		assert.equal(again.backlogRemoved, 0);
+		assert.equal(again.ltmKept, 2);
+	}
 });

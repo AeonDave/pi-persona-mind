@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import {
 	clampBacklogMax,
+	isExpired,
 	makeBacklog,
 	MAX_BACKLOG_ID_CHARS,
 	MAX_BACKLOG_NOTE_CHARS,
@@ -13,6 +14,7 @@ import {
 	compactTerminal,
 	openItems,
 	orderBacklog,
+	pruneExpired,
 	transition,
 	validateBacklog,
 	viewFor,
@@ -32,7 +34,29 @@ test("makeBacklog creates an open, content-addressed entry", () => {
 test("makeBacklog with dueInSeconds sets dueAtEpochMs", () => {
 	const e = makeBacklog({ text: "re-run nmap after reset", dueInSeconds: 600 }, T0);
 	assert.equal(e.dueAtEpochMs, T0 + 600_000);
+	assert.equal(e.expiresAt, new Date(T0 + 48 * 3_600_000).toISOString(), "a short wake still decays at the default 48h");
 });
+
+test("makeBacklog expires by default and a later due extends the life so the wake can still fire", () => {
+	const e = makeBacklog({ text: "revisit next week", dueInSeconds: 7 * 24 * 3600 }, T0);
+	assert.equal(e.expiresAt, new Date(T0 + 7 * 24 * 3_600_000).toISOString());
+});
+
+test("expired backlog items are dropped; a legacy item without expiresAt uses createdAt + 48h", () => {
+	const live = makeBacklog({ text: "fresh lead", ttlHours: 96 }, T0);
+	const stale = { ...makeBacklog({ text: "stale lead" }, T0), expiresAt: new Date(T0 + 1000).toISOString() };
+	const legacy = makeBacklog({ text: "old HTB lead" }, T0);
+	delete legacy.expiresAt;
+	const later = T0 + 49 * 3_600_000;
+	assert.deepEqual(
+		pruneExpired([live, stale, legacy], later).map((e) => e.text),
+		["fresh lead"],
+	);
+	assert.equal(isExpired(stale, T0 + 2000), true);
+	assert.equal(isExpired(legacy, later), true);
+	assert.equal(isExpired(live, T0 + 1000), false);
+});
+
 
 test("transition moves state and records a note; unknown id is a no-op flagged not-ok", () => {
 	const e = makeBacklog({ text: "task", persona: "elite" }, T0);
@@ -53,8 +77,9 @@ test("transition enforces the backlog state machine and never resurrects termina
 	assert.equal(illegalDone.entries[0]?.state, "open");
 
 	const taken = transition([e], e.id, "taken");
-	const illegalTake = transition(taken.entries, e.id, "taken");
-	assert.equal(illegalTake.ok, false, "take only accepts open items");
+	const retake = transition(taken.entries, e.id, "taken");
+	assert.equal(retake.ok, true, "take on an already-taken item is idempotent");
+	assert.equal(retake.entries[0]?.state, "taken");
 
 	const done = transition(taken.entries, e.id, "done", "shipped");
 	assert.equal(done.ok, true);
@@ -124,6 +149,7 @@ test("validateBacklog accepts good entries and rejects junk", () => {
 	assert.equal(validateBacklog({ id: "x", text: "y", state: "bogus" }), null);
 	assert.equal(validateBacklog({ ...good, createdAt: "not-a-date" }), null);
 	assert.equal(validateBacklog({ ...good, dueAtEpochMs: Number.POSITIVE_INFINITY }), null);
+	assert.equal(validateBacklog({ ...good, expiresAt: "not-a-date" }), null);
 	assert.equal(validateBacklog(null), null);
 });
 

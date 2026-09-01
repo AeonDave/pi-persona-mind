@@ -15,6 +15,7 @@
 
 import { closeSync, existsSync, fstatSync, openSync, realpathSync, readSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 import { basename, dirname, join, resolve, win32 } from "node:path";
 
 export const DEFAULT_PERSONA = "_default";
@@ -36,6 +37,8 @@ export interface Scope {
 	projectRoot: string;
 	slug: string;
 	paths: ScopePaths;
+	/** True when the resolved project is the user's home directory (no real git workspace). */
+	homeWorkspace?: true;
 }
 
 /** A marker reading: whether pi-persona's state file could be understood at all, the persona it named,
@@ -197,11 +200,16 @@ export function activePersona(agentDir: string, env: NodeJS.ProcessEnv = process
  * `/persona off`), which pi-persona DOES persist. The change is latched, so switching back to the
  * name the marker originally held is still recognised as a switch rather than read as the seed.
  *
- * Process-global and never cleared, by design: "a switch happened" is a fact about the SESSION, not
- * about one call, so {@link activePersona} is deliberately not a pure function of its arguments
- * across calls. An embedder that reuses one process for several sessions inherits the latch.
+ * Process-global until {@link resetPersonaMarkerLatch} — "a switch happened" is a fact about the
+ * current Pi session. Call the reset from `session_start`/`session_shutdown` so a reused process
+ * does not inherit the previous session's latch.
  */
 const personaMarkers = new Map<string, { baseline: string | null; stamp: string; switched: boolean }>();
+
+/** Drop every session-scoped marker latch. A new Pi session must start from the launch seed. */
+export function resetPersonaMarkerLatch(): void {
+	personaMarkers.clear();
+}
 
 /** Has pi-persona rewritten its marker since this process started? Only a READABLE (or ABSENT) marker
  *  counts — an oversized or torn one is no evidence of a switch and must never demote the seed. Both
@@ -288,11 +296,21 @@ export function projectSlug(projectRoot: string, opts: ProjectSlugOptions = {}):
 	return `${base}-${hash}`;
 }
 
-/** Walk up from `startDir` to the nearest directory that satisfies `hasGit`; else return `startDir`. */
-export function findProjectRoot(startDir: string, hasGit: (dir: string) => boolean): string {
+export interface ProjectRootOptions {
+	/** Never treat this directory as a git project root (typically the user's home). */
+	homedir?: string;
+	/** Equality used to compare walked directories against `homedir`. Defaults to string equality. */
+	samePath?: (a: string, b: string) => boolean;
+}
+
+/** Walk up from `startDir` to the nearest directory that satisfies `hasGit`; else return `startDir`.
+ *  A git-initialized home directory is skipped so every folder under `~` does not share one backlog. */
+export function findProjectRoot(startDir: string, hasGit: (dir: string) => boolean, opts: ProjectRootOptions = {}): string {
+	const home = opts.homedir;
+	const same = opts.samePath ?? ((a, b) => a === b);
 	let cur = startDir;
 	for (;;) {
-		if (hasGit(cur)) return cur;
+		if (hasGit(cur) && !(home !== undefined && same(cur, home))) return cur;
 		const parent = dirname(cur);
 		if (parent === cur) return startDir;
 		cur = parent;
@@ -357,12 +375,21 @@ export interface ScopeResolutionOptions {
 	cliPersona?: string;
 	/** Injectable process environment for tests/embedders. */
 	env?: NodeJS.ProcessEnv;
+	/** Injectable home directory; defaults to os.homedir(). */
+	homedir?: string;
 }
 
 /** Resolve the full scope for a turn: active persona, project root, and the store paths. */
 export function resolveScope(agentDir: string, cwd: string, opts: ScopeResolutionOptions = {}): Scope {
 	const persona = activePersona(agentDir, opts.env ?? process.env, opts.cliPersona);
-	const projectRoot = findProjectRoot(resolve(cwd), (d) => existsSync(join(d, ".git")));
+	const home = opts.homedir ?? homedir();
+	const start = resolve(cwd);
+	const projectRoot = findProjectRoot(start, (d) => existsSync(join(d, ".git")), {
+		homedir: home,
+		samePath: (a, b) => canonicalProjectIdentity(a) === canonicalProjectIdentity(b),
+	});
 	const slug = projectSlug(projectRoot);
-	return { persona, projectRoot, slug, paths: mindPaths(agentDir, persona, slug) };
+	const paths = mindPaths(agentDir, persona, slug);
+	const homeWorkspace = canonicalProjectIdentity(projectRoot) === canonicalProjectIdentity(home);
+	return homeWorkspace ? { persona, projectRoot, slug, paths, homeWorkspace: true } : { persona, projectRoot, slug, paths };
 }

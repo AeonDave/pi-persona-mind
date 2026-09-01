@@ -5,11 +5,12 @@
  * unit-testable over real temp files without a running agent.
  *
  * Four JSON stores back one scope: long-term memory for the active persona, long-term memory shared
- * across personas, short-term (decaying) memory for the project, and the project backlog.
+ * across personas, short-term (48h, auto-deleted) memory for the project, and the project backlog
+ * (same default life; a later wake extends it).
  */
 
-import type { BacklogEntry, BacklogState } from "./backlog.ts";
-import { clampBacklogMax, compactTerminal, makeBacklog, openItems, orderBacklog, transition, validateBacklog, viewFor, MAX_BACKLOG_NOTE_CHARS, MAX_BACKLOG_TAGS, MAX_BACKLOG_TAG_CHARS, MAX_BACKLOG_TEXT_CHARS } from "./backlog.ts";
+import type { BacklogEntry, BacklogState, TransitionResult } from "./backlog.ts";
+import { clampBacklogMax, compactTerminal, makeBacklog, openItems, orderBacklog, pruneExpired as pruneExpiredBacklog, transition, validateBacklog, viewFor, MAX_BACKLOG_NOTE_CHARS, MAX_BACKLOG_TAGS, MAX_BACKLOG_TAG_CHARS, MAX_BACKLOG_TEXT_CHARS } from "./backlog.ts";
 import { contentId } from "./ids.ts";
 import type { MindBudget } from "./inject.ts";
 import { renderMind } from "./inject.ts";
@@ -47,6 +48,7 @@ export interface BacklogAddInput {
 	text: string;
 	tags?: string[];
 	dueInSeconds?: number;
+	ttlHours?: number;
 }
 
 export interface BacklogListOptions {
@@ -79,6 +81,9 @@ export type RememberResult = { ok: true; entry: MemoryEntry } | { ok: false; rea
 export type BacklogAddResult = { ok: true; entry: BacklogEntry } | { ok: false; reason: string };
 export type BacklogSetResult = { ok: true; entry: BacklogEntry } | { ok: false; reason?: string };
 export type ForgetResult = { removed: number; reason?: "ambiguous_id"; candidates?: AmbiguousMemory[] };
+export type WorkspaceResetResult =
+	| { ok: true; stmRemoved: number; backlogRemoved: number; ltmKept: number }
+	| { ok: false; reason: string };
 
 function storageFailure(err: unknown): string {
 	const message = err instanceof Error ? err.message : String(err);
@@ -370,15 +375,34 @@ export class MindService {
 		const sizeError = validateNewTextAndTags(text, input.tags, "backlog", MAX_BACKLOG_TEXT_CHARS, MAX_BACKLOG_TAGS, MAX_BACKLOG_TAG_CHARS);
 		if (sizeError) return { ok: false, reason: sizeError };
 		if (!validPositiveFutureOffset(input.dueInSeconds, 1_000, now)) return { ok: false, reason: "dueInSeconds must be a finite positive duration within the supported date range" };
+		if (!validPositiveFutureOffset(input.ttlHours, 3_600_000, now)) return { ok: false, reason: "ttlHours must be a finite positive duration within the supported date range" };
 		const scan = scanContent(text);
 		if (!scan.ok) return { ok: false, reason: scan.reason ?? "rejected by content scanner" };
 		const makeInput = { text, persona: this.scope.persona } as Parameters<typeof makeBacklog>[0];
 		if (input.tags) makeInput.tags = input.tags;
 		if (input.dueInSeconds !== undefined) makeInput.dueInSeconds = input.dueInSeconds;
+		if (input.ttlHours !== undefined) makeInput.ttlHours = input.ttlHours;
 		const entry = makeBacklog(makeInput, now);
 		try {
-			await this.backlog.update((es) => [...compactTerminal(es).filter((e) => e.id !== entry.id), entry]);
-			return { ok: true, entry };
+			let refused: BacklogEntry | undefined;
+			let kept: BacklogEntry | undefined;
+			await this.backlog.update((es) => {
+				const existing = es.find((e) => e.id === entry.id);
+				if (existing && existing.state !== "open") {
+					refused = existing;
+					return es;
+				}
+				if (existing) {
+					const merged: BacklogEntry = { ...existing };
+					if (entry.expiresAt !== undefined) merged.expiresAt = entry.expiresAt;
+					if (entry.dueAtEpochMs !== undefined) merged.dueAtEpochMs = entry.dueAtEpochMs;
+					kept = merged;
+					return es.map((e) => (e.id === entry.id ? merged : e));
+				}
+				return [...compactTerminal(pruneExpiredBacklog(es, now)), entry];
+			});
+			if (refused) return { ok: false, reason: `backlog item already ${refused.state} — use a new wording, or done/drop first` };
+			return { ok: true, entry: kept ?? entry };
 		} catch (err) {
 			return { ok: false, reason: storageFailure(err) };
 		}
@@ -413,17 +437,27 @@ export class MindService {
 			if (!noteScan.ok) return { ok: false, reason: `backlog note rejected: ${noteScan.reason ?? "content policy"}` };
 		}
 		try {
-			const cur = await this.backlog.load();
-			if (!cur.entries.some((e) => e.id === id)) return { ok: false, reason: "backlog item not found" };
-			let transitioned = false;
+			let outcome: TransitionResult = { ok: false, entries: [], reason: "not_found" };
 			const store = await this.backlog.update((es) => {
-				const result = transition(es, id, state, note);
-				transitioned = result.ok;
-				return result.entries;
+				outcome = transition(es, id, state, note);
+				return outcome.entries;
 			});
-			if (!transitioned) return { ok: false, reason: `cannot transition backlog item to ${state}` };
-			const entry = store.entries.find((e) => e.id === id);
-			return entry ? { ok: true, entry } : { ok: false, reason: "backlog item disappeared during update" };
+			if (outcome.ok) {
+				const entry = store.entries.find((e) => e.id === id);
+				return entry ? { ok: true, entry } : { ok: false, reason: "backlog item disappeared during update" };
+			}
+			if (outcome.reason === "not_found") return { ok: false, reason: "backlog item not found" };
+			const current = store.entries.find((e) => e.id === id);
+			if (current) {
+				const closed = current.state === "done" || current.state === "dropped";
+				return {
+					ok: false,
+					reason: closed
+						? `already ${current.state} — cannot ${state === "taken" ? "take" : state} a closed item`
+						: `already ${current.state} — use done or drop`,
+				};
+			}
+			return { ok: false, reason: `cannot transition backlog item to ${state}` };
 		} catch (err) {
 			return { ok: false, reason: storageFailure(err) };
 		}
@@ -440,13 +474,85 @@ export class MindService {
 			});
 	}
 
+	/**
+	 * Delete expired STM and backlog rows from disk. Call after delivering due wakes (so a lead that
+	 * expires at its due time still gets one reminder) and before injection so stale leads never
+	 * re-enter the prompt. Best-effort: a store error must not block the session.
+	 */
+	async sweepExpired(): Promise<{ stmRemoved: number; backlogRemoved: number }> {
+		const now = this.now();
+		let stmRemoved = 0;
+		let backlogRemoved = 0;
+		try {
+			await withFileLock(this.memoryMutationLock, async () => {
+				const stm = await this.stm.load();
+				const kept = pruneExpired(stm.entries, now);
+				stmRemoved = stm.entries.length - kept.length;
+				if (stmRemoved > 0) await this.stm.update(() => kept);
+			});
+			const backlog = await this.backlog.load();
+			const keptB = pruneExpiredBacklog(backlog.entries, now);
+			backlogRemoved = backlog.entries.length - keptB.length;
+			if (backlogRemoved > 0) await this.backlog.update(() => keptB);
+		} catch {
+			/* hygiene must not take the session down */
+		}
+		return { stmRemoved, backlogRemoved };
+	}
+
+	/** Clear dueAt on still-open items after a wake was shown, so the alarm does not re-nag. */
+	async acknowledgeDue(ids?: readonly string[]): Promise<number> {
+		const wanted = ids && ids.length > 0 ? new Set(ids) : undefined;
+		let cleared = 0;
+		try {
+			await this.backlog.update((es) =>
+				es.map((e) => {
+					if (e.dueAtEpochMs === undefined) return e;
+					if (wanted && !wanted.has(e.id)) return e;
+					if (e.state !== "open" && e.state !== "taken") return e;
+					cleared++;
+					const next = { ...e };
+					delete next.dueAtEpochMs;
+					return next;
+				}),
+			);
+			return cleared;
+		} catch {
+			return 0;
+		}
+	}
+
 	// ── injection ───────────────────────────────────────────────────────────────
+
+	/**
+	 * Wipe THIS PROJECT's short-term memory and backlog. Long-term persona identity (private + shared)
+	 * is left intact — that is not workspace-scoped. Counts every stored STM/backlog row, including
+	 * expired notes and closed leads, because "reset" means the files are empty.
+	 */
+	async resetWorkspace(): Promise<WorkspaceResetResult> {
+		try {
+			let stmRemoved = 0;
+			let backlogRemoved = 0;
+			await withFileLock(this.memoryMutationLock, async () => {
+				const before = await this.stm.load();
+				stmRemoved = before.entries.length;
+				if (stmRemoved > 0) await this.stm.update(() => []);
+			});
+			const backlogBefore = await this.backlog.load();
+			backlogRemoved = backlogBefore.entries.length;
+			if (backlogRemoved > 0) await this.backlog.update(() => []);
+			const ltmKept = (await this.longMemories()).length;
+			return { ok: true, stmRemoved, backlogRemoved, ltmKept };
+		} catch (err) {
+			return { ok: false, reason: storageFailure(err) };
+		}
+	}
 
 	/** Cheap counts for the status line and `/mind` header (expired STM and closed backlog excluded). */
 	async summary(): Promise<{ ltm: number; stm: number; backlogOpen: number }> {
 		const now = this.now();
 		const [ltm, stm, backlog] = await Promise.all([this.longMemories(), this.stm.load(), this.backlog.load()]);
-		return { ltm: ltm.length, stm: pruneExpired(stm.entries, now).length, backlogOpen: openItems(backlog.entries).length };
+		return { ltm: ltm.length, stm: pruneExpired(stm.entries, now).length, backlogOpen: openItems(viewFor(backlog.entries, this.scope.persona, false)).length };
 	}
 
 	/**
@@ -457,17 +563,22 @@ export class MindService {
 	 * intent. (The caller also withholds the write tools + wakes from a leg — see index.ts.)
 	 */
 	async buildInjection(opts: { lean?: boolean } = {}): Promise<string> {
+		// Workers inherit a read-only lean block; they must not mutate the supervisor's stores.
+		if (!opts.lean) await this.sweepExpired();
 		const now = this.now();
-		if (opts.lean) {
+		if (opts.lean || this.scope.homeWorkspace) {
 			const ltm = this.safeMemories(await this.longMemories(), "long-term");
-			return renderMind({ persona: this.scope.persona, ltm, stm: [], backlog: [], now, lean: true, ...(this.budget ? { budget: this.budget } : {}) });
+			if (opts.lean) {
+				return renderMind({ persona: this.scope.persona, ltm, stm: [], backlog: [], now, lean: true, ...(this.budget ? { budget: this.budget } : {}) });
+			}
+			return renderMind({ persona: this.scope.persona, ltm, stm: [], backlog: [], now, ...(this.budget ? { budget: this.budget } : {}) });
 		}
 		const [ltm, stmRaw, backlogRaw] = await Promise.all([this.longMemories(), this.stm.load(), this.backlog.load()]);
 		return renderMind({
 			persona: this.scope.persona,
 			ltm: this.safeMemories(ltm, "long-term"),
 			stm: this.safeMemories(pruneExpired(stmRaw.entries, now), "short-term"),
-			backlog: this.safeBacklog(orderBacklog(openItems(backlogRaw.entries), now)),
+			backlog: this.safeBacklog(orderBacklog(openItems(viewFor(backlogRaw.entries, this.scope.persona, false)), now)),
 			now,
 			...(this.budget ? { budget: this.budget } : {}),
 		});

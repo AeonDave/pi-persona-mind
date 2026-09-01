@@ -26,11 +26,14 @@ test("marks EXPLICIT persist-intent as strong; casual phrasing as soft (governs 
 		assert.equal(cue.strong, true, s);
 	}
 	// Soft: casual turns of phrase that should NOT push a hint into the model's context.
-	for (const s of ["I prefer tabs over spaces", "always check the logs first", "we use pnpm here"]) {
+	for (const s of ["I prefer tabs over spaces", "always check the logs first", "we use pnpm here", "Note that the handler returns null"]) {
 		const cue = detectCaptureCue(s);
 		assert.ok(cue, s);
 		assert.equal(cue.strong, false, s);
 	}
+	const alwaysRemember = detectCaptureCue("Always remember that the VPN is eu-1");
+	assert.ok(alwaysRemember);
+	assert.equal(alwaysRemember.strong, true, "always+remember is an explicit persist request");
 });
 
 test("ignores ordinary messages with no durable cue", () => {

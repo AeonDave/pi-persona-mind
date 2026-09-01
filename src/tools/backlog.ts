@@ -1,13 +1,16 @@
 /**
  * The `backlog` tool — the agent-facing surface for deferred intent.
  *
- * A backlog item is a lead or task the supervisor means to act on later. Unlike short-term memory
- * it does not decay: it is `done` or `dropped`, never silently lost. Open items are re-injected
- * each turn, and an item can carry a wake time. Thin glue over MindService.
+ * A backlog item is a lead or task the supervisor means to act on later. Like short-term memory it
+ * auto-deletes after ~48h (a later wake extends that life). Durable identity belongs in long-term
+ * memory via `promote` / `remember long`. Open items are re-injected each turn until they expire.
+ * Thin glue over MindService.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+
+import { renderExpandableCard, toolResultText } from "../ui/presentation.ts";
 
 import type { BacklogAddInput, BacklogListOptions, MindService } from "../core/service.ts";
 import { clampBacklogMax, MAX_BACKLOG_ID_CHARS, MAX_BACKLOG_NOTE_CHARS, MAX_BACKLOG_TAGS, MAX_BACKLOG_TAG_CHARS, MAX_BACKLOG_TEXT_CHARS } from "../core/backlog.ts";
@@ -22,7 +25,8 @@ const BacklogParams = Type.Object({
 	),
 	text: Type.Optional(Type.String({ maxLength: MAX_BACKLOG_TEXT_CHARS, description: "add: the lead/task to defer. Required for add." })),
 	tags: Type.Optional(Type.Array(Type.String({ maxLength: MAX_BACKLOG_TAG_CHARS }), { maxItems: MAX_BACKLOG_TAGS, description: "add: optional tags" })),
-	dueInSeconds: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "add: wake me about this item after N seconds (a durable alarm re-armed across restarts)" })),
+	dueInSeconds: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "add: wake me about this item after N seconds (a durable alarm re-armed across restarts). Extends the 48h auto-delete so the wake can still fire." })),
+	ttlHours: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "add: hours until this lead is deleted (default 48). A later dueInSeconds wins." })),
 	id: Type.Optional(Type.String({ maxLength: MAX_BACKLOG_ID_CHARS, description: "take/done/drop: the item id (see list)" })),
 	note: Type.Optional(Type.String({ maxLength: MAX_BACKLOG_NOTE_CHARS, description: "done/drop: why (optional)" })),
 	state: Type.Optional(
@@ -68,13 +72,13 @@ export function registerBacklogTool(pi: ExtensionAPI, getMind: GetMind): void {
 		label: "Backlog",
 		promptSnippet: "backlog — persist unfinished or blocked project intent across compaction and restarts",
 		promptGuidelines: [
-			"When work is deferred, blocked, or deliberately left incomplete, record one actionable `backlog add`; close it with `done` or `drop` when resolved. Do not queue routine next steps you will complete in the current turn.",
+			"When work is deferred, blocked, or deliberately left incomplete, record one actionable `backlog add`; close it with `done` or `drop` when resolved. Leads auto-delete after ~48h — promote anything that must survive into long-term `memory`. Do not queue routine next steps you will complete in the current turn.",
 		],
 		description: [
 			"Your deferred-intent backlog — leads and tasks to come back to, per project. `add` a lead so",
-			"you never lose it to compaction, a restart, or a persona switch; optionally attach a wake time.",
-			"`take` to claim one, `done`/`drop` to close it, `list` to review. Open items are re-injected",
-			"into your context each turn. Park a blocked vector here instead of abandoning it.",
+			"it survives compaction and restart for about 48 hours (then it is deleted); optionally attach",
+			"a wake time. `take` to claim one, `done`/`drop` to close it, `list` to review. Park a blocked",
+			"vector here instead of abandoning it. Durable identity belongs in long-term memory, not here.",
 		].join(" "),
 		parameters: BacklogParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -85,6 +89,7 @@ export function registerBacklogTool(pi: ExtensionAPI, getMind: GetMind): void {
 				const input: BacklogAddInput = { text: params.text };
 				if (params.tags) input.tags = params.tags;
 				if (params.dueInSeconds !== undefined) input.dueInSeconds = params.dueInSeconds;
+				if (params.ttlHours !== undefined) input.ttlHours = params.ttlHours;
 				const r = await mind.backlogAdd(input);
 				return r.ok ? say(`Queued ${r.entry.id}: ${compactMemoryText(r.entry.text)}`, { id: r.entry.id, ok: true }) : say(`Not queued: ${r.reason}`, { ok: false, reason: r.reason });
 			}
@@ -113,6 +118,9 @@ export function registerBacklogTool(pi: ExtensionAPI, getMind: GetMind): void {
 			return r.ok
 				? say(`${params.id} → ${state}.`, { id: params.id, state, ok: true })
 				: say(`Not updated: ${r.reason ?? `backlog item "${params.id}" does not exist or cannot transition to ${state}`}.`, { ok: false, reason: r.reason ?? "invalid state transition" });
+		},
+		renderResult(result, { expanded }, theme) {
+			return renderExpandableCard("backlog", toolResultText(result), expanded, theme);
 		},
 	});
 }

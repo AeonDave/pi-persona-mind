@@ -15,7 +15,7 @@ export const MEMORY_KINDS = ["objective", "invariant", "preference", "convention
 export type MemoryKind = (typeof MEMORY_KINDS)[number];
 export type MemoryTerm = "long" | "short";
 
-/** Default life of a short-term memory before it decays out of view. */
+/** Default life of a short-term memory before it is deleted from the store. */
 export const DEFAULT_TTL_HOURS = 48;
 export const DEFAULT_RECALL_MAX = 8;
 export const MAX_RECALL_MAX = 50;
@@ -160,7 +160,7 @@ export function isExpired(entry: MemoryEntry, now: number): boolean {
 	return entry.expiresAt !== undefined && now >= Date.parse(entry.expiresAt);
 }
 
-/** Drop expired short-term entries; keep everything else. */
+/** Drop expired short-term entries; keep everything else. Callers that persist must write this back. */
 export function pruneExpired(entries: readonly MemoryEntry[], now: number): MemoryEntry[] {
 	return entries.filter((e) => !isExpired(e, now));
 }

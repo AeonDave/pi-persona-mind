@@ -89,13 +89,14 @@ function sentences(text: string): string[] {
 }
 
 const CUE_PREFIXES: readonly { re: RegExp; explicit: boolean }[] = [
-	{ re: /^\s*(?:please\s+)?(?:remember(?:\s+that)?|keep\s+in\s+mind(?:\s+that)?|note\s+that|don'?t\s+forget(?:\s+that)?|for\s+future\s+reference|commit\s+(?:this\s+)?to\s+memory(?:\s+that)?)\s*[,;:\-]?\s*(.+)$/i, explicit: true },
+	{ re: /^\s*(?:please\s+)?(?:remember(?:\s+that)?|keep\s+in\s+mind(?:\s+that)?|don'?t\s+forget(?:\s+that)?|for\s+future\s+reference|commit\s+(?:this\s+)?to\s+memory(?:\s+that)?)\s*[,;:\-]?\s*(.+)$/i, explicit: true },
 	{ re: /^\s*(?:i\s+(?:want|need)\s+you\s+to\s+remember(?:\s+that)?)\s*[,;:\-]?\s*(.+)$/i, explicit: true },
 	{ re: /^\s*(?:from\s+now\s+on|going\s+forward|in\s+the\s+future)\s*[,;:\-]?\s*(.+)$/i, explicit: true },
-	{ re: /^\s*(?:per\s+favore\s+)?(?:ricorda(?:ti)?(?:\s+(?:che|di))?|tieni\s+(?:a\s+mente|presente)(?:\s+che)?|nota\s+che|non\s+dimentica(?:re|rti)(?:\s+che)?|memorizza(?:\s+che)?|segnati(?:\s+che)?|conserva\s+in\s+memoria(?:\s+che)?|salva(?:lo)?\s+(?:in|nella)\s+memoria(?:\s+che)?)\s*[,;:\-]?\s*(.+)$/i, explicit: true },
+	{ re: /^\s*(?:per\s+favore\s+)?(?:ricorda(?:ti)?(?:\s+(?:che|di))?|tieni\s+(?:a\s+mente|presente)(?:\s+che)?|non\s+dimentica(?:re|rti)(?:\s+che)?|memorizza(?:\s+che)?|segnati(?:\s+che)?|conserva\s+in\s+memoria(?:\s+che)?|salva(?:lo)?\s+(?:in|nella)\s+memoria(?:\s+che)?)\s*[,;:\-]?\s*(.+)$/i, explicit: true },
 	{ re: /^\s*(?:voglio\s+che\s+tu\s+ricordi(?:\s+che)?)\s*[,;:\-]?\s*(.+)$/i, explicit: true },
 	{ re: /^\s*(?:da\s+ora\s+in\s+poi|da\s+questo\s+momento|d['’]ora\s+in\s+poi|in\s+futuro|per\s+il\s+futuro)\s*[,;:\-]?\s*(.+)$/i, explicit: true },
 	{ re: /^\s*(?:i(?:'d)?\s+prefer|prefer\s+that|preferisco|preferirei)\s*[,;:\-]?\s*(.+)$/i, explicit: false },
+	{ re: /^\s*(?:note\s+that|nota\s+che)\s*[,;:\-]?\s*(.+)$/i, explicit: false },
 ];
 
 function candidateFor(sentence: string): { text: string; explicit: boolean } {
@@ -109,8 +110,9 @@ function candidateFor(sentence: string): { text: string; explicit: boolean } {
 		const text = afterColon || direct;
 		return { text, explicit: /[\p{L}\p{N}]/u.test(text) };
 	}
+	const withoutAlways = direct.replace(/^\s*(?:always|never)\s+/i, "");
 	for (const prefix of CUE_PREFIXES) {
-		const match = prefix.re.exec(direct);
+		const match = prefix.re.exec(direct) ?? (withoutAlways !== direct ? prefix.re.exec(withoutAlways) : null);
 		const candidate = match?.[1]?.trim();
 		if (candidate) {
 			const text = candidate;

@@ -742,6 +742,29 @@ export class JsonStore<E> {
 		return store;
 	}
 
+	private async restoreLive(store: InternalStoreFile<E>): Promise<void> {
+		const invalidEntries = store[PRESERVED_INVALID_ENTRIES] ?? [];
+		const persisted = invalidEntries.length > 0 ? { ...store, entries: [...store.entries, ...invalidEntries] } : store;
+		await atomicWriteFile(this.filePath, `${JSON.stringify(persisted, null, 2)}\n`, {
+			backupIf: () => false,
+			maxBackupBytes: this.maxBytes,
+		});
+	}
+
+	private async recoverFromBak(reason: string, lockToken?: string): Promise<InternalStoreFile<E> | null> {
+		if (lockToken === undefined) {
+			const peek = await this.tryBak();
+			if (!peek) return null;
+			return withFileLock(`${this.filePath}.lock`, async (token) => this.recoverFromBak(reason, token));
+		}
+		const bak = await this.tryBak();
+		if (!bak) return null;
+		this.onWarn(`mind store: ${this.filePath} ${reason}; recovered from ${this.filePath}.bak`);
+		this.warnInvalidEntries(bak);
+		await this.restoreLive(bak);
+		return bak;
+	}
+
 	/** Try to recover the last-known-good `.bak` sidecar. Returns null if it is absent or also bad. */
 	private async tryBak(): Promise<InternalStoreFile<E> | null> {
 		try {
@@ -769,12 +792,8 @@ export class JsonStore<E> {
 			// store lock before quarantine so a writer that repaired the path wins the race safely.
 			return withFileLock(`${this.filePath}.lock`, async (token) => this.loadInternal(token));
 		}
-		const bak = await this.tryBak();
-		if (bak) {
-			this.onWarn(`mind store: ${this.filePath} rejected — ${failure.message}; recovered from ${this.filePath}.bak`);
-			this.warnInvalidEntries(bak);
-			return bak;
-		}
+		const bak = await this.recoverFromBak(`rejected — ${failure.message}`, lockToken);
+		if (bak) return bak;
 		const quarantineOptions: QuarantineOptions = {};
 		if (lockToken !== undefined) quarantineOptions.lockToken = lockToken;
 		const dest = await quarantineCorrupt(this.filePath, failure.message, quarantineOptions);
@@ -787,7 +806,10 @@ export class JsonStore<E> {
 		try {
 			raw = await readTextFileBounded(this.filePath, this.maxBytes);
 		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code === "ENOENT") return this.empty();
+			if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+				const bak = await this.recoverFromBak("missing", lockToken);
+				return bak ?? this.empty();
+			}
 			if (err instanceof BoundedReadFailure) return this.recoverBoundedFailure(err, lockToken);
 			throw err;
 		}
@@ -808,12 +830,8 @@ export class JsonStore<E> {
 			return withFileLock(`${this.filePath}.lock`, async (token) => this.loadInternal(token));
 		}
 		// Live file is torn/invalid — roll back to the last-known-good backup before giving up.
-		const bak = await this.tryBak();
-		if (bak) {
-			this.onWarn(`mind store: ${this.filePath} was corrupt — recovered from ${this.filePath}.bak (the last committed write may be lost)`);
-			this.warnInvalidEntries(bak);
-			return bak;
-		}
+		const bak = await this.recoverFromBak("was corrupt — the last committed write may be lost", lockToken);
+		if (bak) return bak;
 		const quarantineOptions: QuarantineOptions = {};
 		if (lockToken !== undefined) quarantineOptions.lockToken = lockToken;
 		const dest = await quarantineCorrupt(this.filePath, "unparseable / unexpected shape", quarantineOptions);

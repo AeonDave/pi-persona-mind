@@ -51,9 +51,11 @@ test("short-term entries near expiry are flagged for verification", () => {
 
 test("backlog items render with their id so the model can act on them", () => {
 	const b = makeBacklog({ text: "revisit the SMB share", persona: "elite" }, T0);
-	const block = renderMind({ persona: "elite", ltm: [], stm: [], backlog: [b], now: T0 });
+	const taken = { ...b, state: "taken" as const };
+	const block = renderMind({ persona: "elite", ltm: [], stm: [], backlog: [taken], now: T0 });
 	assert.match(block, /## Backlog/);
 	assert.match(block, new RegExp(b.id));
+	assert.match(block, /\(taken\)/);
 	assert.match(block, /revisit the SMB share/);
 });
 

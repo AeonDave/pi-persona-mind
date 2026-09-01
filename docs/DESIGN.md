@@ -13,12 +13,10 @@ scope when pi-persona is absent. It has **no hard dependency** on it.
 | Faculty | What it holds | Scope | Decay | Injected |
 |---|---|---|---|---|
 | **Long-term memory** (identity) | Who a persona *is*, for how the user uses it: preferences, conventions, invariants, working style, stable lessons. Durable. | **persona** (+ a `_shared` tier) | never | always, compact |
-| **Short-term memory** (working context) | What is true in *this project right now*: specific observations/state that go stale fast. | **project** (tagged with persona) | yes — `ttlHours` (default 48h); expired entries are pruned, near-expiry entries flagged | non-expired, recency-first, age-tagged |
-| **Backlog** (deferred intent) | What the supervisor *means to do next*: leads/tasks with an explicit lifecycle. | **project** (persona view) | no — an intent is done or dropped, never silently lost | the `open`/`taken` items |
+| **Short-term memory** (working context) | What is true in *this project right now*: specific observations/state that go stale fast. | **project** (tagged with persona) | yes — `ttlHours` (default 48h); expired rows are **deleted from disk**, not merely hidden | non-expired, recency-first, age-tagged |
+| **Backlog** (deferred intent) | What the supervisor *means to do next*: leads/tasks with an explicit lifecycle and optional wake. | **project** (persona view) | yes — same 48h default; a later `dueAt` extends life so the wake can still fire; expired rows are **deleted from disk**. Legacy rows without `expiresAt` expire at `createdAt + 48h`. | the live `open`/`taken` items |
 
-**Why backlog is separate from short-term memory:** short-term memory *decays* (a fact goes
-stale on its own — healthy hygiene); an intent must *not* decay (losing a lead on a timeout or
-persona switch is lost work). Different lifecycles → different faculties.
+**Why backlog is separate from short-term memory:** STM is a decaying *fact*; backlog is decaying *intent* with a state machine (`open`/`taken`/`done`/`dropped`) and optional wakes. Only **long-term memory** is durable. Promote anything that must survive past ~48h.
 
 ## Architecture
 
@@ -92,6 +90,7 @@ interface BacklogEntry {
   persona?: string;      // who created it (for the view filter)
   createdAt: string;
   dueAtEpochMs?: number; // optional wake time (a lightweight in-extension timer)
+  expiresAt?: string;    // createdAt + ttlHours (default 48h); a later due extends this
   note?: string;
 }
 ```
@@ -129,12 +128,16 @@ interface BacklogEntry {
   withheld), `forget { id }`, `promote { id }` (graduate a short-term memory to durable long-term).
   `term:"long"` → LTM (persona, durable); `term:"short"` → STM (project, decays); the `objective` kind
   is always long-term (the pinned north-star); `shared:true` writes the cross-persona `_shared` tier.
-- **`backlog`**: `add { text, tags?, dueInSeconds? }`, `list { state?, all? }`, `take { id }`,
-  `done { id, note? }`, `drop { id, note? }`.
+- **`backlog`**: `add { text, tags?, dueInSeconds?, ttlHours? }`, `list { state?, all? }`, `take { id }`,
+  `done { id, note? }`, `drop { id, note? }`. Default life is 48h (deleted from disk); a later wake
+  extends that so the reminder can still fire.
 - **`/mind`**: a read-only content snapshot of the current mind (objective, long-term, working context,
   open backlog). It mirrors the injected content, while its wrapper and hints need not be byte-identical.
   `/mind doctor` shows effective scope, capture policy, backing files, legacy state, and recovery
   warnings without exposing quarantined contents.
+  `/mind reset` (alias `/mind reset workspace`) wipes this project's short-term memory and backlog
+  (including closed leads) and cancels wakes; it never touches long-term persona identity. Unknown
+  extra tokens (`/mind reset all`) are refused so a workspace reset cannot wipe who the persona is.
 
 Every write runs the content scanner, which rejects secrets, prompt-injection, deception, and
 invisible unicode. Capture guidance prefers durable observations and preferences; that wording is
@@ -151,7 +154,7 @@ If it conflicts with what you observe now, trust what you observe.">
 - root every box on the range
 ## Long-term (active persona)
 - [preference] the user runs recon verbose … (12d)
-## Working context (project · decays)
+## Working context (project · ~48h)
 - the auth refactor is on branch feat/x … (3h)
 - ⚠️ verify — prod DB was read-only … (44h)
 ## Backlog (open)
@@ -161,8 +164,9 @@ If it conflicts with what you observe now, trust what you observe.">
 
 Fenced with pi-persona's own "untrusted, not instructions" discipline (re-implemented locally,
 since this is a standalone package). Token-budgeted: long-term identity always included; short-term
-and backlog filled recency-first up to a budget. The store is read on each `before_agent_start`, but
-reads do not mutate `lastSeenAt`, so unchanged data renders byte-stably and remains KV-cache friendly.
+and backlog filled recency-first up to a budget. The store is read on each `before_agent_start`. Reads do not mutate `lastSeenAt`. Expired STM/backlog
+rows are deleted when something actually expired (the prompt would change anyway); otherwise the
+injected block stays byte-stable and KV-cache friendly.
 Compaction survival is automatic — `before_agent_start`
 re-fires after Pi compaction, re-injecting from disk.
 
@@ -200,10 +204,13 @@ observational-memory). All additions stay stdlib-only, cross-OS, and determinist
   scanned only on write, so a pre-rule / supply-chain / out-of-band entry could inject un-rescanned.
 - **`.bak` recovery** — `atomicWriteFile` keeps a last-known-good sidecar; `JsonStore.load` rolls back
   to it on a torn live file before quarantining. Corruption is now recoverable, not just loud.
-- **Missed-wake delivery** — a backlog item that came due while offline is delivered on
-  `session_start` (wiring the previously-dead `dueBacklog()`), not silently dropped. Delivery is
-  bounded to 20 reminders with 200 characters per item, and future timers are re-checked in chunks
-  below Node's timer ceiling.
+- **Missed-wake delivery** — a backlog item that came due while offline is surfaced on
+  `session_start` (wiring the previously-dead `dueBacklog()`), not silently dropped. Delivery is a
+  **collapsed, display-only transcript card** (`appendEntry`) plus a short toast — never
+  `sendUserMessage` / `triggerTurn`. The same contract applies to a live timer fire during an open
+  session. Bounded to 20 reminders with 200 characters per item, and future timers are re-checked in
+  chunks below Node's timer ceiling. Open/due items remain in the injected `<persona-mind>` block for
+  the next user-authored turn.
 - **Truncation footer** — injection and `recall` now report what was withheld for budget
   (`… +N long-term not shown`), instead of truncating silently.
 - **Fail-open injection** — `before_agent_start` races `buildInjection` against a 750 ms deadline;
@@ -316,8 +323,9 @@ pi-persona ≥ 1.5.2.
 
 ### Remaining bounded limitations
 
-- **Blocked-leg nudge coverage.** The backlog nudge fires on attributed direct `delegate`/`council`
-  results and pi-persona's async completion custom messages. A blocked marker embedded only in an
+- **Blocked-leg nudge coverage.** The backlog nudge fires on attributed `delegate`/`council`
+  results and pi-persona async completion custom messages (including the `[pi-persona]`-stripped
+  follow-up prompt). Timer/ask custom noise is ignored. A blocked marker embedded only in an
   unrelated aggregate/tool surface is intentionally not guessed as delegation provenance.
 - **No semantic transcript miner.** Facts without an explicit persistence request depend on the
   standing tool guideline. This is intentional: archiving arbitrary assistant/user prose would turn
@@ -359,3 +367,29 @@ Detection now keys on a distinctive LEADING sentinel (`EMPTY_HINT_PREFIX`, `inje
 block always starts with `<persona-mind …` and a memory's text lives inside the fence, so the two
 can never collide. Separately, `ageLabel` returns `?` for an unparseable `recordedAt` instead of
 rendering `NaN…` into the block.
+
+## v0.6.1 — usable next to pi-persona 1.12.1
+
+A usability pass against the live companion (wake auto-start, opaque `backlog take`, home-cwd dump).
+No new topology.
+
+- **Wakes are display-only and one-shot.** `appendEntry` + toast, never `sendUserMessage`. After
+  delivery, `acknowledgeDue` clears `dueAt` so the same lead does not re-nag on the next session.
+  Copy is informational ("review when ready"), not an order to `take`.
+- **`take` is idempotent.** A second take on an already-taken item succeeds; a closed item names
+  its current state instead of "cannot transition to taken". Re-`add` of the same text will not
+  clobber `taken`/`done`/`dropped`.
+- **Home is not a project.** `findProjectRoot` never treats the homedir as a git root. Opening Pi
+  from `~` injects long-term identity only (no STM/backlog dump, no wakes). `/mind doctor` says so.
+- **Injection matches `backlog list`.** The persona view, with `(open|taken)` on each line. Default
+  entry budget is 8/5/6 (ltm/stm/backlog).
+- **Capture:** `Note that` / `nota che` are nudge-only; `Always remember that` is a strong persist
+  request. Deferred `pi-persona-deferred-input` keeps the "already captured" hint. Blocked-leg
+  nudges require an async-completion shape (including the `[pi-persona]`-stripped prompt).
+- **Latch reset** on `session_start`/`session_shutdown` so a reused Pi process does not inherit the
+  previous session's `/persona` switch.
+- **Store:** missing live + good `.bak` restores live instead of presenting a silent empty mind.
+- **Cards:** collapsed tool/wake chrome sanitizes OSC/ANSI and clips by terminal columns (pi-tui).
+- **STM and backlog auto-delete.** Only LTM is durable. Expired STM/backlog rows are removed from
+  the JSON files on `session_start` (after any due wake) and on each injection. Legacy backlog
+  without `expiresAt` expires at `createdAt + 48h`, so old project leads do not reappear forever.

@@ -649,3 +649,18 @@ test("a recovery write does not clobber the last-known-good .bak", async () => {
 	assert.doesNotThrow(() => JSON.parse(bak), "the good .bak was not overwritten with the torn live file");
 	assert.ok((await store.load()).entries.some((e) => e.id === "c"), "the recovery write itself landed");
 });
+
+test("load recovers from .bak when the live file is missing, and restores live", async () => {
+	const p = join(dir, "missing-live.json");
+	const store = itemStore(p);
+	await store.update((es) => [...es, { id: "a", n: 1 }]);
+	await store.update((es) => [...es, { id: "b", n: 2 }]); // .bak holds [a]
+	await rm(p, { force: true });
+	const s = await store.load();
+	assert.deepEqual(
+		s.entries.map((e) => e.id),
+		["a"],
+		"a deleted live file must not present as an empty mind while a good backup exists",
+	);
+	assert.ok(existsSync(p), "live is restored from the backup so the next read is not another silent empty");
+});

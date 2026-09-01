@@ -3,8 +3,9 @@
  *
  * Wires the two agent-facing tools (memory, backlog), injects the deterministic <persona-mind>
  * block into the system prompt every turn (so memory survives compaction + restart), re-arms
- * durable backlog wake timers on session start AND delivers any that came due while offline, and
- * offers a read-only `/mind` view. All heavy lifting lives in the pure core; this factory is thin.
+ * durable backlog wake timers on session start AND surfaces any that came due while offline as a
+ * collapsed, display-only transcript card (never a follow-up that starts a turn), and
+ * offers `/mind` (snapshot, doctor, workspace reset). All heavy lifting lives in the pure core; this factory is thin.
  * The only coupling to pi-persona is a best-effort read of its live CLI selector / active-persona
  * marker (see core/scope.ts); absent both, everything runs under a `_default` scope.
  */
@@ -21,12 +22,15 @@ import { captureMode, detectCaptureCues, type CaptureCue } from "./core/capture.
 import { EMPTY_HINT_PREFIX } from "./core/inject.ts";
 import { compactMemoryText } from "./core/memory.ts";
 import { inspectStoreFile, migrateCurrentScopeAliases, migrateLegacyRoot, type MigrationReport, type StoreDiagnostic } from "./core/migrate.ts";
-import { personaFromCliArgs, preferredAgentDir, rawActivePersona, resolveScope } from "./core/scope.ts";
+import { personaFromCliArgs, preferredAgentDir, rawActivePersona, resetPersonaMarkerLatch, resolveScope } from "./core/scope.ts";
 import { MindService } from "./core/service.ts";
 import { registerBacklogTool } from "./tools/backlog.ts";
 import { registerMemoryTool } from "./tools/memory.ts";
+import { renderExpandableCard } from "./ui/presentation.ts";
 
 const STATUS_KEY = "pi-persona-mind";
+/** Display-only transcript card for a due backlog wake. Never sent to the model; never starts a turn. */
+const WAKE_ENTRY_TYPE = "pi-persona-mind-wake";
 /** A stalled read must never freeze a turn: injection degrades to nothing past this deadline. */
 const INJECT_DEADLINE_MS = 750;
 const MIGRATION_AWAIT_MS = 100;
@@ -260,6 +264,27 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	};
 	const getMind = (ctx: ExtensionContext): MindService =>
 		new MindService(resolveMindScope(ctx), { onWarn: (message) => surfaceWarning(ctx, message) });
+
+	pi.registerEntryRenderer<{ content: string }>(WAKE_ENTRY_TYPE, (entry, { expanded }, theme) => {
+		const body = typeof entry.data?.content === "string" ? entry.data.content : "";
+		return renderExpandableCard("pi-persona-mind", body, expanded, theme);
+	});
+
+	/** Human-visible due reminder: toast + collapsed card. Must never sendUserMessage / triggerTurn. */
+	const deliverWake = (ctx: ExtensionContext, body: string): void => {
+		const first = body.split("\n", 1)[0] ?? body;
+		const toast = first.length > 160 ? `${first.slice(0, 159)}…` : first;
+		try {
+			ctx.ui.notify(`[pi-persona-mind] ${toast}`, "info");
+		} catch {
+			/* headless / no UI */
+		}
+		try {
+			pi.appendEntry(WAKE_ENTRY_TYPE, { content: body });
+		} catch {
+			/* host without transcript entries */
+		}
+	};
 	let rootMigration: Promise<MigrationReport> | undefined;
 	let backgroundMigration: Promise<MigrationReport> | undefined;
 	let backgroundMigrationKey: string | undefined;
@@ -416,6 +441,10 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		const generation = ++wakeGeneration;
 		clearTimers();
 		const scope = resolveMindScope(ctx);
+		if (scope.homeWorkspace) {
+			releaseWakeOwner();
+			return;
+		}
 		const nextOwnerPath = `${scope.paths.backlog}.wakeowner`;
 		ownerPath = nextOwnerPath;
 		if (!claimWakeOwner(nextOwnerPath, ownerToken)) {
@@ -440,7 +469,9 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			if (wakeGeneration === generation && ownerPath === nextOwnerPath) releaseWakeOwner();
 			return;
 		}
-		// (rank 3) Deliver items that came due while offline as ONE combined reminder, instead of dropping them.
+		// Deliver items that came due while offline as ONE combined reminder, instead of dropping them.
+		// Display-only: the mind is already injected on the next user turn; a follow-up would start the
+		// agent unprompted (it used to treat "Use backlog take" as an order to resume work).
 		const due = all.filter((item) => item.dueAtEpochMs !== undefined && item.dueAtEpochMs <= now);
 		if (deliverPastDue && due.length > 0) {
 			try {
@@ -449,7 +480,11 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 				const omitted = due.length - shown.length;
 				const more = omitted > 0 ? `\n… +${omitted} more due item(s); use \`backlog list\` to review them.` : "";
 				if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
-				pi.sendUserMessage(`[pi-persona-mind] ${due.length} backlog item(s) came due while you were away:\n${list}${more}\nUse \`backlog take <id>\` or \`backlog drop <id>\`.`, { deliverAs: "followUp" });
+				deliverWake(
+					ctx,
+					`${due.length} backlog item(s) came due while you were away:\n${list}${more}\nReview when ready — stale leads auto-remove after ~48h; keep durable facts in long-term memory.`,
+				);
+				await mind.acknowledgeDue(due.map((item) => item.id));
 			} catch {
 				/* raced shutdown */
 			}
@@ -475,7 +510,11 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 							return;
 						}
 						if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
-						pi.sendUserMessage(`[pi-persona-mind] backlog due — ${compactMemoryText(live.text, MAX_WAKE_TEXT_CHARS)} (id ${live.id}). Use \`backlog take ${live.id}\` to act on it, or \`backlog drop ${live.id}\`.`, { deliverAs: "followUp" });
+						deliverWake(
+							ctx,
+							`backlog due — ${compactMemoryText(live.text, MAX_WAKE_TEXT_CHARS)} (id ${live.id}). Review when ready.`,
+						);
+						await mind.acknowledgeDue([live.id]);
 					} catch (err) {
 						if (sessionActive && wakeGeneration === generation && ownerPath === nextOwnerPath) surfaceWarning(ctx, `could not re-check due backlog item ${item.id}: ${err instanceof Error ? err.message : String(err)}`);
 					}
@@ -535,7 +574,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			/* cosmetic */
 		}
 	};
-	const isDelegatedReport = (prompt: string): boolean => /^\[pi-persona\]\s+\d+\s+async runs? settled\b/i.test(prompt);
+	const isDelegatedReport = (prompt: string): boolean => /^(?:\[pi-persona\]\s+)?\d+\s+async runs? settled\b/i.test(prompt.trim());
 
 	interface CaptureNotice {
 		hint: string;
@@ -657,19 +696,25 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	pi.on("message_start", async (event, ctx) => {
 		const message = event.message;
 		if (message.role !== "custom") return;
-		pendingInputProvenance = { source: "extension" };
-		pendingCaptureNotice = undefined;
 		const text = customMessageText(message.content);
 		if (!text) return;
 		if (message.customType === "pi-persona") {
-			const blocked = nudgeEnabled ? detectBlockedLeg(text) : undefined;
+			pendingInputProvenance = { source: "extension" };
+			pendingCaptureNotice = undefined;
+			const blocked = nudgeEnabled && isDelegatedReport(text) ? detectBlockedLeg(text) : undefined;
 			if (blocked) nudgeBlocked(ctx, blocked.snippet);
 			return;
 		}
-		if (message.customType !== "pi-persona-deferred-input" || isDelegatedLeg || capturePolicy === "off") return;
-		latestDirectInputPrompt = text;
-		rememberDirectInputPrompt(text);
-		await captureDirectCues(text, ctx);
+		if (message.customType === "pi-persona-deferred-input") {
+			if (isDelegatedLeg || capturePolicy === "off") return;
+			pendingInputProvenance = { source: "interactive" };
+			latestDirectInputPrompt = text;
+			rememberDirectInputPrompt(text);
+			pendingCaptureNotice = await captureDirectCues(text, ctx);
+			return;
+		}
+		pendingInputProvenance = { source: "extension" };
+		pendingCaptureNotice = undefined;
 	});
 
 	// Inject the mind into every turn. before_agent_start re-fires after compaction, so this is also
@@ -762,6 +807,8 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		// A reused Pi process must not inherit the previous session's persona-switch latch.
+		resetPersonaMarkerLatch();
 		// A worker never arms/fires the supervisor's backlog wakes (nor shows a status line).
 		if (isDelegatedLeg) return;
 		sessionActive = true;
@@ -771,6 +818,11 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			await reconcileScope(ctx);
 			await armWakes(ctx);
 			lastArmedMigrationGeneration = migrationGeneration;
+			try {
+				await getMind(ctx).sweepExpired();
+			} catch {
+				/* expired STM/backlog must not block session start */
+			}
 			await refreshStatus(ctx);
 		} finally {
 			sessionStarting = false;
@@ -780,16 +832,22 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 
 	pi.on("session_shutdown", () => {
 		sessionActive = false;
+		resetPersonaMarkerLatch();
 		wakeGeneration++;
 		clearTimers();
 		releaseWakeOwner();
 	});
 
-	// Read-only human view of what is currently in the mind (and injected each turn).
+	// Human view of what is currently in the mind (and injected each turn), plus workspace reset.
 	pi.registerCommand("mind", {
-		description: "Show this persona's mind, or run /mind doctor for storage and capture diagnostics",
+		description: "Show this persona's mind. /mind doctor for diagnostics. /mind reset clears this project's working memory and backlog.",
 		handler: async (args, ctx) => {
 			const command = args.trim().toLowerCase();
+			const [verb, qualifier] = command.split(/\s+/);
+			if (command && verb !== "doctor" && verb !== "reset" && command !== "migrate-persona") {
+				ctx.ui.notify("usage: /mind | /mind doctor | /mind reset | /mind migrate-persona", "warning");
+				return;
+			}
 			if (command === "migrate-persona") {
 				const rawPersona = rawMindPersona();
 				await ensureLegacyMigrated(ctx, true, true);
@@ -819,7 +877,8 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 				const lines = [
 					"pi-persona-mind doctor",
 					`persona: ${scope.persona}`,
-					`project root: ${scope.projectRoot}`,
+					`cwd: ${ctx.cwd}`,
+					`project root: ${scope.projectRoot}${scope.homeWorkspace ? " (home — STM/backlog not injected, wakes off)" : ""}`,
 					`project slug: ${scope.slug}`,
 					`capture: ${capturePolicy} (PI_PERSONA_MIND_CAPTURE)`,
 					pathLine(diagnostics[0]!),
@@ -833,6 +892,34 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 				warningStatusActive = false;
 				setStatus(ctx, allWarnings.length === 0 ? "mind doctor · healthy" : `mind doctor · ${allWarnings.length} warning(s) acknowledged`, allWarnings.length === 0 ? "dim" : "warning");
 				ctx.ui.notify(lines.join("\n"), allWarnings.length === 0 ? "info" : "warning");
+				return;
+			}
+			if (verb === "reset") {
+				if (isDelegatedLeg) {
+					ctx.ui.notify("a delegated worker cannot reset the supervisor's workspace mind", "warning");
+					return;
+				}
+				if (qualifier && qualifier !== "workspace") {
+					ctx.ui.notify(
+						"/mind reset clears THIS PROJECT's short-term memory and backlog only. Long-term persona identity is not workspace-scoped — forget individual facts with `memory forget <id>`.",
+						"warning",
+					);
+					return;
+				}
+				const mind = getMind(ctx);
+				const result = await mind.resetWorkspace();
+				if (!result.ok) {
+					ctx.ui.notify(`mind reset failed: ${result.reason}`, "error");
+					return;
+				}
+				if (sessionActive) {
+					await armWakes(ctx, false);
+					await refreshStatus(ctx);
+				}
+				ctx.ui.notify(
+					`Cleared this workspace (${scope.projectRoot}): ${result.stmRemoved} short-term · ${result.backlogRemoved} backlog. Long-term identity (${result.ltmKept}) left intact.`,
+					"info",
+				);
 				return;
 			}
 			const mind = getMind(ctx);

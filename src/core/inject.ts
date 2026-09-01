@@ -39,7 +39,7 @@ export const EMPTY_HINT_PREFIX = "⟢ pi-persona-mind (";
 function emptyMindHint(persona: string): string {
 	return (
 		`${EMPTY_HINT_PREFIX}${persona}) — this mind is empty. \`memory\` keeps durable preferences/lessons ` +
-		"and decaying project notes; `backlog` holds leads to revisit — both survive compaction and restart. " +
+		"and project notes that auto-delete after ~48h; `backlog` holds leads that likewise expire. " +
 		"Reach for them when something is genuinely worth carrying to the next session; otherwise ignore this line."
 	);
 }
@@ -55,7 +55,7 @@ export interface MindBudget {
 	backlog: number;
 }
 
-const DEFAULT_BUDGET: MindBudget = { ltm: 12, stm: 10, backlog: 12 };
+const DEFAULT_BUDGET: MindBudget = { ltm: 8, stm: 5, backlog: 6 };
 
 export interface RenderMindInput {
 	persona: string;
@@ -123,14 +123,14 @@ export function renderMind(input: RenderMindInput): string {
 			const flag = nearExpiry(e, input.now, NEAR_EXPIRY_MS) ? "⚠️ verify — " : "";
 			return `- ${flag}${safeText(e.text)} (${ageLabel(e.recordedAt, input.now)})`;
 		});
-		sections.push(`## Working context (project · decays)\n${lines.join("\n")}`);
+		sections.push(`## Working context (project · ~48h)\n${lines.join("\n")}`);
 	}
 	if (input.stm.length > stm.length) hidden.push(`+${input.stm.length - stm.length} working`);
 
 	const backlogBudget = Number.isFinite(budget.backlog) ? Math.max(0, Math.floor(budget.backlog)) : 0;
 	const backlog = input.backlog.slice(0, backlogBudget);
 	if (backlog.length > 0) {
-		const lines = backlog.map((e) => `- [${e.id}] ${safeText(e.text)}`);
+		const lines = backlog.map((e) => `- [${e.id}] (${e.state}) ${safeText(e.text)}`);
 		sections.push(`## Backlog (open)\n${lines.join("\n")}`);
 	}
 	if (input.backlog.length > backlog.length) hidden.push(`+${input.backlog.length - backlog.length} backlog`);

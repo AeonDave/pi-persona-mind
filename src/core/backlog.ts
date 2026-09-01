@@ -2,14 +2,17 @@
  * The backlog faculty — pure domain logic, no I/O.
  *
  * A backlog entry is a DEFERRED INTENT: a lead or task the supervisor means to act on but has not
- * yet. Unlike short-term memory it does NOT decay — an intent is completed (`done`) or abandoned
- * (`dropped`), never silently lost to a timeout or a persona switch (which would drop a real lead).
- * Contents are project-scoped; the `persona` field is who created it, used only for the view filter.
+ * yet. It is project-scoped and time-bounded like short-term memory (default 48h, then deleted from
+ * the store). The lifecycle (`open`/`taken`/`done`/`dropped`) and optional wake are why it is not
+ * just another STM note; durable identity still belongs in long-term memory. The `persona` field is
+ * who created it, used only for the view filter.
  */
 
 import { contentId } from "./ids.ts";
 
 export const BACKLOG_STATES = ["open", "taken", "done", "dropped"] as const;
+/** Same default life as short-term memory — working intent goes stale just as working notes do. */
+export const DEFAULT_BACKLOG_TTL_HOURS = 48;
 export type BacklogState = (typeof BACKLOG_STATES)[number];
 export const DEFAULT_BACKLOG_MAX = 20;
 export const MAX_BACKLOG_MAX = 50;
@@ -41,6 +44,8 @@ export interface BacklogEntry {
 	createdAt: string;
 	/** Optional wake time — a lightweight in-extension alarm re-armed on session start. */
 	dueAtEpochMs?: number;
+	/** When this lead is deleted from the store. Absent on legacy rows ⇒ createdAt + 48h. */
+	expiresAt?: string;
 	/** A note attached on done/drop (why). */
 	note?: string;
 }
@@ -51,6 +56,8 @@ export interface BacklogInput {
 	persona?: string;
 	/** Arm a wake `dueInSeconds` from now. */
 	dueInSeconds?: number;
+	/** Hours until auto-delete (default 48). A later due time extends life so the wake can still fire. */
+	ttlHours?: number;
 }
 
 function iso(now: number): string {
@@ -73,8 +80,29 @@ export function makeBacklog(input: BacklogInput, now: number): BacklogEntry {
 		createdAt: iso(now),
 	};
 	if (input.persona) entry.persona = input.persona;
-	if (input.dueInSeconds !== undefined) entry.dueAtEpochMs = now + Math.round(input.dueInSeconds * 1000);
+	const ttlHours = input.ttlHours ?? DEFAULT_BACKLOG_TTL_HOURS;
+	let expiresAtMs = now + ttlHours * 3_600_000;
+	if (input.dueInSeconds !== undefined) {
+		const dueAtMs = now + Math.round(input.dueInSeconds * 1000);
+		entry.dueAtEpochMs = dueAtMs;
+		if (dueAtMs > expiresAtMs) expiresAtMs = dueAtMs;
+	}
+	entry.expiresAt = iso(expiresAtMs);
 	return entry;
+}
+
+/** True once a backlog item has passed its expiry (legacy rows without expiresAt use createdAt + 48h). */
+export function isExpired(entry: BacklogEntry, now: number): boolean {
+	const expiryMs =
+		entry.expiresAt !== undefined
+			? Date.parse(entry.expiresAt)
+			: Date.parse(entry.createdAt) + DEFAULT_BACKLOG_TTL_HOURS * 3_600_000;
+	return Number.isFinite(expiryMs) && now >= expiryMs;
+}
+
+/** Drop expired backlog items (any state) so stale leads do not linger on disk. */
+export function pruneExpired(entries: readonly BacklogEntry[], now: number): BacklogEntry[] {
+	return entries.filter((e) => !isExpired(e, now));
 }
 
 export interface TransitionResult {
@@ -84,6 +112,7 @@ export interface TransitionResult {
 }
 
 function legalTransition(from: BacklogState, to: BacklogState): boolean {
+	if (from === "taken" && to === "taken") return true; // take is idempotent — the user/model already claimed it
 	if (from === "open") return to === "taken" || to === "done" || to === "dropped";
 	if (from === "taken") return to === "done" || to === "dropped";
 	return false;
@@ -94,6 +123,7 @@ export function transition(entries: readonly BacklogEntry[], id: string, state: 
 	const found = entries.find((e) => e.id === id);
 	if (!found) return { ok: false, entries: [...entries], reason: "not_found" };
 	if (!legalTransition(found.state, state)) return { ok: false, entries: [...entries], reason: "invalid_transition" };
+	if (found.state === state) return { ok: true, entries: [...entries] };
 	const next = entries.map((e) => {
 		if (e.id !== id) return e;
 		const updated: BacklogEntry = { ...e, state };
@@ -189,6 +219,10 @@ export function validateBacklog(raw: unknown): BacklogEntry | null {
 	if (o.note !== undefined) {
 		if (typeof o.note !== "string" || o.note.length > MAX_BACKLOG_NOTE_CHARS) return null;
 		entry.note = o.note;
+	}
+	if (o.expiresAt !== undefined) {
+		if (typeof o.expiresAt !== "string" || !Number.isFinite(Date.parse(o.expiresAt))) return null;
+		entry.expiresAt = o.expiresAt;
 	}
 	return entry;
 }

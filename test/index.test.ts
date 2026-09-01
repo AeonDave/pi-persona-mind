@@ -20,10 +20,19 @@ interface ToolLike {
 	promptSnippet?: string;
 	promptGuidelines?: string[];
 	execute: (id: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) => Promise<{ content: { type: string; text: string }[]; details: Record<string, unknown> }>;
+	renderResult?: (
+		result: { content: { type: string; text: string }[]; details: Record<string, unknown> },
+		opts: { expanded: boolean },
+		theme: { fg: (name: "accent" | "toolOutput" | "dim", text: string) => string; bold: (text: string) => string },
+	) => { render: (width: number) => string[] };
 }
 type Handler = (event: unknown, ctx: unknown) => unknown;
 interface CommandLike {
 	handler: (args: string, ctx: unknown) => unknown;
+}
+interface WakeEntry {
+	type: string;
+	data: { content?: string };
 }
 
 function mockPi(flags: Readonly<Record<string, boolean | string | undefined>> = {}) {
@@ -33,11 +42,13 @@ function mockPi(flags: Readonly<Record<string, boolean | string | undefined>> = 
 	const registeredFlags = new Set<string>();
 	const messages: string[] = [];
 	const messageOptions: Array<{ deliverAs?: "steer" | "followUp" }> = [];
+	const entries: WakeEntry[] = [];
 	const pi = {
 		registerTool: (t: ToolLike) => tools.set(t.name, t),
 		registerCommand: (name: string, def: CommandLike) => commands.set(name, def),
 		registerShortcut: () => {},
 		registerFlag: (name: string) => registeredFlags.add(name),
+		registerEntryRenderer: () => {},
 		on: (event: string, handler: Handler) => handlers.set(event, handler),
 		// Pi scopes getFlag() to flags registered by this extension, even though values are runtime-wide.
 		getFlag: (name: string) => (registeredFlags.has(name) ? flags[name] : undefined),
@@ -45,8 +56,15 @@ function mockPi(flags: Readonly<Record<string, boolean | string | undefined>> = 
 			messages.push(text);
 			messageOptions.push(options ?? {});
 		},
+		appendEntry: (type: string, data: { content?: string }) => {
+			entries.push({ type, data });
+		},
 	};
-	return { pi: pi as never, tools, commands, handlers, messages, messageOptions };
+	return { pi: pi as never, tools, commands, handlers, messages, messageOptions, entries };
+}
+
+function wakeTexts(m: { entries: WakeEntry[] }): string[] {
+	return m.entries.filter((entry) => entry.type === "pi-persona-mind-wake").map((entry) => entry.data.content ?? "");
 }
 
 function ctxFor(cwd: string) {
@@ -317,6 +335,73 @@ test("/mind doctor reports corrupt and invalid stores without mutating them", as
 	assert.equal(await readFile(invalidPath, "utf8"), invalidRaw, "doctor did not rewrite invalid entries");
 });
 
+test("/mind reset clears this project's STM and backlog without touching long-term identity", async () => {
+	const m = mockPi();
+	const notices: string[] = [];
+	createExtension(m.pi, { agentDir: join(dir, "reset-cmd", "agent") });
+	const ctx = {
+		...ctxFor(join(dir, "reset-cmd", "proj")),
+		ui: { setStatus: () => {}, notify: (message: string) => notices.push(message), theme: { fg: (_c: string, s: string) => s } },
+	};
+	const memory = m.tools.get("memory");
+	const backlog = m.tools.get("backlog");
+	assert.ok(memory && backlog);
+	await memory.execute("t1", { action: "remember", term: "long", kind: "preference", text: "prefers verbose recon" }, undefined, undefined, ctx);
+	await memory.execute("t2", { action: "remember", term: "short", kind: "note", text: "vpn is down in this project" }, undefined, undefined, ctx);
+	await backlog.execute("t3", { action: "add", text: "revisit the SMB share" }, undefined, undefined, ctx);
+
+	await m.commands.get("mind")?.handler("reset", ctx);
+	assert.ok(notices.some((n) => /Cleared this workspace/i.test(n) && /1 short-term/.test(n) && /1 backlog/.test(n)));
+	assert.ok(notices.some((n) => /Long-term identity \(1\) left intact/.test(n)));
+
+	const short = await memory.execute("r1", { action: "recall", scope: "short" }, undefined, undefined, ctx);
+	assert.equal(short.details.count, 0);
+	const long = await memory.execute("r2", { action: "recall", scope: "long" }, undefined, undefined, ctx);
+	assert.match(long.content[0]?.text ?? "", /verbose recon/);
+	const listed = await backlog.execute("l1", { action: "list" }, undefined, undefined, ctx);
+	assert.match(listed.content[0]?.text ?? "", /empty/i);
+});
+
+test("/mind reset workspace is the same as /mind reset", async () => {
+	const m = mockPi();
+	const notices: string[] = [];
+	createExtension(m.pi, { agentDir: join(dir, "reset-alias", "agent") });
+	const ctx = {
+		...ctxFor(join(dir, "reset-alias", "proj")),
+		ui: { setStatus: () => {}, notify: (message: string) => notices.push(message), theme: { fg: (_c: string, s: string) => s } },
+	};
+	await m.commands.get("mind")?.handler("reset workspace", ctx);
+	assert.ok(notices.some((n) => /Cleared this workspace/i.test(n)));
+});
+
+test("/mind reset all refuses to wipe long-term identity", async () => {
+	const m = mockPi();
+	const notices: string[] = [];
+	createExtension(m.pi, { agentDir: join(dir, "reset-all", "agent") });
+	const ctx = {
+		...ctxFor(join(dir, "reset-all", "proj")),
+		ui: { setStatus: () => {}, notify: (message: string) => notices.push(message), theme: { fg: (_c: string, s: string) => s } },
+	};
+	await m.tools.get("memory")?.execute("t1", { action: "remember", term: "long", kind: "preference", text: "keep me" }, undefined, undefined, ctx);
+	await m.commands.get("mind")?.handler("reset all", ctx);
+	assert.ok(notices.some((n) => /Long-term persona identity is not workspace-scoped/i.test(n)));
+	const long = await m.tools.get("memory")?.execute("r", { action: "recall", scope: "long" }, undefined, undefined, ctx);
+	assert.match(long?.content[0]?.text ?? "", /keep me/);
+});
+
+test("/mind unknown subcommand prints usage instead of dumping the mind", async () => {
+	const m = mockPi();
+	const notices: string[] = [];
+	createExtension(m.pi, { agentDir: join(dir, "reset-usage", "agent") });
+	const ctx = {
+		...ctxFor(join(dir, "reset-usage", "proj")),
+		ui: { setStatus: () => {}, notify: (message: string) => notices.push(message), theme: { fg: (_c: string, s: string) => s } },
+	};
+	await m.commands.get("mind")?.handler("wipe", ctx);
+	assert.ok(notices.some((n) => /usage: \/mind/i.test(n)));
+	assert.ok(notices.every((n) => !/<persona-mind/.test(n)));
+});
+
 test("a migration warning remains visible after normal status refresh", async () => {
 	const m = mockPi();
 	const agentDir = join(dir, "warning-status", "agent");
@@ -377,6 +462,8 @@ test("a pi-persona deferred user input is captured even when its handled input s
 	);
 	const recalled = await m.tools.get("memory")?.execute("r-deferred", { action: "recall", query: "quarzo-19" }, undefined, undefined, ctx);
 	assert.equal(recalled?.details.count, 1, "the replay remains durable even though Mind never saw the original input event");
+	const result = (await m.handlers.get("before_agent_start")?.({ systemPrompt: "BASE", prompt: "Ricorda che il codice di handoff differito è quarzo-19." }, ctx)) as { systemPrompt?: string } | undefined;
+	assert.match(result?.systemPrompt ?? "", /already captured/i, "a deferred user replay still gets the capture acknowledgement");
 });
 
 test("a direct capture notice survives prompt-template expansion", async () => {
@@ -502,10 +589,16 @@ test("a backlog item due while offline is delivered on session_start", async () 
 	assert.ok(start);
 	await start({}, ctx);
 	assert.ok(
-		m.messages.some((t) => /came due while you were away/.test(t) && /re-check the share/.test(t)),
+		wakeTexts(m).some((t) => /came due while you were away/.test(t) && /re-check the share/.test(t)),
 		"the missed wake was delivered, not dropped",
 	);
-	assert.equal(m.messageOptions.find((options) => options.deliverAs !== undefined)?.deliverAs, "followUp");
+	assert.equal(m.messages.length, 0, "a missed wake must not send a user message (that would start a turn)");
+	assert.equal(m.messageOptions.length, 0, "a missed wake is display-only, never a follow-up");
+	assert.doesNotMatch(wakeTexts(m).join("\n"), /Use `backlog take/, "a wake must not order the model to take the item");
+	m.handlers.get("session_shutdown")?.({}, ctx);
+	m.entries.length = 0;
+	await start({}, ctx);
+	assert.equal(wakeTexts(m).length, 0, "acknowledged due items do not re-nag on the next session_start");
 });
 
 test("missed wake delivery is compact and capped even when many large items are due", async () => {
@@ -523,10 +616,11 @@ test("missed wake delivery is compact and capped even when many large items are 
 	createExtension(m.pi, { agentDir });
 	await m.handlers.get("session_start")?.({}, ctxFor(cwd));
 
-	const reminder = m.messages.find((message) => /came due while you were away/.test(message)) ?? "";
+	const reminder = wakeTexts(m).find((message) => /came due while you were away/.test(message)) ?? "";
 	assert.ok(reminder.length > 0, "one reminder is delivered");
 	assert.ok(reminder.length < 6_000, `wake reminder was ${reminder.length} characters`);
 	assert.match(reminder, /\+5 more/i);
+	assert.equal(m.messages.length, 0, "the capped reminder is still display-only");
 	m.handlers.get("session_shutdown")?.({}, ctxFor(cwd));
 });
 
@@ -543,8 +637,9 @@ test("only the elected owner session delivers a missed wake (no double-fire)", a
 	const ctxB = ctxFor(cwd);
 	await a.handlers.get("session_start")?.({}, ctxA);
 	await b.handlers.get("session_start")?.({}, ctxB);
-	const delivered = a.messages.filter((t) => /came due/.test(t)).length + b.messages.filter((t) => /came due/.test(t)).length;
+	const delivered = wakeTexts(a).filter((t) => /came due/.test(t)).length + wakeTexts(b).filter((t) => /came due/.test(t)).length;
 	assert.equal(delivered, 1, "exactly one session delivered the missed wake");
+	assert.equal(a.messages.length + b.messages.length, 0, "neither session starts a turn to deliver the wake");
 });
 
 test("far-future wakes are chunked instead of overflowing Node timers", async () => {
@@ -560,7 +655,7 @@ test("far-future wakes are chunked instead of overflowing Node timers", async ()
 	createExtension(m.pi, { agentDir, wakeTimerMaxDelayMs: 10 });
 	await m.handlers.get("session_start")?.({}, ctx);
 	await new Promise((resolve) => setTimeout(resolve, 50));
-	assert.equal(m.messages.filter((message) => /far future wake/.test(message)).length, 0, "a far-future item is not fired by timer overflow");
+	assert.equal(wakeTexts(m).filter((message) => /far future wake/.test(message)).length, 0, "a far-future item is not fired by timer overflow");
 	m.handlers.get("session_shutdown")?.({}, ctx);
 });
 
@@ -586,6 +681,7 @@ test("shutdown during an async wake-state read cannot create a ghost wake", asyn
 	releaseRead([due]);
 	await startup;
 	assert.equal(m.messages.length, 0, "shutdown invalidates the in-flight read before it can send or schedule");
+	assert.equal(m.entries.length, 0, "shutdown also withholds the display-only wake card");
 });
 
 test("a failed wake-state read releases the wake owner for a later session", async () => {
@@ -703,7 +799,7 @@ test("a delegated worker leg (PI_PERSONA_CHILD) withholds tools + wakes and inje
 
 	// A worker never arms/fires the supervisor's backlog wakes.
 	await leg.handlers.get("session_start")?.({}, ctxFor(cwd));
-	assert.equal(leg.messages.filter((t) => /came due/.test(t)).length, 0, "a leg fires no backlog wakes");
+	assert.equal(wakeTexts(leg).length, 0, "a leg fires no backlog wakes");
 });
 
 test("PI_PERSONA_LEG marks a delegated leg — the mind withholds its write tools", () => {
@@ -759,13 +855,24 @@ test("a blocked delegated leg surfaces a backlog nudge on both delivery paths", 
 	status.length = 0;
 	const onMessage = m.handlers.get("message_start");
 	assert.ok(onMessage);
+	const before = m.handlers.get("before_agent_start");
+	assert.ok(before);
 	await onMessage({ message: { role: "custom", customType: "pi-persona", content: "1 async run settled — leg reported [BLOCKED: dead end]" } }, ctx);
 	assert.ok(status.some((s) => /backlog add/.test(s)), "an async blocked report nudges a backlog capture");
 
+	// pi-persona 1.x strips the `[pi-persona]` prefix before the follow-up turn prompt.
+	status.length = 0;
+	await m.handlers.get("input")?.({ text: "2 async runs settled — [BLOCKED: stripped prefix]", source: "extension" }, ctx);
+	await before({ systemPrompt: "BASE", prompt: "2 async runs settled — [BLOCKED: stripped prefix]" }, ctx);
+	assert.ok(status.some((s) => /backlog add/.test(s)), "a stripped async completion prompt still nudges");
+
+	// Timer/ask custom noise with a quoted marker is not a delegated completion.
+	status.length = 0;
+	await onMessage({ message: { role: "custom", customType: "pi-persona", content: "timer fired — someone wrote [BLOCKED: ignore]" } }, ctx);
+	assert.equal(status.length, 0, "non-completion pi-persona custom messages do not nudge");
+
 	// A direct user's prompt is not a delegated report, even when it quotes the marker.
 	status.length = 0;
-	const before = m.handlers.get("before_agent_start");
-	assert.ok(before);
 	await m.handlers.get("input")?.({ text: "I saw [BLOCKED: dead end] in a log", source: "interactive" }, ctx);
 	await before({ systemPrompt: "BASE", prompt: "I saw [BLOCKED: dead end] in a log" }, ctx);
 	assert.equal(status.length, 0, "a direct user prompt never nudges as a delegated report");
@@ -861,7 +968,7 @@ test("an armed wake does not fire for a backlog item dropped before it comes due
 	await m.handlers.get("session_start")?.({}, ctx); // arms the ~200ms timer
 	await backlog.execute("t2", { action: "drop", id }, undefined, undefined, ctx); // close it before it fires
 	await new Promise((r) => setTimeout(r, 400)); // let the timer elapse
-	assert.ok(!m.messages.some((t) => /backlog due/.test(t) && /ping CI/.test(t)), "no stale wake fired for a dropped item");
+	assert.ok(!wakeTexts(m).some((t) => /backlog due/.test(t) && /ping CI/.test(t)), "no stale wake fired for a dropped item");
 });
 
 test("a due backlog item added during an active session is armed immediately", async () => {
@@ -876,10 +983,11 @@ test("a due backlog item added during an active session is armed immediately", a
 	const added = await backlog.execute("t1", { action: "add", text: "check the live timer", dueInSeconds: 0.03 }, undefined, undefined, ctx);
 	assert.equal(added.details.ok, true);
 	await m.handlers.get("tool_result")?.({ toolName: "backlog", details: added.details, content: added.content }, ctx);
-	await new Promise((resolve) => setTimeout(resolve, 100));
+	await new Promise((resolve) => setTimeout(resolve, 250));
 
-	assert.ok(m.messages.some((text) => /backlog due/.test(text) && /check the live timer/.test(text)), "a new wake must not wait for the next session restart");
-	assert.ok(m.messageOptions.some((options) => options.deliverAs === "followUp"), "a scheduled wake is queued as a follow-up while Pi is busy");
+	assert.ok(wakeTexts(m).some((text) => /backlog due/.test(text) && /check the live timer/.test(text)), "a new wake must not wait for the next session restart");
+	assert.equal(m.messages.length, 0, "a live wake is a collapsed card, not a follow-up that starts a turn");
+	assert.equal(m.messageOptions.length, 0, "a live wake never queues sendUserMessage");
 	m.handlers.get("session_shutdown")?.({}, ctx);
 });
 
@@ -894,8 +1002,55 @@ test("the backlog tool queues and lists an item through the Pi surface", async (
 	const list = await backlog.execute("t2", { action: "list" }, undefined, undefined, ctx);
 	assert.match(list.content[0]?.text ?? "", /revisit the SMB share/);
 	const id = add.details.id as string;
-	await backlog.execute("t3", { action: "take", id }, undefined, undefined, ctx);
+	const take = await backlog.execute("t3", { action: "take", id }, undefined, undefined, ctx);
+	assert.equal(take.details.ok, true);
+	const retake = await backlog.execute("t3b", { action: "take", id }, undefined, undefined, ctx);
+	assert.equal(retake.details.ok, true, "take on an already-taken item is a no-op success");
 	await backlog.execute("t4", { action: "done", id, note: "verified in the final test run" }, undefined, undefined, ctx);
+	const takeClosed = await backlog.execute("t4b", { action: "take", id }, undefined, undefined, ctx);
+	assert.equal(takeClosed.details.ok, false);
+	assert.match(takeClosed.content[0]?.text ?? "", /done/i);
 	const closed = await backlog.execute("t5", { action: "list", state: "done" }, undefined, undefined, ctx);
 	assert.match(closed.content[0]?.text ?? "", /note: verified in the final test run/i, "terminal rationale is readable, not write-only");
+});
+
+const plainTheme = { fg: (_name: string, text: string) => text, bold: (text: string) => text };
+
+test("memory recall stays complete for the model but collapses the human card", async () => {
+	const m = mockPi();
+	createExtension(m.pi, { agentDir: join(dir, "mem-card", "agent") });
+	const ctx = ctxFor(join(dir, "mem-card", "proj"));
+	const memory = m.tools.get("memory");
+	assert.ok(memory?.renderResult);
+	for (let i = 0; i < 8; i++) {
+		await memory.execute(`r${i}`, { action: "remember", term: "long", kind: "note", text: `durable fact ${i} ${"x".repeat(80)}` }, undefined, undefined, ctx);
+	}
+	const recalled = await memory.execute("recall", { action: "recall", max: 8 }, undefined, undefined, ctx);
+	assert.match(recalled.content[0]?.text ?? "", /recalled/);
+	assert.ok((recalled.content[0]?.text.split("\n").length ?? 0) > 4, "the model still sees every recalled line");
+	const collapsed = memory.renderResult(recalled, { expanded: false }, plainTheme).render(200).join("\n");
+	const expanded = memory.renderResult(recalled, { expanded: true }, plainTheme).render(200).join("\n");
+	assert.match(collapsed, /^memory/m);
+	assert.ok(collapsed.split("\n").length < expanded.split("\n").length, "the collapsed card is shorter than the expanded card");
+	assert.match(collapsed, /to expand|ctrl\+o/i);
+	assert.doesNotMatch(collapsed, /durable fact 0/, "older recall lines stay behind the expand key");
+	assert.match(expanded, /durable fact 0/, "expand is lossless");
+});
+
+test("backlog list collapses the human card the same way", async () => {
+	const m = mockPi();
+	createExtension(m.pi, { agentDir: join(dir, "bl-card", "agent") });
+	const ctx = ctxFor(join(dir, "bl-card", "proj"));
+	const backlog = m.tools.get("backlog");
+	assert.ok(backlog?.renderResult);
+	for (let i = 0; i < 6; i++) {
+		await backlog.execute(`a${i}`, { action: "add", text: `lead ${i} ${"y".repeat(60)}` }, undefined, undefined, ctx);
+	}
+	const listed = await backlog.execute("list", { action: "list" }, undefined, undefined, ctx);
+	const collapsed = backlog.renderResult(listed, { expanded: false }, plainTheme).render(200).join("\n");
+	const expanded = backlog.renderResult(listed, { expanded: true }, plainTheme).render(200).join("\n");
+	assert.match(collapsed, /^backlog/m);
+	assert.ok(collapsed.split("\n").length < expanded.split("\n").length);
+	assert.match(collapsed, /to expand|ctrl\+o/i);
+	assert.match(expanded, /lead 5/);
 });

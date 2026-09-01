@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 
-import { activePersona, findProjectRoot, mindPaths, parsePersonaState, personaFromCliArgs, personaStateFile, preferredAgentDir, projectSlug, rawActivePersona, resolveScope, sanitizePersona } from "../src/core/scope.ts";
+import { activePersona, findProjectRoot, mindPaths, parsePersonaState, personaFromCliArgs, personaStateFile, preferredAgentDir, projectSlug, rawActivePersona, resetPersonaMarkerLatch, resolveScope, sanitizePersona } from "../src/core/scope.ts";
 
 test("parsePersonaState reads a named lastPersona, else null (absent/invalid)", () => {
 	assert.equal(parsePersonaState(JSON.stringify({ lastPersona: "elite" })), "elite");
@@ -251,6 +251,40 @@ test("findProjectRoot walks up to a .git dir, else falls back to the start", () 
 	const deep = join(root, "src", "core");
 	assert.equal(findProjectRoot(deep, (d) => d === root), root);
 	assert.equal(findProjectRoot(deep, () => false), deep);
+});
+
+test("findProjectRoot never treats the home directory as a git project root", () => {
+	const home = join("C:", "Users", "novad");
+	const nested = join(home, "Downloads", "scratch");
+	assert.equal(
+		findProjectRoot(nested, (d) => d === home, { homedir: home }),
+		nested,
+		"a git-initialized home must not collapse every descendant into one STM/backlog",
+	);
+	assert.equal(findProjectRoot(home, (d) => d === home, { homedir: home }), home);
+});
+
+test("resolveScope marks the home directory itself as an isolated workspace", async () => {
+	const home = join(dir, "fake-home");
+	await mkdir(home, { recursive: true });
+	const scope = resolveScope(join(dir, "home-agent"), home, { homedir: home });
+	assert.equal(scope.homeWorkspace, true);
+	const proj = join(dir, "real-proj");
+	await mkdir(join(proj, ".git"), { recursive: true });
+	const real = resolveScope(join(dir, "home-agent"), proj, { homedir: home });
+	assert.equal(real.homeWorkspace, undefined);
+});
+
+test("resetPersonaMarkerLatch starts a fresh session's seed without inheriting the prior switch", async () => {
+	const agentDir = join(dir, "latch-reset-agent");
+	const statePath = join(agentDir, "persona", "state.json");
+	await mkdir(join(agentDir, "persona"), { recursive: true });
+	await writeFile(statePath, JSON.stringify({ lastPersona: "ada" }), "utf8");
+	assert.equal(activePersona(agentDir, {}, "grace"), "grace");
+	await writeFile(statePath, JSON.stringify({ lastPersona: "hopper" }), "utf8");
+	assert.equal(activePersona(agentDir, {}, "grace"), "hopper");
+	resetPersonaMarkerLatch();
+	assert.equal(activePersona(agentDir, {}, "grace"), "grace", "a new Pi session must not inherit the previous session's switch latch");
 });
 
 test("mindPaths lays out the four stores under <agentDir>/pi-persona-mind", () => {

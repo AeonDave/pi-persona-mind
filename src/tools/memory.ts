@@ -10,6 +10,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
+import { renderExpandableCard, toolResultText } from "../ui/presentation.ts";
+
 import {
 	clampRecallMax,
 	compactMemoryText,
@@ -33,7 +35,7 @@ const MemoryParams = Type.Object({
 	term: Type.Optional(
 		Type.Union([Type.Literal("long"), Type.Literal("short")], {
 			description:
-				"remember: long = durable identity for this persona (preferences/conventions/lessons); short = a project note that decays (defaults expiry 48h). Required for remember.",
+				"remember: long = durable identity for this persona (preferences/conventions/lessons); short = a project note that auto-deletes after ~48h. Required for remember.",
 		}),
 	),
 	kind: Type.Optional(
@@ -50,7 +52,7 @@ const MemoryParams = Type.Object({
 		}),
 	),
 	tags: Type.Optional(Type.Array(Type.String({ maxLength: MAX_MEMORY_TAG_CHARS }), { maxItems: MAX_MEMORY_TAGS, description: "optional tags to aid later recall" })),
-	ttlHours: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "remember(short): hours until it decays out of context (default 48)" })),
+	ttlHours: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "remember(short): hours until it is deleted from the store (default 48)" })),
 	supersedes: Type.Optional(Type.String({ maxLength: MAX_MEMORY_ID_CHARS, description: "remember: id of an existing entry this one replaces" })),
 	shared: Type.Optional(
 		Type.Boolean({ description: "remember(long): store in the cross-persona shared tier — facts true for EVERY persona (e.g. the user's OS)" }),
@@ -90,7 +92,7 @@ export function registerMemoryTool(pi: ExtensionAPI, getMind: GetMind): void {
 		description: [
 			"Your durable, persona-scoped memory. `remember` a fact so it survives context compaction and",
 			"restarts — long-term for who this persona is to the user (preferences/conventions/lessons),",
-			"short-term for project notes that go stale (they decay). `recall` to search; `forget` by id.",
+			"short-term for project notes that auto-delete after ~48h. `recall` to search; `forget` by id.",
 			"Facts are re-injected into your context automatically each turn, so remember what you would",
 			"want to know next session. Keep entries DECLARATIVE, never store secrets.",
 		].join(" "),
@@ -106,6 +108,9 @@ export function registerMemoryTool(pi: ExtensionAPI, getMind: GetMind): void {
 				const message = err instanceof Error ? err.message : String(err);
 				return say(`Memory is unavailable: ${message || "unknown persistence failure"}`, { ok: false, reason: "storage_error" });
 			}
+		},
+		renderResult(result, { expanded }, theme) {
+			return renderExpandableCard("memory", toolResultText(result), expanded, theme);
 		},
 	});
 }
@@ -146,7 +151,7 @@ async function runMemoryAction(mind: MindService, params: MemoryToolParams): Pro
 		]
 			.filter(Boolean)
 			.join("\n");
-		const lines = hits.map((e) => `- [${e.id}] (${e.kind}) ${compactMemoryText(e.text)}`);
+		const lines = hits.map((e) => `- [${e.id}] (${e.kind}) ${compactMemoryText(e.text, 80)}`);
 		return say(`${hits.length} recalled${withheld > 0 ? ` of ${total}` : ""}:\n${lines.join("\n")}${more ? `\n${more}` : ""}`, {
 			count: hits.length,
 			total,
