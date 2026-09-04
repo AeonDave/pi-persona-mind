@@ -1,5 +1,5 @@
 /**
- * One-way importer for the pre-pi-persona-mind storage root.
+ * One-way importer for the superseded `pi-`prefixed storage root.
  *
  * The old root is only read.  Destination writes go through JsonStore so two Pi
  * processes importing at the same time cannot lose entries. Exact id/content
@@ -59,9 +59,9 @@ export interface MigrationReport {
 }
 
 export interface LegacyMigrationOptions {
-	/** Override the old root; defaults to `<agentDir>/persona-mind`. */
+	/** Override the old root; defaults to `<agentDir>/pi-persona-mind`. */
 	legacyRoot?: string;
-	/** Override the current root; defaults to `<agentDir>/pi-persona-mind`. */
+	/** Override the current root; defaults to `<agentDir>/persona-mind`. */
 	destinationRoot?: string;
 	/** Injectable clock forwarded to JsonStore. */
 	now?: () => number;
@@ -73,9 +73,9 @@ export interface LegacyMigrationOptions {
 
 /** Options for the bounded migration of aliases created by the v0.5.2 scope rules. */
 export interface ScopeAliasMigrationOptions {
-	/** Override the old root; defaults to `<agentDir>/persona-mind`. */
+	/** Override the old root; defaults to `<agentDir>/pi-persona-mind`. */
 	legacyRoot?: string;
-	/** Override the current root; defaults to `<agentDir>/pi-persona-mind`. */
+	/** Override the current root; defaults to `<agentDir>/persona-mind`. */
 	currentRoot?: string;
 	/** Injectable project canonicalization seam, forwarded to {@link projectSlug}. */
 	project?: ProjectSlugOptions;
@@ -487,8 +487,8 @@ export async function migrateCurrentScopeAliases(
 	const oldPersona = oldPersonaSegment(rawPersona ?? DEFAULT_PERSONA, platform);
 	const oldProject = oldProjectSlug(projectRoot, options.project?.platform);
 	const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
-	const legacyRoot = options.legacyRoot ?? join(agentDir, "persona-mind");
-	const currentRoot = options.currentRoot ?? join(agentDir, "pi-persona-mind");
+	const legacyRoot = options.legacyRoot ?? join(agentDir, "pi-persona-mind");
+	const currentRoot = options.currentRoot ?? join(agentDir, "persona-mind");
 	const currentBase = currentRoot;
 	const roots = [currentRoot, legacyRoot];
 	const aliases: readonly { kind: ImportKind; oldRelative: string; newRelative: string }[] = [
@@ -518,14 +518,14 @@ export async function migrateCurrentScopeAliases(
 }
 
 /**
- * Import supported files from `<agentDir>/persona-mind` into the current
- * `<agentDir>/pi-persona-mind` root. It is safe to call repeatedly and from
+ * Import supported files from `<agentDir>/pi-persona-mind` into the current
+ * `<agentDir>/persona-mind` root. It is safe to call repeatedly and from
  * concurrent processes. The legacy root is never written.
  */
 export async function migrateLegacyRoot(agentDir: string, options: LegacyMigrationOptions = {}): Promise<MigrationReport> {
 	const report = emptyReport();
-	const legacyRoot = options.legacyRoot ?? join(agentDir, "persona-mind");
-	const destinationRoot = options.destinationRoot ?? join(agentDir, "pi-persona-mind");
+	const legacyRoot = options.legacyRoot ?? join(agentDir, "pi-persona-mind");
+	const destinationRoot = options.destinationRoot ?? join(agentDir, "persona-mind");
 	const maxFiles = options.maxFiles ?? DEFAULT_MAX_FILES;
 	const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
 	const manifest = new JsonStore<LegacySourceStamp>(

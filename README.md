@@ -105,7 +105,7 @@ never carries — or pollutes — the supervisor's memory:
 
 ## Per-persona
 
-Memory is keyed by the active persona under `<agentDir>/pi-persona-mind/`:
+Memory is keyed by the active persona under `<agentDir>/persona-mind/`:
 
 ```
 memory/ltm/<persona>.json   long-term, private to a persona
@@ -129,7 +129,17 @@ on Windows**. Every write keeps a last-known-good `.bak`; a torn live file rolls
 final, non-destructive quarantine to `*.corrupt-N` (memory is never silently presented as empty). The
 durable-store pattern is adapted from [OpenLore](https://github.com/clay-good/openlore) (MIT).
 
-Upgrades import the older `<agentDir>/persona-mind/` root non-destructively. They automatically
+> **0.7.0 is a breaking storage change for anyone on 0.6.x.** The mind's root moved from
+> `<agentDir>/pi-persona-mind/` to `<agentDir>/persona-mind/`, so the Pi agent dir holds exactly two
+> plugin roots (`persona`, `persona-mind`). The npm package, the repo and the commands are unchanged —
+> only the directory name. **Nothing is deleted or moved:** the first 0.7.0 start imports the old root
+> into the new one through the same non-destructive, deduplicating, idempotent importer described
+> below, and every byte under `pi-persona-mind/` is left exactly where it lies. If both roots hold data
+> (an 0.6.x install that had itself upgraded from ≤0.5), they are merged and the destination copy wins
+> an exact conflict. Downgrading to 0.6.x does not lose anything either, but 0.6.x reads the other
+> root, so memory written by 0.7.0 is invisible to it until it is imported back.
+
+Upgrades import the older `<agentDir>/pi-persona-mind/` root non-destructively. They automatically
 reconcile project filenames when canonical realpaths change a scope; collision-prone v0.5.2 persona
 aliases require the explicit `/mind migrate-persona` command and its loud ambiguity warning. Startup
 scans at most 256 legacy JSON files, reads at most 4 MiB per source, and waits only briefly in the

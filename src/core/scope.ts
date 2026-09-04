@@ -6,7 +6,7 @@
  * is absent or no persona is selected, everything degrades to a `_default` scope, so the extension
  * is fully usable on its own.
  *
- * Layout under `<agentDir>/pi-persona-mind/`:
+ * Layout under `<agentDir>/persona-mind/`:
  *   memory/ltm/<persona>.json   long-term, per persona (identity)
  *   memory/ltm/_shared.json     long-term, shared across personas
  *   memory/stm/<project>.json   short-term, per project (decays)
@@ -319,7 +319,7 @@ export function findProjectRoot(startDir: string, hasGit: (dir: string) => boole
 
 /** Build the four store paths for a (persona, project-slug) pair. Inputs must be pre-sanitized. */
 export function mindPaths(agentDir: string, persona: string, slug: string): ScopePaths {
-	const base = join(agentDir, "pi-persona-mind");
+	const base = join(agentDir, "persona-mind");
 	return {
 		ltm: join(base, "memory", "ltm", `${persona}.json`),
 		shared: join(base, "memory", "ltm", `${SHARED_SCOPE}.json`),

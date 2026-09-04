@@ -287,12 +287,15 @@ test("resetPersonaMarkerLatch starts a fresh session's seed without inheriting t
 	assert.equal(activePersona(agentDir, {}, "grace"), "grace", "a new Pi session must not inherit the previous session's switch latch");
 });
 
-test("mindPaths lays out the four stores under <agentDir>/pi-persona-mind", () => {
+test("mindPaths lays out the four stores under <agentDir>/persona-mind", () => {
 	const p = mindPaths("/agent", "elite", "slug-abc");
-	assert.ok(p.ltm.endsWith(join("pi-persona-mind", "memory", "ltm", "elite.json")));
-	assert.ok(p.shared.endsWith(join("pi-persona-mind", "memory", "ltm", "_shared.json")));
-	assert.ok(p.stm.endsWith(join("pi-persona-mind", "memory", "stm", "slug-abc.json")));
-	assert.ok(p.backlog.endsWith(join("pi-persona-mind", "backlog", "slug-abc.json")));
+	// Whole-path equality, not a suffix: `pi-persona-mind/...` also ends with `persona-mind/...`,
+	// so a suffix check could not tell the current root from the root it superseded.
+	const base = join("/agent", "persona-mind");
+	assert.equal(p.ltm, join(base, "memory", "ltm", "elite.json"));
+	assert.equal(p.shared, join(base, "memory", "ltm", "_shared.json"));
+	assert.equal(p.stm, join(base, "memory", "stm", "slug-abc.json"));
+	assert.equal(p.backlog, join(base, "backlog", "slug-abc.json"));
 });
 
 let dir: string;

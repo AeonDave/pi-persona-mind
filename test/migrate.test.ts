@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { readFile, writeFile, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -70,8 +71,8 @@ test("doctor inspection applies the same entry cap as the live store", async () 
 test("migration deduplicates semantic content across legacy and current id encodings", async () => {
 	const agentDir = join(dir, "semantic-id-agent");
 	const entry = makeMemory({ term: "long", kind: "note", text: "same migrated fact", tags: ["a,b"] }, 1_000_000);
-	const source = join(agentDir, "persona-mind", "memory", "ltm", "p.json");
-	const destination = join(agentDir, "pi-persona-mind", "memory", "ltm", "p.json");
+	const source = join(agentDir, "pi-persona-mind", "memory", "ltm", "p.json");
+	const destination = join(agentDir, "persona-mind", "memory", "ltm", "p.json");
 	await putStore(source, [entry]);
 	await putStore(destination, [{ ...entry, id: legacyContentId(entry.kind, entry.text, entry.tags) }]);
 
@@ -98,9 +99,9 @@ function oldProjectSlug(projectRoot: string, platform: "win32" | "host" = "host"
 
 test("migrateLegacyRoot merges expected stores, preserves legacy bytes, and is idempotent", async () => {
 	const agentDir = join(dir, "agent");
-	const legacyLtm = join(agentDir, "persona-mind", "memory", "ltm", "elite.json");
-	const legacyStm = join(agentDir, "persona-mind", "memory", "stm", "project.json");
-	const legacyBacklog = join(agentDir, "persona-mind", "backlog", "project.json");
+	const legacyLtm = join(agentDir, "pi-persona-mind", "memory", "ltm", "elite.json");
+	const legacyStm = join(agentDir, "pi-persona-mind", "memory", "stm", "project.json");
+	const legacyBacklog = join(agentDir, "pi-persona-mind", "backlog", "project.json");
 	const now = 1_000_000;
 	const ltm = makeMemory({ term: "long", kind: "preference", text: "legacy preference" }, now);
 	const stm = makeMemory({ term: "short", kind: "note", text: "legacy context" }, now);
@@ -114,9 +115,9 @@ test("migrateLegacyRoot merges expected stores, preserves legacy bytes, and is i
 	const first = await migrateLegacyRoot(agentDir);
 	assert.equal(first.entriesAdded, 3);
 	assert.equal(first.filesMigrated, 3);
-	assert.equal((await readEntries(join(agentDir, "pi-persona-mind", "memory", "ltm", "elite.json"))).length, 1);
-	assert.equal((await readEntries(join(agentDir, "pi-persona-mind", "memory", "stm", "project.json"))).length, 1);
-	assert.equal((await readEntries(join(agentDir, "pi-persona-mind", "backlog", "project.json"))).length, 1);
+	assert.equal((await readEntries(join(agentDir, "persona-mind", "memory", "ltm", "elite.json"))).length, 1);
+	assert.equal((await readEntries(join(agentDir, "persona-mind", "memory", "stm", "project.json"))).length, 1);
+	assert.equal((await readEntries(join(agentDir, "persona-mind", "backlog", "project.json"))).length, 1);
 	assert.deepEqual(await readFile(legacyLtm, "utf8"), sourceBytes[0]);
 	assert.deepEqual(await readFile(legacyStm, "utf8"), sourceBytes[1]);
 	assert.deepEqual(await readFile(legacyBacklog, "utf8"), sourceBytes[2]);
@@ -128,7 +129,7 @@ test("migrateLegacyRoot merges expected stores, preserves legacy bytes, and is i
 
 test("legacy migration caches unchanged source fingerprints across fresh calls and rechecks changes", async () => {
 	const agentDir = join(dir, "manifest-agent");
-	const source = join(agentDir, "persona-mind", "memory", "ltm", "custom.json");
+	const source = join(agentDir, "pi-persona-mind", "memory", "ltm", "custom.json");
 	const firstEntry = makeMemory({ term: "long", kind: "note", text: "first legacy fact" }, 1_500_000);
 	await putStore(source, [firstEntry]);
 
@@ -146,21 +147,21 @@ test("legacy migration caches unchanged source fingerprints across fresh calls a
 	const changed = await migrateLegacyRoot(agentDir);
 	assert.equal(changed.filesScanned, 1, "a changed source fingerprint invalidates the cache");
 	assert.equal(changed.entriesAdded, 1);
-	assert.equal((await readEntries(join(agentDir, "pi-persona-mind", "memory", "ltm", "custom.json"))).length, 2);
+	assert.equal((await readEntries(join(agentDir, "persona-mind", "memory", "ltm", "custom.json"))).length, 2);
 });
 
 test("migration keeps destination conflicts and converges under concurrent importers", async () => {
 	const agentDir = join(dir, "conflict-agent");
-	const legacyPath = join(agentDir, "persona-mind", "memory", "ltm", "elite.json");
+	const legacyPath = join(agentDir, "pi-persona-mind", "memory", "ltm", "elite.json");
 	const entry = makeMemory({ term: "long", kind: "note", text: "same id" }, 2_000_000);
 	const legacy = { ...entry, text: "legacy text with destination id" };
 	await putStore(legacyPath, [legacy]);
-	const destinationPath = join(agentDir, "pi-persona-mind", "memory", "ltm", "elite.json");
+	const destinationPath = join(agentDir, "persona-mind", "memory", "ltm", "elite.json");
 	await putStore(destinationPath, [{ ...entry, text: "destination wins" }]);
 	const concurrentEntry = makeMemory({ term: "short", kind: "note", text: "only one concurrent append" }, 2_000_000);
-	const concurrentLegacyPath = join(agentDir, "persona-mind", "memory", "stm", "project.json");
+	const concurrentLegacyPath = join(agentDir, "pi-persona-mind", "memory", "stm", "project.json");
 	await putStore(concurrentLegacyPath, [concurrentEntry]);
-	const concurrentDestinationPath = join(agentDir, "pi-persona-mind", "memory", "stm", "project.json");
+	const concurrentDestinationPath = join(agentDir, "persona-mind", "memory", "stm", "project.json");
 
 	const reports = await Promise.all([migrateLegacyRoot(agentDir), migrateLegacyRoot(agentDir)]);
 	assert.equal((await readEntries(destinationPath)).map((e) => (e as { text: string }).text).join("\n"), "destination wins\nlegacy text with destination id");
@@ -170,10 +171,10 @@ test("migration keeps destination conflicts and converges under concurrent impor
 
 test("migration reports malformed legacy files and ignores unrelated files", async () => {
 	const agentDir = join(dir, "warnings-agent");
-	const malformed = join(agentDir, "persona-mind", "memory", "ltm", "broken.json");
+	const malformed = join(agentDir, "pi-persona-mind", "memory", "ltm", "broken.json");
 	await putStore(malformed, []);
 	await writeFile(malformed, "not json", "utf8");
-	await putStore(join(agentDir, "persona-mind", "other.json"), []);
+	await putStore(join(agentDir, "pi-persona-mind", "other.json"), []);
 
 	const report = await migrateLegacyRoot(agentDir);
 	assert.equal(report.entriesAdded, 0);
@@ -188,7 +189,7 @@ test("scope alias migration moves a Windows case-folded project slug from the cu
 	const oldSlug = oldProjectSlug(projectRoot, "win32");
 	const newSlug = projectSlug(projectRoot, projectOptions);
 	assert.notEqual(oldSlug, newSlug);
-	const oldPath = join(agentDir, "pi-persona-mind", "memory", "stm", `${oldSlug}.json`);
+	const oldPath = join(agentDir, "persona-mind", "memory", "stm", `${oldSlug}.json`);
 	const destinationPath = mindPaths(agentDir, "elite", newSlug).stm;
 	const entry = makeMemory({ term: "short", kind: "note", text: "survives slug canonicalization" }, 3_000_000);
 	const oldBytes = await putStore(oldPath, [entry]);
@@ -207,8 +208,8 @@ test("scope alias migration moves lossy and reserved persona filenames", async (
 	const projectRoot = join(dir, "alias-persona-project");
 	const lossy = makeMemory({ term: "long", kind: "note", text: "lossy persona" }, 4_000_000);
 	const reserved = makeMemory({ term: "long", kind: "note", text: "reserved persona" }, 4_000_000);
-	const oldLossy = join(agentDir, "pi-persona-mind", "memory", "ltm", `${oldSanitizePersona("dev ops")}.json`);
-	const oldReserved = join(agentDir, "pi-persona-mind", "memory", "ltm", `${oldSanitizePersona("NUL")}.json`);
+	const oldLossy = join(agentDir, "persona-mind", "memory", "ltm", `${oldSanitizePersona("dev ops")}.json`);
+	const oldReserved = join(agentDir, "persona-mind", "memory", "ltm", `${oldSanitizePersona("NUL")}.json`);
 	await putStore(oldLossy, [lossy]);
 	await putStore(oldReserved, [reserved]);
 
@@ -232,7 +233,7 @@ test("scope alias migration uses the historical non-Latin hash and never aliases
 	const sourceEntry = makeMemory({ term: "long", kind: "note", text: "non-latin source" }, 4_500_000);
 	const poisonedDefault = makeMemory({ term: "long", kind: "note", text: "must not bleed from default" }, 4_500_000);
 	await putStore(target, [sourceEntry]);
-	const defaultPath = join(agentDir, "pi-persona-mind", "memory", "ltm", "_default.json");
+	const defaultPath = join(agentDir, "persona-mind", "memory", "ltm", "_default.json");
 	const defaultBytes = await putStore(defaultPath, [poisonedDefault]);
 
 	const report = await migrateCurrentScopeAliases(agentDir, rawPersona, projectRoot);
@@ -249,10 +250,10 @@ test("scope alias migration uses persona-_shared and persona-NUL historical alia
 	const nulEntry = makeMemory({ term: "long", kind: "note", text: "nul alias source" }, 4_600_000);
 	const poisonedShared = makeMemory({ term: "long", kind: "note", text: "must not import shared sentinel" }, 4_600_000);
 	const poisonedNul = makeMemory({ term: "long", kind: "note", text: "must not import raw nul" }, 4_600_000);
-	await putStore(join(agentDir, "pi-persona-mind", "memory", "ltm", "persona-_shared.json"), [sharedEntry]);
-	await putStore(join(agentDir, "pi-persona-mind", "memory", "ltm", "_shared.json"), [poisonedShared]);
-	await putStore(join(agentDir, "pi-persona-mind", "memory", "ltm", "persona-NUL.json"), [nulEntry]);
-	await putStore(join(agentDir, "pi-persona-mind", "memory", "ltm", "NUL.json"), [poisonedNul]);
+	await putStore(join(agentDir, "persona-mind", "memory", "ltm", "persona-_shared.json"), [sharedEntry]);
+	await putStore(join(agentDir, "persona-mind", "memory", "ltm", "_shared.json"), [poisonedShared]);
+	await putStore(join(agentDir, "persona-mind", "memory", "ltm", "persona-NUL.json"), [nulEntry]);
+	await putStore(join(agentDir, "persona-mind", "memory", "ltm", "NUL.json"), [poisonedNul]);
 
 	const sharedReport = await migrateCurrentScopeAliases(agentDir, "_shared", projectRoot, { project: projectOptions, includeAmbiguousPersonaAlias: true });
 	assert.equal(sharedReport.entriesAdded, 1);
@@ -340,7 +341,7 @@ test("scope alias migration keeps null persona on _default while reconciling its
 	const newSlug = projectSlug(projectRoot, projectOptions);
 	assert.notEqual(oldSlug, newSlug);
 	const entry = makeMemory({ term: "short", kind: "note", text: "default project alias" }, 6_000_000);
-	await putStore(join(agentDir, "pi-persona-mind", "memory", "stm", `${oldSlug}.json`), [entry]);
+	await putStore(join(agentDir, "persona-mind", "memory", "stm", `${oldSlug}.json`), [entry]);
 
 	const report = await migrateCurrentScopeAliases(agentDir, null, projectRoot, { project: projectOptions });
 	assert.equal(report.entriesAdded, 1);
@@ -353,9 +354,9 @@ test("automatic alias migration skips ambiguous persona files but still reconcil
 	const projectOptions = { realpath: (path: string) => path, platform: "win32" as const };
 	const personaEntry = makeMemory({ term: "long", kind: "note", text: "ambiguous persona source" }, 7_000_000);
 	const projectEntry = makeMemory({ term: "short", kind: "note", text: "safe project source" }, 7_000_000);
-	await putStore(join(agentDir, "pi-persona-mind", "memory", "ltm", "red-team.json"), [personaEntry]);
+	await putStore(join(agentDir, "persona-mind", "memory", "ltm", "red-team.json"), [personaEntry]);
 	const oldProject = oldProjectSlug(projectRoot, "win32");
-	await putStore(join(agentDir, "pi-persona-mind", "memory", "stm", `${oldProject}.json`), [projectEntry]);
+	await putStore(join(agentDir, "persona-mind", "memory", "stm", `${oldProject}.json`), [projectEntry]);
 	const report = await migrateCurrentScopeAliases(agentDir, "red team", projectRoot, { project: projectOptions });
 	assert.equal(report.entriesAdded, 1, "only the unambiguous project alias is automatic");
 	assert.equal(await readFile(mindPaths(agentDir, sanitizePersona("red team"), projectSlug(projectRoot, projectOptions)).ltm).catch(() => null), null, "ambiguous persona source was not imported");
@@ -364,14 +365,14 @@ test("automatic alias migration skips ambiguous persona files but still reconcil
 
 test("legacy import bounds file count and bytes without following non-regular sources", async () => {
 	const agentDir = join(dir, "bounded-root-agent");
-	const first = join(agentDir, "persona-mind", "memory", "ltm", "first.json");
-	const second = join(agentDir, "persona-mind", "memory", "ltm", "second.json");
+	const first = join(agentDir, "pi-persona-mind", "memory", "ltm", "first.json");
+	const second = join(agentDir, "pi-persona-mind", "memory", "ltm", "second.json");
 	await putStore(first, [makeMemory({ term: "long", kind: "note", text: "first bounded" }, 8_000_000)]);
 	await putStore(second, [makeMemory({ term: "long", kind: "note", text: "second bounded" }, 8_000_000)]);
 	const report = await migrateLegacyRoot(agentDir, { maxFiles: 1, maxFileBytes: 100 });
 	assert.equal(report.filesScanned, 1);
 	assert.ok(report.warnings.some((warning) => /migration limit|byte/i.test(warning)));
-	assert.equal(await readFile(join(agentDir, "pi-persona-mind", "memory", "ltm", "first.json")).catch(() => null), null, "oversized source is skipped");
+	assert.equal(await readFile(join(agentDir, "persona-mind", "memory", "ltm", "first.json")).catch(() => null), null, "oversized source is skipped");
 });
 
 test("migration repairs colliding legacy comma-tag ids instead of dropping distinct memories", async () => {
@@ -379,19 +380,19 @@ test("migration repairs colliding legacy comma-tag ids instead of dropping disti
 	const a = makeMemory({ term: "long", kind: "note", text: "alpha", tags: ["a,b"] }, 9_000_000);
 	const b = makeMemory({ term: "long", kind: "note", text: "alpha", tags: ["a", "b"] }, 9_000_000);
 	const legacyId = legacyContentId("note", "alpha", ["a,b"]);
-	const legacyPath = join(agentDir, "persona-mind", "memory", "ltm", "elite.json");
+	const legacyPath = join(agentDir, "pi-persona-mind", "memory", "ltm", "elite.json");
 	await putStore(legacyPath, [{ ...a, id: legacyId }, { ...b, id: legacyId }]);
 	const report = await migrateLegacyRoot(agentDir);
 	assert.equal(report.entriesAdded, 2);
-	assert.equal((await readEntries(join(agentDir, "pi-persona-mind", "memory", "ltm", "elite.json"))).length, 2);
+	assert.equal((await readEntries(join(agentDir, "persona-mind", "memory", "ltm", "elite.json"))).length, 2);
 });
 
 test("legacy migration warns for a capacity source and continues with other files", async () => {
 	const agentDir = join(dir, "capacity-legacy-agent");
-	const blockedDestination = join(agentDir, "pi-persona-mind", "memory", "ltm", "blocked.json");
-	const blockedSource = join(agentDir, "persona-mind", "memory", "ltm", "blocked.json");
-	const followupSource = join(agentDir, "persona-mind", "memory", "ltm", "followup.json");
-	const followupDestination = join(agentDir, "pi-persona-mind", "memory", "ltm", "followup.json");
+	const blockedDestination = join(agentDir, "persona-mind", "memory", "ltm", "blocked.json");
+	const blockedSource = join(agentDir, "pi-persona-mind", "memory", "ltm", "blocked.json");
+	const followupSource = join(agentDir, "pi-persona-mind", "memory", "ltm", "followup.json");
+	const followupDestination = join(agentDir, "persona-mind", "memory", "ltm", "followup.json");
 	const full = Array.from({ length: 10_000 }, (_, index) => makeMemory({ term: "long", kind: "note", text: `already full ${index}` }, 10_000_000));
 	await putStore(blockedDestination, full);
 	await putStore(blockedSource, [makeMemory({ term: "long", kind: "note", text: "cannot fit" }, 10_000_000)]);
@@ -412,8 +413,8 @@ test("scope alias migration warns for a capacity source and continues with other
 	const newSlug = projectSlug(projectRoot, projectOptions);
 	assert.notEqual(oldSlug, newSlug);
 	const blockedDestination = mindPaths(agentDir, "elite", newSlug).stm;
-	const blockedSource = join(agentDir, "pi-persona-mind", "memory", "stm", `${oldSlug}.json`);
-	const followupSource = join(agentDir, "pi-persona-mind", "backlog", `${oldSlug}.json`);
+	const blockedSource = join(agentDir, "persona-mind", "memory", "stm", `${oldSlug}.json`);
+	const followupSource = join(agentDir, "persona-mind", "backlog", `${oldSlug}.json`);
 	const followupDestination = mindPaths(agentDir, "elite", newSlug).backlog;
 	const full = Array.from({ length: 10_000 }, (_, index) => makeMemory({ term: "short", kind: "note", text: `already full ${index}` }, 11_000_000));
 	await putStore(blockedDestination, full);
@@ -425,4 +426,102 @@ test("scope alias migration warns for a capacity source and continues with other
 	assert.equal(report.entriesAdded, 1);
 	assert.deepEqual(await readEntries(followupDestination), [followup]);
 	assert.ok(report.warnings.some((warning) => warning.includes(blockedSource) && /capacity|limit/i.test(warning)));
+});
+
+test("the unprefixed root is where the mind writes, and the pi-prefixed root is the one-way source", async () => {
+	const agentDir = join(dir, "inverted-direction-agent");
+	const source = join(agentDir, "pi-persona-mind", "memory", "ltm", "elite.json");
+	const entry = makeMemory({ term: "long", kind: "note", text: "written under the pi-prefixed root" }, 12_000_000);
+	const sourceBytes = await putStore(source, [entry]);
+
+	const report = await migrateLegacyRoot(agentDir);
+
+	assert.equal(report.entriesAdded, 1);
+	assert.deepEqual(await readEntries(join(agentDir, "persona-mind", "memory", "ltm", "elite.json")), [entry]);
+	assert.equal(await readFile(source, "utf8"), sourceBytes, "the pi-prefixed root is only ever read");
+});
+
+test("the inverted import merges both populated roots and a true collision keeps the destination record", async () => {
+	const agentDir = join(dir, "inverted-merge-agent");
+	const now = 12_100_000;
+	const both = makeMemory({ term: "long", kind: "note", text: "recorded under both roots" }, now);
+	// Same fact, later metadata: the destination's own record must survive the merge untouched.
+	const destinationCopy = { ...both, lastSeenAt: new Date(now + 3_600_000).toISOString() };
+	const onlyOld = makeMemory({ term: "long", kind: "note", text: "only under the pi-prefixed root" }, now);
+	const onlyNew = makeMemory({ term: "long", kind: "note", text: "only under the unprefixed root" }, now);
+	const source = join(agentDir, "pi-persona-mind", "memory", "ltm", "elite.json");
+	const destination = join(agentDir, "persona-mind", "memory", "ltm", "elite.json");
+	await putStore(source, [both, onlyOld]);
+	await putStore(destination, [destinationCopy, onlyNew]);
+
+	const report = await migrateLegacyRoot(agentDir);
+
+	assert.equal(report.entriesAdded, 1, "only the fact the destination did not already hold is appended");
+	const merged = (await readEntries(destination)) as { text: string }[];
+	assert.deepEqual(merged.map((entry) => entry.text).sort(), [both.text, onlyNew.text, onlyOld.text].sort(), "neither root loses an entry");
+	assert.deepEqual(merged.find((entry) => entry.text === both.text), destinationCopy, "the destination copy wins a true collision");
+
+	const second = await migrateLegacyRoot(agentDir);
+	assert.equal(second.entriesAdded, 0, "re-running the inverted import changes nothing");
+	assert.equal((await readEntries(destination)).length, 3);
+});
+
+test("a manifest left by the pre-0.7.0 direction can neither skip nor re-import an entry", async () => {
+	const agentDir = join(dir, "inverted-manifest-agent");
+	const source = join(agentDir, "pi-persona-mind", "memory", "ltm", "elite.json");
+	const entry = makeMemory({ term: "long", kind: "note", text: "must survive the direction flip" }, 12_200_000);
+	await putStore(source, [entry]);
+	// 0.6.x stamped its manifest at its destination — the root the flip turns back into the SOURCE.
+	// Two independent reasons make it inert: a stamp id hashes source\0destination, so every record in
+	// it addresses the opposite direction and can never match a stamp taken now; and it sits outside
+	// the three scanned directories, so it is never mistaken for a store either.
+	const supersededManifest = join(agentDir, "pi-persona-mind", ".legacy-import-v1.json");
+	const supersededBytes = await putStore(supersededManifest, [
+		{
+			id: "abcdefabcdefabcdefabcdef",
+			source: resolve(join(agentDir, "persona-mind", "memory", "ltm", "elite.json")),
+			destination: resolve(source),
+			kind: "ltm",
+			size: "1",
+			mtimeNs: "1",
+			ctimeNs: "1",
+			dev: "1",
+			ino: "1",
+		},
+	]);
+
+	const first = await migrateLegacyRoot(agentDir);
+	assert.equal(first.filesSkipped, 0, "a stamp from the old direction must not suppress a real source");
+	assert.equal(first.entriesAdded, 1);
+	assert.deepEqual(await readEntries(join(agentDir, "persona-mind", "memory", "ltm", "elite.json")), [entry]);
+	assert.equal(await readFile(supersededManifest, "utf8"), supersededBytes, "the superseded manifest is left where it lies");
+
+	const second = await migrateLegacyRoot(agentDir);
+	assert.equal(second.filesSkipped, 1, "only the manifest at the new destination decides a skip");
+	assert.equal(second.entriesAdded, 0);
+	assert.equal((await readEntries(join(agentDir, "persona-mind", ".legacy-import-v1.json"))).length, 1);
+});
+
+test("with nothing under the pi-prefixed root the current root is left byte-for-byte alone", async () => {
+	const agentDir = join(dir, "only-current-agent");
+	const destination = join(agentDir, "persona-mind", "memory", "ltm", "elite.json");
+	const entry = makeMemory({ term: "long", kind: "note", text: "already in the current root" }, 12_300_000);
+	const bytes = await putStore(destination, [entry]);
+
+	const report = await migrateLegacyRoot(agentDir);
+
+	assert.deepEqual(report, { filesScanned: 0, filesSkipped: 0, filesMigrated: 0, entriesSeen: 0, entriesAdded: 0, conflicts: 0, invalidEntries: 0, warnings: [] });
+	assert.equal(await readFile(destination, "utf8"), bytes, "an absent legacy root is not an error and rewrites nothing");
+	assert.equal(await readFile(join(agentDir, "pi-persona-mind", "memory", "ltm", "elite.json"), "utf8").catch(() => null), null, "the superseded root is never recreated");
+});
+
+test("a fresh install with neither root writes nothing, not even a manifest", async () => {
+	const agentDir = join(dir, "no-roots-agent");
+	await mkdir(agentDir, { recursive: true });
+
+	const report = await migrateLegacyRoot(agentDir);
+
+	assert.deepEqual(report, { filesScanned: 0, filesSkipped: 0, filesMigrated: 0, entriesSeen: 0, entriesAdded: 0, conflicts: 0, invalidEntries: 0, warnings: [] });
+	assert.equal(existsSync(join(agentDir, "persona-mind")), false, "an empty pass must not materialize the store tree");
+	assert.equal(existsSync(join(agentDir, "pi-persona-mind")), false);
 });

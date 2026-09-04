@@ -885,7 +885,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 					pathLine(diagnostics[1]!),
 					pathLine(diagnostics[2]!),
 					pathLine(diagnostics[3]!),
-					`legacy root: ${join(agentDir, "persona-mind")} (${existsSync(join(agentDir, "persona-mind")) ? "detected; imported non-destructively" : "absent"})`,
+					`legacy root: ${join(agentDir, "pi-persona-mind")} (${existsSync(join(agentDir, "pi-persona-mind")) ? "detected; imported non-destructively" : "absent"})`,
 					`warnings: ${allWarnings.length === 0 ? "none" : allWarnings.join(" | ")}`,
 				];
 				warnings.clear();

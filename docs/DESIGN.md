@@ -44,7 +44,7 @@ src/
 
 ### Storage layout
 
-Under `<agentDir>/pi-persona-mind/` (agentDir mirrors pi-persona's own `PI_AGENT_DIR || getAgentDir()`,
+Under `<agentDir>/persona-mind/` (agentDir mirrors pi-persona's own `PI_AGENT_DIR || getAgentDir()`,
 and the marker location follows `PI_PERSONA_STATE_FILE`, so the two stay in lockstep under those
 overrides; see Scope resolution):
 
@@ -111,7 +111,7 @@ interface BacklogEntry {
   real path and case-fold it on Windows before hashing. Junctions, symlinks, and drive-letter case no
   longer split one project's STM/backlog. Successful default realpath resolutions are reused in a
   bounded process-local cache; injected realpath seams remain uncached.
-- **Compatibility:** a bounded, idempotent importer merges the pre-package `persona-mind` root and
+- **Compatibility:** a bounded, idempotent importer merges the superseded `pi-persona-mind` root and
   project aliases into current files under lock. Ambiguous persona aliases are explicit-command-only.
   Exact-id/content conflicts keep the destination, while distinct same-id content is preserved; sources
   are untouched. The legacy scan caps each pass at 256 JSON files and 4 MiB per source. A destination
@@ -393,3 +393,28 @@ No new topology.
 - **STM and backlog auto-delete.** Only LTM is durable. Expired STM/backlog rows are removed from
   the JSON files on `session_start` (after any due wake) and on each injection. Legacy backlog
   without `expiresAt` expires at `createdAt + 48h`, so old project leads do not reappear forever.
+
+## v0.7.0 — the agent dir holds two plugin roots
+
+A storage-root rename, and nothing else: the Pi agent dir must contain exactly `persona/` and
+`persona-mind/`, not four roots half of them `pi-`prefixed. The npm package, the repo, the tools, the
+commands and the injected `<persona-mind>` fence are untouched — only the directory name changed.
+
+- **The current root is `<agentDir>/persona-mind/`** (`mindPaths`, `scope.ts`). pi-persona's own
+  marker at `<agentDir>/persona/state.json` was already unprefixed and did not move.
+- **The one-way importer reverses direction** (`migrateLegacyRoot`, `migrate.ts`): it now reads
+  `<agentDir>/pi-persona-mind/` and writes `<agentDir>/persona-mind/`. Same machinery — bounded scan
+  (256 files, 4 MiB per source), semantic dedup across id encodings, JsonStore-locked destination
+  writes, source bytes never rewritten or removed — with the two roots swapped. `/mind doctor` names
+  the `pi-`prefixed root as the legacy one.
+- **Both roots may hold data**, because 0.6.x itself imported from an unprefixed root. That case is a
+  merge, not a rename: entries present only on one side are appended, semantically identical entries
+  are dropped, and a true collision keeps the destination's record. Re-running is a no-op.
+- **The 0.6.x manifest is inert, not misleading.** `.legacy-import-v1.json` lived at the *destination*
+  root, which the flip turns back into the *source* root. It cannot cause a wrong skip or a wrong
+  re-import for two independent reasons: a stamp id is `sha256(source\0destination)` and both fields
+  are compared on read, so every record in it addresses the opposite direction and can never match a
+  stamp taken now; and it sits at the root, outside the three scanned directories (`memory/ltm`,
+  `memory/stm`, `backlog`), so it is never read as a store either. It is left where it lies as dead
+  bytes — the same non-destructive rule that applies to every other file under the legacy root — and
+  0.7.0 keeps its own manifest at `<agentDir>/persona-mind/.legacy-import-v1.json`.

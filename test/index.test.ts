@@ -110,8 +110,8 @@ test("the live --persona flag overrides a stale persisted marker for reads and w
 		ctx,
 	);
 	assert.equal(result?.details.ok, true);
-	assert.equal(existsSync(join(agentDir, "pi-persona-mind", "memory", "ltm", "quartz-supervisor.json")), true);
-	assert.equal(existsSync(join(agentDir, "pi-persona-mind", "memory", "ltm", "stale-persona.json")), false);
+	assert.equal(existsSync(join(agentDir, "persona-mind", "memory", "ltm", "quartz-supervisor.json")), true);
+	assert.equal(existsSync(join(agentDir, "persona-mind", "memory", "ltm", "stale-persona.json")), false);
 });
 
 test("memory recall rejects an oversized query without echoing it into the tool result", async () => {
@@ -133,7 +133,7 @@ test("a refused ambiguous forget hands the model an id it can actually delete wi
 	const m = mockPi();
 	const agentDir = join(dir, "ambiguous-forget-tool", "agent");
 	const ctx = ctxFor(join(dir, "ambiguous-forget-tool", "project"));
-	const ltmPath = join(agentDir, "pi-persona-mind", "memory", "ltm", "_default.json");
+	const ltmPath = join(agentDir, "persona-mind", "memory", "ltm", "_default.json");
 	// Two distinct facts that a v1 comma-joined tag list hashed to ONE id: undeletable until the refusal
 	// itself names a per-fact handle.
 	const commaTagged = makeMemory({ term: "long", kind: "gotcha", text: "release checklist", tags: ["a,b"] }, 1_000_000);
@@ -165,8 +165,8 @@ test("promote says so when the lineage handle it carried over retired nothing", 
 	const cwd = join(dir, "promote-ambiguous-tool", "project");
 	const ctx = ctxFor(cwd);
 	const now = Date.now();
-	const ltmPath = join(agentDir, "pi-persona-mind", "memory", "ltm", "_default.json");
-	const stmPath = join(agentDir, "pi-persona-mind", "memory", "stm", `${projectSlug(cwd)}.json`);
+	const ltmPath = join(agentDir, "persona-mind", "memory", "ltm", "_default.json");
+	const stmPath = join(agentDir, "persona-mind", "memory", "stm", `${projectSlug(cwd)}.json`);
 	const commaTagged = makeMemory({ term: "long", kind: "gotcha", text: "release checklist", tags: ["a,b"] }, now);
 	const splitTagged = makeMemory({ term: "long", kind: "gotcha", text: "release checklist", tags: ["a", "b"] }, now);
 	const legacy = legacyContentId("gotcha", "release checklist", ["a,b"]);
@@ -188,7 +188,7 @@ test("a store written by another build fails the memory tool loudly instead of t
 	const m = mockPi();
 	const agentDir = join(dir, "version-skew-tool", "agent");
 	const ctx = ctxFor(join(dir, "version-skew-tool", "project"));
-	const ltmPath = join(agentDir, "pi-persona-mind", "memory", "ltm", "_default.json");
+	const ltmPath = join(agentDir, "persona-mind", "memory", "ltm", "_default.json");
 	await mkdir(dirname(ltmPath), { recursive: true });
 	await writeFile(ltmPath, `${JSON.stringify({ version: 2, sequence: 1, updatedAt: new Date(1_000_000).toISOString(), entries: [] })}\n`, "utf8");
 	createExtension(m.pi, { agentDir });
@@ -207,8 +207,8 @@ test("session startup imports the legacy root without deleting it and surfaces m
 	const cwd = join(dir, "legacy-wiring", "project");
 	const persona = "migration-test";
 	const statePath = join(agentDir, "persona", "state.json");
-	const legacyPath = join(agentDir, "persona-mind", "memory", "ltm", `${persona}.json`);
-	const malformedPath = join(agentDir, "persona-mind", "memory", "ltm", "malformed.json");
+	const legacyPath = join(agentDir, "pi-persona-mind", "memory", "ltm", `${persona}.json`);
+	const malformedPath = join(agentDir, "pi-persona-mind", "memory", "ltm", "malformed.json");
 	await mkdir(dirname(statePath), { recursive: true });
 	await writeFile(statePath, JSON.stringify({ lastPersona: persona }), "utf8");
 	await mkdir(dirname(legacyPath), { recursive: true });
@@ -236,7 +236,7 @@ test("session startup reconciles a v0.5.2 persona filename after collision-safe 
 	const agentDir = join(dir, "scope-alias-wiring", "agent");
 	const cwd = join(dir, "scope-alias-wiring", "project");
 	const statePath = join(agentDir, "persona", "state.json");
-	const oldPath = join(agentDir, "pi-persona-mind", "memory", "ltm", "red-team.json");
+	const oldPath = join(agentDir, "persona-mind", "memory", "ltm", "red-team.json");
 	await mkdir(dirname(statePath), { recursive: true });
 	await writeFile(statePath, JSON.stringify({ lastPersona: "red team" }), "utf8");
 	await mkdir(dirname(oldPath), { recursive: true });
@@ -267,8 +267,8 @@ test("session startup migration is bounded and continues in the background", asy
 	const m = mockPi();
 	const agentDir = join(dir, "bounded-migration", "agent");
 	const cwd = join(dir, "bounded-migration", "project");
-	const legacyPath = join(agentDir, "persona-mind", "memory", "ltm", "_default.json");
-	const destinationPath = join(agentDir, "pi-persona-mind", "memory", "ltm", "_default.json");
+	const legacyPath = join(agentDir, "pi-persona-mind", "memory", "ltm", "_default.json");
+	const destinationPath = join(agentDir, "persona-mind", "memory", "ltm", "_default.json");
 	const entry = makeMemory({ term: "long", kind: "note", text: "background import" }, Date.now());
 	await mkdir(dirname(legacyPath), { recursive: true });
 	await writeFile(legacyPath, JSON.stringify({ version: 1, sequence: 1, updatedAt: new Date().toISOString(), entries: [entry] }), "utf8");
@@ -311,14 +311,18 @@ test("/mind doctor explains the effective scope and persistence policy without d
 	assert.match(report, /capture:\s+(auto|prompt|off)/i);
 	assert.match(report, /long-term.*\.json/i);
 	assert.match(report, /project root:/i);
+	// The live stores sit under the unprefixed root; the `pi-`prefixed one is only ever imported FROM,
+	// so naming them the other way round would send an operator to inspect the wrong directory.
+	assert.ok(report.includes(`long-term: ${join(agentDir, "persona-mind", "memory", "ltm")}`), "doctor points at the current root");
+	assert.ok(report.includes(`legacy root: ${join(agentDir, "pi-persona-mind")}`), "doctor names the pi-prefixed root as the legacy one");
 });
 
 test("/mind doctor reports corrupt and invalid stores without mutating them", async () => {
 	const m = mockPi();
 	const agentDir = join(dir, "doctor-validation", "agent");
 	const cwd = join(dir, "doctor-validation", "project");
-	const corruptPath = join(agentDir, "pi-persona-mind", "memory", "ltm", "_default.json");
-	const invalidPath = join(agentDir, "pi-persona-mind", "memory", "stm", `${projectSlug(cwd)}.json`);
+	const corruptPath = join(agentDir, "persona-mind", "memory", "ltm", "_default.json");
+	const invalidPath = join(agentDir, "persona-mind", "memory", "stm", `${projectSlug(cwd)}.json`);
 	await mkdir(dirname(corruptPath), { recursive: true });
 	await mkdir(dirname(invalidPath), { recursive: true });
 	await writeFile(corruptPath, "not json", "utf8");
@@ -406,7 +410,7 @@ test("a migration warning remains visible after normal status refresh", async ()
 	const m = mockPi();
 	const agentDir = join(dir, "warning-status", "agent");
 	const cwd = join(dir, "warning-status", "project");
-	const malformedPath = join(agentDir, "persona-mind", "memory", "ltm", "broken.json");
+	const malformedPath = join(agentDir, "pi-persona-mind", "memory", "ltm", "broken.json");
 	await mkdir(dirname(malformedPath), { recursive: true });
 	await writeFile(malformedPath, "not json", "utf8");
 	const statuses: string[] = [];
@@ -610,7 +614,7 @@ test("missed wake delivery is compact and capped even when many large items are 
 		entry.dueAtEpochMs = Date.now() - 1_000;
 		return entry;
 	});
-	const path = join(agentDir, "pi-persona-mind", "backlog", `${projectSlug(cwd)}.json`);
+	const path = join(agentDir, "persona-mind", "backlog", `${projectSlug(cwd)}.json`);
 	await mkdir(dirname(path), { recursive: true });
 	await writeFile(path, JSON.stringify({ version: 1, updatedAt: new Date().toISOString(), sequence: 1, entries }), "utf8");
 	createExtension(m.pi, { agentDir });
@@ -648,7 +652,7 @@ test("far-future wakes are chunked instead of overflowing Node timers", async ()
 	const cwd = join(dir, "far-wake", "project");
 	const entry = makeBacklog({ text: "far future wake" }, Date.now());
 	entry.dueAtEpochMs = Date.now() + 3_000_000_000;
-	const path = join(agentDir, "pi-persona-mind", "backlog", `${projectSlug(cwd)}.json`);
+	const path = join(agentDir, "persona-mind", "backlog", `${projectSlug(cwd)}.json`);
 	await mkdir(dirname(path), { recursive: true });
 	await writeFile(path, JSON.stringify({ version: 1, updatedAt: new Date().toISOString(), sequence: 1, entries: [entry] }), "utf8");
 	const ctx = ctxFor(cwd);
@@ -673,7 +677,7 @@ test("shutdown during an async wake-state read cannot create a ghost wake", asyn
 		releaseRead = resolve;
 	});
 	const ctx = ctxFor(cwd);
-	await mkdir(dirname(join(agentDir, "pi-persona-mind", "backlog", `${projectSlug(cwd)}.json.wakeowner`)), { recursive: true });
+	await mkdir(dirname(join(agentDir, "persona-mind", "backlog", `${projectSlug(cwd)}.json.wakeowner`)), { recursive: true });
 	createExtension(m.pi, { agentDir, migrationAwaitMs: 0, wakeStateReader: async () => { readStarted(); return wakeState; } });
 	const startup = m.handlers.get("session_start")?.({}, ctx) as Promise<unknown>;
 	await started;
@@ -689,7 +693,7 @@ test("a failed wake-state read releases the wake owner for a later session", asy
 	const agentDir = join(dir, "wake-read-failure", "agent");
 	const cwd = join(dir, "wake-read-failure", "proj");
 	const ctx = ctxFor(cwd);
-	const wakeOwner = join(agentDir, "pi-persona-mind", "backlog", `${projectSlug(cwd)}.json.wakeowner`);
+	const wakeOwner = join(agentDir, "persona-mind", "backlog", `${projectSlug(cwd)}.json.wakeowner`);
 	await mkdir(dirname(wakeOwner), { recursive: true });
 	createExtension(m.pi, { agentDir, wakeStateReader: async () => { throw new Error("read failed"); } });
 	await m.handlers.get("session_start")?.({}, ctx);
@@ -907,7 +911,7 @@ test("foreign and malformed wake owners surface a doctor warning", async () => {
 		const m = mockPi();
 		const agentDir = join(dir, `wake-owner-${label}`, "agent");
 		const cwd = join(dir, `wake-owner-${label}`, "proj");
-		const wakeOwner = join(agentDir, "pi-persona-mind", "backlog", `${projectSlug(cwd)}.json.wakeowner`);
+		const wakeOwner = join(agentDir, "persona-mind", "backlog", `${projectSlug(cwd)}.json.wakeowner`);
 		await mkdir(dirname(wakeOwner), { recursive: true });
 		await writeFile(wakeOwner, token, "utf8");
 		const notices: string[] = [];
@@ -926,7 +930,7 @@ test("an oversized wake owner is rejected with a bounded warning", async () => {
 	const m = mockPi();
 	const agentDir = join(dir, "wake-owner-oversized", "agent");
 	const cwd = join(dir, "wake-owner-oversized", "proj");
-	const wakeOwner = join(agentDir, "pi-persona-mind", "backlog", `${projectSlug(cwd)}.json.wakeowner`);
+	const wakeOwner = join(agentDir, "persona-mind", "backlog", `${projectSlug(cwd)}.json.wakeowner`);
 	await mkdir(dirname(wakeOwner), { recursive: true });
 	await writeFile(wakeOwner, `${"foreign-host".repeat(300)}:1234:1`, "utf8");
 	const notices: string[] = [];
