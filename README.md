@@ -135,17 +135,21 @@ durable-store pattern is adapted from [OpenLore](https://github.com/clay-good/op
 > only the directory name. **Nothing is deleted or moved:** the first 0.7.0 start imports the old root
 > into the new one through the same non-destructive, deduplicating, idempotent importer described
 > below, and every byte under `pi-persona-mind/` is left exactly where it lies. If both roots hold data
-> (an 0.6.x install that had itself upgraded from ≤0.5), they are merged and the destination copy wins
-> an exact conflict. Downgrading to 0.6.x does not lose anything either, but 0.6.x reads the other
+> (an 0.6.x install that had itself upgraded from ≤0.5), they are merged and a record held by both is
+> reconciled to the **later** copy — the root 0.7.0 promotes to destination is the pre-0.6 snapshot the
+> 0.6.x importer drained, so it does not get to win by sitting on the destination side. Downgrading to
+> 0.6.x does not lose anything either, but 0.6.x reads the other
 > root, so memory written by 0.7.0 is invisible to it until it is imported back.
 
 Upgrades import the older `<agentDir>/pi-persona-mind/` root non-destructively. They automatically
 reconcile project filenames when canonical realpaths change a scope; collision-prone v0.5.2 persona
 aliases require the explicit `/mind migrate-persona` command and its loud ambiguity warning. Startup
 scans at most 256 legacy JSON files, reads at most 4 MiB per source, and waits only briefly in the
-lifecycle hook before continuing in the background. A full destination store produces a warning for
-that source and does not stop other imports. Merges are idempotent and locked, distinct same-id
-content is preserved, and source files are never deleted.
+lifecycle hook before continuing in the background. A destination a source cannot be merged into — a
+full store, one written by another build, a lock held too long — produces a warning naming that
+source and does not stop the other imports; a torn source falls back to its `.bak` sidecar, and one
+that stays unreadable is never recorded as imported. Merges are idempotent and locked, distinct
+same-id content is preserved, and source files are never deleted.
 Invalid individual entries are retained losslessly on disk but hidden from consumers, with the problem
 surfaced through the UI and read-only `/mind doctor` diagnostics.
 Startup migration is bounded and continues in the background if a lock or slow disk exceeds its short

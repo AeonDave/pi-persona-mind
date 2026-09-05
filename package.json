@@ -1,6 +1,6 @@
 {
   "name": "pi-persona-mind",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "private": false,
   "type": "module",
   "description": "A durable, persona-aware mind for Pi supervisors: long-term memory (who a persona is, per user), decaying short-term working memory (per project), and a deferred-intent backlog — on one cross-OS atomic store, injected into context every turn.",

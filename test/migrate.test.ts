@@ -6,9 +6,9 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve, win32 } from "node:path";
 import { after, before, test } from "node:test";
 
-import { makeBacklog } from "../src/core/backlog.ts";
+import { type BacklogEntry, makeBacklog } from "../src/core/backlog.ts";
 import { legacyContentId } from "../src/core/ids.ts";
-import { makeMemory } from "../src/core/memory.ts";
+import { makeMemory, type MemoryEntry } from "../src/core/memory.ts";
 import { inspectStoreFile, migrateLegacyRoot, migrateCurrentScopeAliases } from "../src/core/migrate.ts";
 import { mindPaths, projectSlug, sanitizePersona } from "../src/core/scope.ts";
 
@@ -441,11 +441,11 @@ test("the unprefixed root is where the mind writes, and the pi-prefixed root is 
 	assert.equal(await readFile(source, "utf8"), sourceBytes, "the pi-prefixed root is only ever read");
 });
 
-test("the inverted import merges both populated roots and a true collision keeps the destination record", async () => {
+test("the inverted import merges both populated roots and a true collision keeps the later record", async () => {
 	const agentDir = join(dir, "inverted-merge-agent");
 	const now = 12_100_000;
 	const both = makeMemory({ term: "long", kind: "note", text: "recorded under both roots" }, now);
-	// Same fact, later metadata: the destination's own record must survive the merge untouched.
+	// Same fact, and here the destination holds the LATER copy — so it must survive the merge untouched.
 	const destinationCopy = { ...both, lastSeenAt: new Date(now + 3_600_000).toISOString() };
 	const onlyOld = makeMemory({ term: "long", kind: "note", text: "only under the pi-prefixed root" }, now);
 	const onlyNew = makeMemory({ term: "long", kind: "note", text: "only under the unprefixed root" }, now);
@@ -459,7 +459,7 @@ test("the inverted import merges both populated roots and a true collision keeps
 	assert.equal(report.entriesAdded, 1, "only the fact the destination did not already hold is appended");
 	const merged = (await readEntries(destination)) as { text: string }[];
 	assert.deepEqual(merged.map((entry) => entry.text).sort(), [both.text, onlyNew.text, onlyOld.text].sort(), "neither root loses an entry");
-	assert.deepEqual(merged.find((entry) => entry.text === both.text), destinationCopy, "the destination copy wins a true collision");
+	assert.deepEqual(merged.find((entry) => entry.text === both.text), destinationCopy, "the later copy wins a true collision");
 
 	const second = await migrateLegacyRoot(agentDir);
 	assert.equal(second.entriesAdded, 0, "re-running the inverted import changes nothing");
@@ -524,4 +524,179 @@ test("a fresh install with neither root writes nothing, not even a manifest", as
 	assert.deepEqual(report, { filesScanned: 0, filesSkipped: 0, filesMigrated: 0, entriesSeen: 0, entriesAdded: 0, conflicts: 0, invalidEntries: 0, warnings: [] });
 	assert.equal(existsSync(join(agentDir, "persona-mind")), false, "an empty pass must not materialize the store tree");
 	assert.equal(existsSync(join(agentDir, "pi-persona-mind")), false);
+});
+
+test("a semantic collision is reconciled by freshness, not by which root the record sits in", async () => {
+	const agentDir = join(dir, "stale-destination-agent");
+	const base = makeMemory({ term: "short", kind: "note", text: "the deploy key rotates on fridays" }, Date.parse("2025-12-30T00:00:00.000Z"));
+	// The destination root is the pre-0.6 snapshot the 0.6.x importer drained and deliberately left
+	// populated, so ITS copy is the superseded one; the pi-prefixed root is where the user has lived since.
+	const superseded = { ...base, lastSeenAt: "2026-01-01T00:00:00.000Z", expiresAt: "2026-01-03T00:00:00.000Z" };
+	const live = { ...base, lastSeenAt: "2026-09-04T00:00:00.000Z", expiresAt: "2099-09-06T00:00:00.000Z", source: "session 12" };
+	const source = join(agentDir, "pi-persona-mind", "memory", "stm", "p.json");
+	const destination = join(agentDir, "persona-mind", "memory", "stm", "p.json");
+	await putStore(destination, [superseded]);
+	await putStore(source, [live]);
+
+	const report = await migrateLegacyRoot(agentDir);
+
+	const merged = (await readEntries(destination)) as MemoryEntry[];
+	assert.equal(merged.length, 1, "one fact must not persist twice");
+	assert.equal(merged[0]?.expiresAt, live.expiresAt, "a live short-term memory must not be re-expired by the superseded snapshot");
+	assert.equal(merged[0]?.lastSeenAt, live.lastSeenAt);
+	assert.equal(merged[0]?.source, "session 12");
+	assert.equal(merged[0]?.id, superseded.id, "identity stays the destination's, as upsertMemory does");
+	assert.equal(merged[0]?.recordedAt, superseded.recordedAt);
+	assert.equal(report.conflicts, 1);
+	assert.equal(report.entriesAdded, 1, "a record reconciled in place is a committed change");
+});
+
+test("a semantic duplicate dropped under a different id encoding is still counted as a conflict", async () => {
+	const agentDir = join(dir, "conflict-count-agent");
+	const entry = makeMemory({ term: "long", kind: "note", text: "counted once", tags: ["a,b"] }, 13_100_000);
+	const source = join(agentDir, "pi-persona-mind", "memory", "ltm", "p.json");
+	const destination = join(agentDir, "persona-mind", "memory", "ltm", "p.json");
+	await putStore(source, [entry]);
+	await putStore(destination, [{ ...entry, id: legacyContentId(entry.kind, entry.text, entry.tags) }]);
+
+	const report = await migrateLegacyRoot(agentDir);
+
+	assert.equal(report.entriesAdded, 0);
+	assert.equal(report.conflicts, 1, "the counter must report what the dedup actually did");
+});
+
+test("a lead finished under the source root stays done when the superseded root still calls it open", async () => {
+	const agentDir = join(dir, "terminal-backlog-agent");
+	const open = makeBacklog({ text: "call the client", tags: ["client"], dueInSeconds: 60 }, 13_200_000);
+	const done: BacklogEntry = { ...open, state: "done", note: "called on the 21st" };
+	delete done.dueAtEpochMs; // the live copy already delivered and acknowledged its wake
+	const source = join(agentDir, "pi-persona-mind", "backlog", "p.json");
+	const destination = join(agentDir, "persona-mind", "backlog", "p.json");
+	await putStore(destination, [open]);
+	await putStore(source, [done]);
+
+	const report = await migrateLegacyRoot(agentDir);
+
+	const merged = (await readEntries(destination)) as BacklogEntry[];
+	assert.equal(merged.length, 1, "state is not part of the content id — a done row must not join an open row");
+	assert.equal(merged[0]?.state, "done", "finished work must not revert to open");
+	assert.equal(merged[0]?.note, "called on the 21st");
+	assert.equal(merged[0]?.dueAtEpochMs, undefined, "an acknowledged wake must not be re-armed by the superseded copy");
+	assert.equal(report.entriesAdded, 1);
+});
+
+test("advancing a lead's state never drags the superseded copy's lifetime across", async () => {
+	// Progress moves forward; retention does not travel with it. Taking the further-along copy WHOLESALE
+	// pairs its `expiresAt` with the destination's own `createdAt`, and a superseded lifetime can predate
+	// it — a row that expires before it exists, which no reader can make sense of.
+	const agentDir = join(dir, "lifetime-backlog-agent");
+	const open = makeBacklog({ text: "renew the cert", tags: ["ops"] }, 13_300_000);
+	const stale: BacklogEntry = { ...open, state: "done", expiresAt: new Date(13_100_000).toISOString() };
+	const source = join(agentDir, "pi-persona-mind", "backlog", "p.json");
+	const destination = join(agentDir, "persona-mind", "backlog", "p.json");
+	await putStore(destination, [open]);
+	await putStore(source, [stale]);
+
+	await migrateLegacyRoot(agentDir);
+
+	const merged = (await readEntries(destination)) as BacklogEntry[];
+	assert.equal(merged[0]?.state, "done", "the further-along state still wins");
+	assert.equal(merged[0]?.expiresAt, open.expiresAt, "retention stays with the row the user has been living with");
+	const lead = merged[0]!;
+	assert.ok(lead.expiresAt, "the destination's lifetime is kept, so it is still set");
+	assert.ok(
+		Date.parse(lead.expiresAt) >= Date.parse(lead.createdAt),
+		`a merged lead must not expire before it was created: created ${lead.createdAt}, expires ${lead.expiresAt}`,
+	);
+});
+
+test("a terminal destination lead is not reopened by a superseded open copy", async () => {
+	const agentDir = join(dir, "terminal-destination-agent");
+	const open = makeBacklog({ text: "renew the certificate", tags: ["ops"] }, 13_250_000);
+	const done: BacklogEntry = { ...open, state: "done", note: "renewed" };
+	const source = join(agentDir, "pi-persona-mind", "backlog", "p.json");
+	const destination = join(agentDir, "persona-mind", "backlog", "p.json");
+	await putStore(destination, [done]);
+	await putStore(source, [open]);
+
+	const report = await migrateLegacyRoot(agentDir);
+
+	const merged = (await readEntries(destination)) as BacklogEntry[];
+	assert.equal(merged.length, 1);
+	assert.equal(merged[0]?.state, "done");
+	assert.equal(merged[0]?.note, "renewed");
+	assert.equal(report.entriesAdded, 0, "a destination that already holds the later state is untouched");
+});
+
+test("one unimportable destination does not strand the rest of its directory", async () => {
+	const agentDir = join(dir, "stranded-directory-agent");
+	const now = 13_300_000;
+	const a = makeMemory({ term: "long", kind: "note", text: "first legacy fact" }, now);
+	const b = makeMemory({ term: "long", kind: "note", text: "second legacy fact" }, now);
+	const c = makeMemory({ term: "long", kind: "note", text: "third legacy fact" }, now);
+	const legacyDirectory = join(agentDir, "pi-persona-mind", "memory", "ltm");
+	await putStore(join(legacyDirectory, "a.json"), [a]);
+	await putStore(join(legacyDirectory, "b.json"), [b]);
+	await putStore(join(legacyDirectory, "c.json"), [c]);
+	// A destination written by another build: JsonStore.load throws StoreVersionError instead of
+	// quarantining it, and that is not the capacity error mergeImport isolates.
+	const blocked = join(agentDir, "persona-mind", "memory", "ltm", "b.json");
+	await mkdir(join(blocked, ".."), { recursive: true });
+	await writeFile(blocked, `${JSON.stringify({ version: 2, updatedAt: new Date(0).toISOString(), sequence: 1, entries: [] }, null, 2)}\n`, "utf8");
+
+	const report = await migrateLegacyRoot(agentDir);
+
+	assert.equal(report.filesScanned, 3, "every recognized source is still visited");
+	assert.equal(report.entriesAdded, 2);
+	assert.deepEqual(await readEntries(join(agentDir, "persona-mind", "memory", "ltm", "c.json")), [c], "a later file must not be stranded behind a failing one");
+	assert.ok(report.warnings.some((warning) => warning.includes(join(legacyDirectory, "b.json"))), "the warning names the source that failed, not its directory");
+});
+
+test("a torn legacy source falls back to the last-known-good .bak sidecar beside it", async () => {
+	const agentDir = join(dir, "torn-source-agent");
+	const entry = makeMemory({ term: "long", kind: "note", text: "only the backup still has this" }, 13_400_000);
+	const source = join(agentDir, "pi-persona-mind", "memory", "ltm", "torn.json");
+	await putStore(`${source}.bak`, [entry]);
+	await writeFile(source, '{"version":1,"entries":[{"id":"a","ki', "utf8");
+
+	const report = await migrateLegacyRoot(agentDir);
+
+	assert.deepEqual(await readEntries(join(agentDir, "persona-mind", "memory", "ltm", "torn.json")), [entry], "the sidecar JsonStore keeps for exactly this failure must be consulted");
+	assert.ok(report.warnings.some((warning) => warning.includes("torn.json") && warning.includes(".bak")), "the warning says the backup was used");
+	assert.equal(report.entriesAdded, 1);
+});
+
+test("an unreadable legacy source is never stamped as successfully imported", async () => {
+	const agentDir = join(dir, "unstamped-source-agent");
+	const source = join(agentDir, "pi-persona-mind", "memory", "ltm", "shredded.json");
+	const destination = join(agentDir, "persona-mind", "memory", "ltm", "shredded.json");
+	await putStore(destination, [makeMemory({ term: "long", kind: "note", text: "unrelated destination fact" }, 13_500_000)]);
+	await mkdir(join(source, ".."), { recursive: true });
+	await writeFile(source, "not json at all", "utf8");
+
+	const first = await migrateLegacyRoot(agentDir);
+	const second = await migrateLegacyRoot(agentDir);
+
+	assert.ok(first.warnings.some((warning) => warning.includes("shredded.json")));
+	assert.equal(second.filesSkipped, 0, "a source that was never imported must not be stamped as done");
+	assert.ok(second.warnings.some((warning) => warning.includes("shredded.json")), "the damage keeps being surfaced until it is repaired");
+});
+
+test("a .bak that recovers nothing is not treated as a successful read", async () => {
+	// Accepting an empty sidecar would let importFile stamp the torn source, and the next start's
+	// `sameStamp && destination exists` skip would bury it forever — silently, after one warning.
+	const agentDir = join(dir, "empty-bak-agent");
+	const source = join(agentDir, "pi-persona-mind", "memory", "ltm", "p.json");
+	await putStore(source, [makeMemory({ term: "long", kind: "note", text: "keep me", tags: [] }, 13_400_000)]);
+	await putStore(`${source}.bak`, []);
+	await writeFile(source, "{ this is torn", "utf8");
+
+	const first = await migrateLegacyRoot(agentDir);
+	assert.equal(first.entriesAdded, 0);
+	assert.ok(first.warnings.some((w) => w.includes("no usable")), `the torn source must be reported: ${JSON.stringify(first.warnings)}`);
+
+	// Not stamped, so a later run still retries it — here the user has restored a good .bak.
+	await putStore(`${source}.bak`, [makeMemory({ term: "long", kind: "note", text: "keep me", tags: [] }, 13_400_000)]);
+	const second = await migrateLegacyRoot(agentDir);
+	assert.equal(second.entriesAdded, 1, "a source that was never successfully read must stay retryable");
 });

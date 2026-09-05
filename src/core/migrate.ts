@@ -2,16 +2,16 @@
  * One-way importer for the superseded `pi-`prefixed storage root.
  *
  * The old root is only read.  Destination writes go through JsonStore so two Pi
- * processes importing at the same time cannot lose entries. Exact id/content
- * conflicts keep the destination; distinct same-id content is preserved. Filenames
- * and legacy bytes are not rewritten or removed.
+ * processes importing at the same time cannot lose entries. Two copies of one fact
+ * are reconciled by which copy is LATER, not by which root it sits in; distinct
+ * same-id content is preserved. Filenames and legacy bytes are not rewritten or removed.
  */
 
 import { lstat, opendir } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { basename, join, resolve, win32 } from "node:path";
 
-import type { BacklogEntry } from "./backlog.ts";
+import type { BacklogEntry, BacklogState } from "./backlog.ts";
 import { validateBacklog } from "./backlog.ts";
 import type { MemoryEntry } from "./memory.ts";
 import { validateLongMemory, validateShortMemory } from "./memory.ts";
@@ -51,7 +51,7 @@ export interface MigrationReport {
 	entriesSeen: number;
 	/** Entries newly appended to, or reconciled in place in, the current destination. */
 	entriesAdded: number;
-	/** Valid entries whose id was already present in the destination. */
+	/** Valid entries the destination already held under the same semantic identity (kept or reconciled). */
 	conflicts: number;
 	/** Entries rejected by the current schema validator. */
 	invalidEntries: number;
@@ -277,17 +277,24 @@ interface ParsedLegacy<E> {
 	invalidEntries: number;
 }
 
-function parseLegacy<E>(raw: string, validate: (value: unknown) => E | null, path: string, report: MigrationReport): ParsedLegacy<E> | null {
+/** Why one source could not be read as a store. The caller reports it — it may first retry a `.bak`. */
+interface LegacyParseFailure {
+	failure: string;
+}
+
+function isParseFailure<E>(result: ParsedLegacy<E> | LegacyParseFailure): result is LegacyParseFailure {
+	return "failure" in result;
+}
+
+function parseLegacy<E>(raw: string, validate: (value: unknown) => E | null, path: string, report: MigrationReport): ParsedLegacy<E> | LegacyParseFailure {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(raw);
 	} catch {
-		warning(report, `legacy mind: could not parse ${path}`);
-		return null;
+		return { failure: `legacy mind: could not parse ${path}` };
 	}
 	if (!isRecord(parsed) || !Array.isArray(parsed.entries)) {
-		warning(report, `legacy mind: ${path} has no entries array`);
-		return null;
+		return { failure: `legacy mind: ${path} has no entries array` };
 	}
 
 	const entries: E[] = [];
@@ -308,6 +315,39 @@ function parseLegacy<E>(raw: string, validate: (value: unknown) => E | null, pat
 	return { entries, invalidEntries };
 }
 
+/**
+ * Read one legacy store, falling back to the `<file>.bak` sidecar JsonStore maintains beside every
+ * store (store.ts) when the live bytes are torn. This import is the only pass that will ever carry
+ * those entries across — the release note invites the user to delete the legacy root afterwards — so
+ * a recoverable last-known-good copy must not be abandoned. null ⇒ nothing was read: the caller must
+ * NOT stamp the source, or the next start's skip test would bury the damage forever.
+ */
+async function readLegacyStore<E>(
+	legacyPath: string,
+	validate: (value: unknown) => E | null,
+	report: MigrationReport,
+	maxFileBytes: number,
+): Promise<ParsedLegacy<E> | null> {
+	const raw = await readBounded(legacyPath, maxFileBytes, report, "legacy mind");
+	if (raw === null) return null;
+	const parsed = parseLegacy<E>(raw, validate, legacyPath, report);
+	if (!isParseFailure(parsed)) return parsed;
+	// Only a source we could READ but not PARSE is torn. A source that vanished mid-scan is gone, and
+	// importing a leftover sidecar for it would resurrect data the user deleted.
+	const backupPath = `${legacyPath}.bak`;
+	const backupRaw = await readBounded(backupPath, maxFileBytes, report, "legacy mind");
+	const backup = backupRaw === null ? null : parseLegacy<E>(backupRaw, validate, backupPath, report);
+	// A sidecar that parses to NOTHING is not a recovery: accepting it would let the caller stamp the
+	// torn source as imported, and the skip test would then bury it on every later start — the exact
+	// burial this fallback exists to prevent.
+	if (backup !== null && !isParseFailure(backup) && backup.entries.length > 0) {
+		warning(report, `${parsed.failure}; recovered its last-known-good ${backupPath}`);
+		return backup;
+	}
+	warning(report, `${parsed.failure}; no usable ${backupPath} either — nothing was imported from it`);
+	return null;
+}
+
 async function importFile(
 	legacyPath: string,
 	destinationPath: string,
@@ -316,26 +356,23 @@ async function importFile(
 	now: (() => number) | undefined,
 	maxFileBytes: number,
 ): Promise<boolean> {
-	const raw = await readBounded(legacyPath, maxFileBytes, report, "legacy mind");
-	if (raw === null) return false;
-
 	if (kind === "ltm" || kind === "stm") {
 		const validate = kind === "ltm" ? validateLongMemory : validateShortMemory;
-		const parsed = parseLegacy<MemoryEntry>(raw, validate, legacyPath, report);
-		if (parsed === null) return true;
+		const parsed = await readLegacyStore<MemoryEntry>(legacyPath, validate, report, maxFileBytes);
+		if (parsed === null) return false;
 		report.entriesSeen += parsed.entries.length;
 		report.invalidEntries += parsed.invalidEntries;
 		if (parsed.entries.length === 0) return true;
 		const store = new JsonStore<MemoryEntry>(destinationPath, makeStoreOptions(validate, now, report));
-		return mergeImport(store, parsed.entries, report, legacyPath, "legacy mind");
+		return mergeImport(store, parsed.entries, report, legacyPath, "legacy mind", reconcileMemory);
 	} else {
-		const parsed = parseLegacy<BacklogEntry>(raw, validateBacklog, legacyPath, report);
-		if (parsed === null) return true;
+		const parsed = await readLegacyStore<BacklogEntry>(legacyPath, validateBacklog, report, maxFileBytes);
+		if (parsed === null) return false;
 		report.entriesSeen += parsed.entries.length;
 		report.invalidEntries += parsed.invalidEntries;
 		if (parsed.entries.length === 0) return true;
 		const store = new JsonStore<BacklogEntry>(destinationPath, makeStoreOptions(validateBacklog, now, report));
-		return mergeImport(store, parsed.entries, report, legacyPath, "legacy mind");
+		return mergeImport(store, parsed.entries, report, legacyPath, "legacy mind", reconcileBacklog);
 	}
 }
 
@@ -349,29 +386,105 @@ function makeStoreOptions<E>(validateEntry: (raw: unknown) => E | null, now: (()
 	return options;
 }
 
-async function merge<E extends { id: string }>(store: JsonStore<E>, incoming: readonly E[], report: MigrationReport): Promise<void> {
-	// A read avoids an unnecessary sequence bump on a repeat import. The update
-	// callback still re-checks ids while holding JsonStore's per-file lock.
-	const current = await store.load();
-	const currentIds = new Set(current.entries.map((entry) => entry.id));
-	const currentIdentities = new Set(current.entries.map((entry) => entryIdentity(entry)));
-	for (const entry of incoming) {
-		if (currentIds.has(entry.id)) report.conflicts++;
+/**
+ * How one semantic-identity collision is settled. Returns the destination record ITSELF when the
+ * incoming copy carries nothing later — identity comparison is what keeps an unchanged import a
+ * genuine no-op that does not bump the store sequence.
+ */
+type Reconcile<E> = (destination: E, incoming: E) => E;
+
+/**
+ * Settle two copies of one fact by FRESHNESS, not by which root they came from.
+ *
+ * The destination is no longer the newer root: 0.7.0 promotes the pre-0.6 snapshot that the 0.6.x
+ * importer drained and deliberately left populated to DESTINATION, so keeping its record on every
+ * match would resurrect a superseded copy — a dead `expiresAt` re-expiring a live short-term memory.
+ * This is `upsertMemory`'s own live rule rather than a second reconciliation: identity (`id`) and
+ * first-recorded (`recordedAt`) stay the destination's, and everything the user last touched comes
+ * from whichever copy was seen last. Both sides are validated, so `lastSeenAt` parses on both.
+ */
+function reconcileMemory(destination: MemoryEntry, incoming: MemoryEntry): MemoryEntry {
+	if (Date.parse(incoming.lastSeenAt) <= Date.parse(destination.lastSeenAt)) return destination;
+	return { ...incoming, id: destination.id, recordedAt: destination.recordedAt };
+}
+
+/** open → taken → done/dropped; the state machine (backlog.ts) only ever moves forward. */
+const BACKLOG_PROGRESS: Readonly<Record<BacklogState, number>> = { open: 0, taken: 1, done: 2, dropped: 2 };
+
+/**
+ * Settle two copies of one lead by LIFECYCLE PROGRESS, so a terminal state and its note survive a
+ * merge in either direction and finished work never reverts to `open`.
+ *
+ * `state` deliberately stays out of the identity: `contentId("backlog", text, tags)` ignores it, so
+ * adding it here would leave an open row and a done row sharing one content id — which the ambiguity
+ * guards then refuse to act on, and which `backlog list` shows twice. Because the state machine only
+ * moves forward, the further-along record is the later one; taking it whole also carries over the
+ * `dueAtEpochMs` that `acknowledgeDue` already cleared, so a delivered wake is not re-armed.
+ */
+function reconcileBacklog(destination: BacklogEntry, incoming: BacklogEntry): BacklogEntry {
+	if (BACKLOG_PROGRESS[incoming.state] <= BACKLOG_PROGRESS[destination.state]) return destination;
+	// Carry only what the LIFECYCLE owns: the state, the note that explains it, and the due date, which
+	// finishing a lead CLEARS — keeping the superseded copy's would re-arm a wake the user already
+	// acknowledged. Identity and retention stay with the destination: taking the further-along copy
+	// wholesale would drag its `expiresAt` across against the destination's own `createdAt`, and a
+	// superseded lifetime can predate it, leaving a row that expires before it exists.
+	const merged: BacklogEntry = { ...destination, state: incoming.state };
+	if (incoming.note === undefined) delete merged.note;
+	else merged.note = incoming.note;
+	if (incoming.dueAtEpochMs === undefined) delete merged.dueAtEpochMs;
+	else merged.dueAtEpochMs = incoming.dueAtEpochMs;
+	return merged;
+}
+
+/** First occurrence wins, so the pre-read check and the locked mutator agree on the destination copy. */
+function byIdentity<E>(entries: readonly E[]): Map<string, { at: number; entry: E }> {
+	const index = new Map<string, { at: number; entry: E }>();
+	for (const [at, entry] of entries.entries()) {
+		const identity = entryIdentity(entry);
+		if (!index.has(identity)) index.set(identity, { at, entry });
 	}
-	if (incoming.every((entry) => currentIdentities.has(entryIdentity(entry)))) return;
+	return index;
+}
+
+async function merge<E extends { id: string }>(store: JsonStore<E>, incoming: readonly E[], report: MigrationReport, reconcile: Reconcile<E>): Promise<void> {
+	// A read avoids an unnecessary sequence bump on a repeat import. The update
+	// callback still re-checks identities while holding JsonStore's per-file lock.
+	const current = byIdentity((await store.load()).entries);
+	// Count conflicts the way the merge actually dedups — by semantic identity. Counting serialized
+	// ids instead let the v2 twin of a record written under the v1 comma-joined id be dropped by the
+	// dedup below without the report ever saying so.
+	let pending = false;
+	for (const entry of incoming) {
+		const held = current.get(entryIdentity(entry));
+		if (held === undefined) {
+			pending = true;
+			continue;
+		}
+		report.conflicts++;
+		if (reconcile(held.entry, entry) !== held.entry) pending = true;
+	}
+	if (!pending) return;
 
 	let addedHere = 0;
 	await store.update((entries) => {
 		// JsonStore may replay the mutator after lock-ownership recovery; diagnostics must describe
 		// the committed attempt, not accumulate counts from abandoned attempts.
 		addedHere = 0;
-		const identities = new Set(entries.map((entry) => entryIdentity(entry)));
 		const next = [...entries];
+		const held = byIdentity(next);
 		for (const entry of incoming) {
 			const identity = entryIdentity(entry);
-			if (identities.has(identity)) continue;
-			identities.add(identity);
-			next.push(entry);
+			const existing = held.get(identity);
+			if (existing === undefined) {
+				held.set(identity, { at: next.length, entry });
+				next.push(entry);
+				addedHere++;
+				continue;
+			}
+			const reconciled = reconcile(existing.entry, entry);
+			if (reconciled === existing.entry) continue;
+			next[existing.at] = reconciled;
+			held.set(identity, { at: existing.at, entry: reconciled });
 			addedHere++;
 		}
 		return next;
@@ -389,9 +502,10 @@ async function mergeImport<E extends { id: string }>(
 	report: MigrationReport,
 	sourcePath: string,
 	label: string,
+	reconcile: Reconcile<E>,
 ): Promise<boolean> {
 	try {
-		await merge(store, incoming, report);
+		await merge(store, incoming, report, reconcile);
 		return true;
 	} catch (err) {
 		if (!(err instanceof StoreCapacityError)) throw err;
@@ -408,27 +522,28 @@ async function importAliasFile(
 	now: (() => number) | undefined,
 	maxFileBytes: number,
 ): Promise<void> {
-	const raw = await readBounded(sourcePath, maxFileBytes, report, "scope alias");
-	if (raw === null) return;
+	if (!(await regularFileExists(sourcePath))) return;
 	report.filesScanned++;
 
 	if (kind === "ltm" || kind === "stm") {
 		const validate = kind === "ltm" ? validateLongMemory : validateShortMemory;
-		const parsed = parseLegacy<MemoryEntry>(raw, validate, sourcePath, report);
+		// Same `.bak` recovery as the legacy-root pass: nothing else ever opens the OLD alias filename
+		// (`mindPaths` only returns the new names), so this is the one pass that can rescue a torn one.
+		const parsed = await readLegacyStore<MemoryEntry>(sourcePath, validate, report, maxFileBytes);
 		if (parsed === null) return;
 		report.entriesSeen += parsed.entries.length;
 		report.invalidEntries += parsed.invalidEntries;
 		if (parsed.entries.length === 0) return;
-		await mergeImport(new JsonStore<MemoryEntry>(destinationPath, makeStoreOptions(validate, now, report)), parsed.entries, report, sourcePath, "scope alias");
+		await mergeImport(new JsonStore<MemoryEntry>(destinationPath, makeStoreOptions(validate, now, report)), parsed.entries, report, sourcePath, "scope alias", reconcileMemory);
 		return;
 	}
 
-	const parsed = parseLegacy<BacklogEntry>(raw, validateBacklog, sourcePath, report);
+	const parsed = await readLegacyStore<BacklogEntry>(sourcePath, validateBacklog, report, maxFileBytes);
 	if (parsed === null) return;
 	report.entriesSeen += parsed.entries.length;
 	report.invalidEntries += parsed.invalidEntries;
 	if (parsed.entries.length === 0) return;
-	await mergeImport(new JsonStore<BacklogEntry>(destinationPath, makeStoreOptions(validateBacklog, now, report)), parsed.entries, report, sourcePath, "scope alias");
+	await mergeImport(new JsonStore<BacklogEntry>(destinationPath, makeStoreOptions(validateBacklog, now, report)), parsed.entries, report, sourcePath, "scope alias", reconcileBacklog);
 }
 
 /**
@@ -552,16 +667,24 @@ export async function migrateLegacyRoot(agentDir: string, options: LegacyMigrati
 				const relativeFile = join(directory.relative, file.name);
 				const source = join(legacyRoot, relativeFile);
 				const destination = join(destinationRoot, relativeFile);
-				const stamp = await sourceStamp(source, destination, directory.kind);
-				const previous = stamp ? known.get(stamp.id) : undefined;
-				if (stamp && previous && sameStamp(stamp, previous) && (await regularFileExists(destination))) {
-					report.filesSkipped++;
-					continue;
-				}
-				report.filesScanned++;
-				if (await importFile(source, destination, directory.kind, report, options.now, maxFileBytes)) {
-					const committedStamp = stamp ?? (await sourceStamp(source, destination, directory.kind));
-					if (committedStamp) processed.push(committedStamp);
+				try {
+					const stamp = await sourceStamp(source, destination, directory.kind);
+					const previous = stamp ? known.get(stamp.id) : undefined;
+					if (stamp && previous && sameStamp(stamp, previous) && (await regularFileExists(destination))) {
+						report.filesSkipped++;
+						continue;
+					}
+					report.filesScanned++;
+					if (await importFile(source, destination, directory.kind, report, options.now, maxFileBytes)) {
+						const committedStamp = stamp ?? (await sourceStamp(source, destination, directory.kind));
+						if (committedStamp) processed.push(committedStamp);
+					}
+				} catch (err) {
+					// One destination's failure (a version skew, a lock timeout under two concurrent Pi
+					// starts, an EPERM on the Windows rename) belongs to THIS source. Letting it reach the
+					// directory catch aborts the iteration, and readdir order is stable — every later file
+					// would be stranded, unnamed, on every subsequent start.
+					warning(report, `legacy mind: could not import ${source}: ${String(err)}`);
 				}
 			}
 		} catch (err) {

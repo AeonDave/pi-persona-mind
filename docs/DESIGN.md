@@ -113,10 +113,12 @@ interface BacklogEntry {
   bounded process-local cache; injected realpath seams remain uncached.
 - **Compatibility:** a bounded, idempotent importer merges the superseded `pi-persona-mind` root and
   project aliases into current files under lock. Ambiguous persona aliases are explicit-command-only.
-  Exact-id/content conflicts keep the destination, while distinct same-id content is preserved; sources
-  are untouched. The legacy scan caps each pass at 256 JSON files and 4 MiB per source. A destination
-  capacity error is warned for that source and the remaining files continue. `/mind doctor` validates
-  stores read-only with the same bounded file/entry checks and never quarantines them.
+  A semantic-identity conflict is reconciled to the later record, while distinct same-id content is
+  preserved; sources are untouched. The legacy scan caps each pass at 256 JSON files and 4 MiB per
+  source. A per-file import failure is warned against that source and the remaining files continue;
+  a torn source is retried from its `.bak` sidecar and is stamped only if something was read.
+  `/mind doctor` validates stores read-only with the same bounded file/entry checks and never
+  quarantines them.
   A destination-side manifest records size plus filesystem change fingerprints for successfully
   imported legacy sources. Fresh Pi processes therefore stat and skip unchanged sources instead of
   rereading up to the full migration byte budget; a changed source or missing destination is retried.
@@ -408,8 +410,16 @@ commands and the injected `<persona-mind>` fence are untouched — only the dire
   writes, source bytes never rewritten or removed — with the two roots swapped. `/mind doctor` names
   the `pi-`prefixed root as the legacy one.
 - **Both roots may hold data**, because 0.6.x itself imported from an unprefixed root. That case is a
-  merge, not a rename: entries present only on one side are appended, semantically identical entries
-  are dropped, and a true collision keeps the destination's record. Re-running is a no-op.
+  merge, not a rename: entries present only on one side are appended, and a collision is reconciled to
+  the LATER record. It cannot be resolved by side: the root the flip promotes to destination is exactly
+  the pre-0.6 snapshot the 0.6.x importer drained and left populated, so "the destination wins" would
+  hand every field to the superseded copy. Memory reuses `upsertMemory`'s live rule — the destination
+  keeps `id`/`recordedAt`, the copy with the later `lastSeenAt` supplies the rest — so a dead
+  `expiresAt` can no longer re-expire a live short-term memory. The backlog reconciles by lifecycle
+  progress (`open` → `taken` → `done`/`dropped`), so a terminal state, its note and its already
+  acknowledged wake survive in either direction; `state` stays out of the content id, which would
+  otherwise split one lead into an open row and a done row that the ambiguity guards then refuse to
+  act on. Re-running is a no-op.
 - **The 0.6.x manifest is inert, not misleading.** `.legacy-import-v1.json` lived at the *destination*
   root, which the flip turns back into the *source* root. It cannot cause a wrong skip or a wrong
   re-import for two independent reasons: a stamp id is `sha256(source\0destination)` and both fields
