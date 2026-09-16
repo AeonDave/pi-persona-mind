@@ -1020,6 +1020,28 @@ test("the backlog tool queues and lists an item through the Pi surface", async (
 
 const plainTheme = { fg: (_name: string, text: string) => text, bold: (text: string) => text };
 
+test("memory saves show one useful line and retain the machine-readable receipt", async () => {
+	const m = mockPi();
+	createExtension(m.pi, { agentDir: join(dir, "save-card", "agent") });
+	const ctx = ctxFor(join(dir, "save-card", "proj"));
+	const memory = m.tools.get("memory");
+	assert.ok(memory?.renderResult);
+	for (const term of ["long", "short"] as const) {
+		const saved = await memory.execute(`save-${term}`, {
+			action: "remember", term, kind: "preference", text: "Prefers concise answers.",
+		}, undefined, undefined, ctx);
+		assert.equal(saved.details.ok, true);
+		assert.equal(typeof saved.details.id, "string");
+		assert.ok(saved.content[0]?.text.includes(String(saved.details.id)), "the model can still address the saved fact");
+		for (const expanded of [false, true]) {
+			const visible = memory.renderResult(saved, { expanded }, plainTheme).render(200).map((line) => line.trimEnd()).join("\n");
+			assert.equal(visible, `${term === "long" ? "Long" : "Short"}-term saved — Prefers concise answers.`);
+		}
+	}
+	const legacy = { content: [{ type: "text", text: "Remembered abb181b69cfb — long-term preference. It will re-appear in your context." }], details: { ok: true, id: "abb181b69cfb" } };
+	assert.equal(memory.renderResult(legacy, { expanded: false }, plainTheme).render(200).map((line) => line.trimEnd()).join("\n"), "Long-term saved", "resumed old receipts also stay concise");
+});
+
 test("memory recall stays complete for the model but collapses the human card", async () => {
 	const m = mockPi();
 	createExtension(m.pi, { agentDir: join(dir, "mem-card", "agent") });
@@ -1032,9 +1054,9 @@ test("memory recall stays complete for the model but collapses the human card", 
 	const recalled = await memory.execute("recall", { action: "recall", max: 8 }, undefined, undefined, ctx);
 	assert.match(recalled.content[0]?.text ?? "", /recalled/);
 	assert.ok((recalled.content[0]?.text.split("\n").length ?? 0) > 4, "the model still sees every recalled line");
-	const collapsed = memory.renderResult(recalled, { expanded: false }, plainTheme).render(200).join("\n");
-	const expanded = memory.renderResult(recalled, { expanded: true }, plainTheme).render(200).join("\n");
-	assert.match(collapsed, /^memory/m);
+	const collapsed = memory.renderResult(recalled, { expanded: false }, plainTheme).render(200).map((line) => line.trimEnd()).join("\n");
+	const expanded = memory.renderResult(recalled, { expanded: true }, plainTheme).render(200).map((line) => line.trimEnd()).join("\n");
+	assert.doesNotMatch(collapsed, /^memory$/m, "the result does not repeat Pi's call title");
 	assert.ok(collapsed.split("\n").length < expanded.split("\n").length, "the collapsed card is shorter than the expanded card");
 	assert.match(collapsed, /to expand|ctrl\+o/i);
 	assert.doesNotMatch(collapsed, /durable fact 0/, "older recall lines stay behind the expand key");
@@ -1051,9 +1073,9 @@ test("backlog list collapses the human card the same way", async () => {
 		await backlog.execute(`a${i}`, { action: "add", text: `lead ${i} ${"y".repeat(60)}` }, undefined, undefined, ctx);
 	}
 	const listed = await backlog.execute("list", { action: "list" }, undefined, undefined, ctx);
-	const collapsed = backlog.renderResult(listed, { expanded: false }, plainTheme).render(200).join("\n");
-	const expanded = backlog.renderResult(listed, { expanded: true }, plainTheme).render(200).join("\n");
-	assert.match(collapsed, /^backlog/m);
+	const collapsed = backlog.renderResult(listed, { expanded: false }, plainTheme).render(200).map((line) => line.trimEnd()).join("\n");
+	const expanded = backlog.renderResult(listed, { expanded: true }, plainTheme).render(200).map((line) => line.trimEnd()).join("\n");
+	assert.doesNotMatch(collapsed, /^backlog$/m, "the shared result renderer does not repeat Pi's call title");
 	assert.ok(collapsed.split("\n").length < expanded.split("\n").length);
 	assert.match(collapsed, /to expand|ctrl\+o/i);
 	assert.match(expanded, /lead 5/);

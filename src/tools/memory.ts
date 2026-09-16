@@ -10,7 +10,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-import { renderExpandableCard, toolResultText } from "../ui/presentation.ts";
+import { renderExpandableResult, toolResultText } from "../ui/presentation.ts";
 
 import {
 	clampRecallMax,
@@ -110,7 +110,17 @@ export function registerMemoryTool(pi: ExtensionAPI, getMind: GetMind): void {
 			}
 		},
 		renderResult(result, { expanded }, theme) {
-			return renderExpandableCard("memory", toolResultText(result), expanded, theme);
+			const body = toolResultText(result);
+			const details = result.details && typeof result.details === "object" ? result.details as Record<string, unknown> : undefined;
+			// Recognize old receipts too, so reopening a session does not restore the noisy card.
+			const savedTerm = details?.ok === true ? /^Remembered \S+ — (long|short)-term /.exec(body)?.[1] : undefined;
+			if (savedTerm) {
+				const summary = typeof details?.summary === "string"
+					? details.summary
+					: `${savedTerm === "long" ? "Long" : "Short"}-term saved`;
+				return renderExpandableResult(summary, true, theme);
+			}
+			return renderExpandableResult(body, expanded, theme);
 		},
 	});
 }
@@ -129,7 +139,11 @@ async function runMemoryAction(mind: MindService, params: MemoryToolParams): Pro
 		if (params.derivedFrom) input.derivedFrom = params.derivedFrom;
 		const r = await mind.remember(input);
 		return r.ok
-			? say(`Remembered ${r.entry.id} — ${r.entry.expiresAt ? "short" : "long"}-term ${params.kind}. It will re-appear in your context.`, { id: r.entry.id, ok: true })
+			? say(`Remembered ${r.entry.id} — ${r.entry.expiresAt ? "short" : "long"}-term ${params.kind}. It will re-appear in your context.`, {
+				id: r.entry.id,
+				ok: true,
+				summary: `${r.entry.expiresAt ? "Short" : "Long"}-term saved — ${compactMemoryText(r.entry.text, 80)}`,
+			})
 			: say(`Not stored: ${r.reason}`, { ok: false, reason: r.reason });
 	}
 

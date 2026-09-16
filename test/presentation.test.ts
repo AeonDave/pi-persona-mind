@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { compactVisibleText, renderExpandableCard, toolResultText } from "../src/ui/presentation.ts";
+import { compactVisibleText, renderExpandableCard, renderExpandableResult, toolResultText } from "../src/ui/presentation.ts";
 
 const theme = { fg: (_name: string, text: string) => text, bold: (text: string) => text };
 
@@ -23,15 +23,18 @@ test("compactVisibleText leaves a short result untruncated", () => {
 	assert.equal(preview.text, "Remembered abc — long-term note.");
 });
 
-test("renderExpandableCard is lossless when expanded and bounded when collapsed", () => {
+test("tool results omit the title while standalone cards retain it", () => {
 	const body = ["10 recalled of 12:", ...Array.from({ length: 10 }, (_, i) => `- [${i}] (note) fact ${i}`)].join("\n");
-	const collapsed = renderExpandableCard("memory", body, false, theme).render(200).join("\n");
-	const expanded = renderExpandableCard("memory", body, true, theme).render(200).join("\n");
-	assert.match(collapsed, /^memory/);
+	const collapsed = renderExpandableResult(body, false, theme).render(200).map((line) => line.trimEnd()).join("\n");
+	const expanded = renderExpandableResult(body, true, theme).render(200).map((line) => line.trimEnd()).join("\n");
+	assert.doesNotMatch(collapsed, /^memory(?:\n|$)/, "Pi already renders the tool title above this result");
+	assert.doesNotMatch(expanded, /^memory(?:\n|$)/);
 	assert.match(collapsed, /to expand|ctrl\+o/i);
 	assert.ok(collapsed.split("\n").length < expanded.split("\n").length);
 	assert.match(expanded, /fact 9/);
 	assert.doesNotMatch(collapsed, /fact 9/);
+	const wake = renderExpandableCard("backlog wake", "A saved reminder is due.", false, theme).render(200).map((line) => line.trimEnd()).join("\n");
+	assert.equal(wake, "backlog wake\nA saved reminder is due.");
 });
 
 test("toolResultText reads the first text part", () => {

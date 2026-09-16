@@ -10,7 +10,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-import { renderExpandableCard, toolResultText } from "../ui/presentation.ts";
+import { renderExpandableResult, toolResultText } from "../ui/presentation.ts";
 
 import type { BacklogAddInput, BacklogListOptions, MindService } from "../core/service.ts";
 import { clampBacklogMax, MAX_BACKLOG_ID_CHARS, MAX_BACKLOG_NOTE_CHARS, MAX_BACKLOG_TAGS, MAX_BACKLOG_TAG_CHARS, MAX_BACKLOG_TEXT_CHARS } from "../core/backlog.ts";
@@ -120,7 +120,7 @@ export function registerBacklogTool(pi: ExtensionAPI, getMind: GetMind): void {
 				: say(`Not updated: ${r.reason ?? `backlog item "${params.id}" does not exist or cannot transition to ${state}`}.`, { ok: false, reason: r.reason ?? "invalid state transition" });
 		},
 		renderResult(result, { expanded }, theme) {
-			return renderExpandableCard("backlog", toolResultText(result), expanded, theme);
+			return renderExpandableResult(toolResultText(result), expanded, theme);
 		},
 	});
 }

@@ -72,14 +72,23 @@ export function expandDetailHint(): string {
 	}
 }
 
-/** Collapsed-by-default transcript card; expansion is lossless against sanitized `body`. */
-export function renderExpandableCard(label: string, body: string, expanded: boolean, theme: CardTheme): Text {
-	const title = theme.fg("accent", theme.bold(label));
+function formatExpandableBody(body: string, expanded: boolean, theme: CardTheme): string {
 	const full = sanitizeCardText(body).trim() || "(no output)";
-	if (expanded) return new Text(`${title}\n${theme.fg("toolOutput", full)}`, 0, 0);
+	if (expanded) return theme.fg("toolOutput", full);
 	const preview = compactVisibleText(full);
 	const hint = preview.truncated ? `\n${theme.fg("dim", expandDetailHint())}` : "";
-	return new Text(`${title}\n${theme.fg("toolOutput", preview.text)}${hint}`, 0, 0);
+	return `${theme.fg("toolOutput", preview.text)}${hint}`;
+}
+
+/** Result body only: Pi renders the call title. Expansion is lossless against sanitized `body`. */
+export function renderExpandableResult(body: string, expanded: boolean, theme: CardTheme): Text {
+	return new Text(formatExpandableBody(body, expanded, theme), 0, 0);
+}
+
+/** Standalone entries such as backlog wakes have no Pi tool title and still need their own. */
+export function renderExpandableCard(label: string, body: string, expanded: boolean, theme: CardTheme): Text {
+	const title = theme.fg("accent", theme.bold(label));
+	return new Text(`${title}\n${formatExpandableBody(body, expanded, theme)}`, 0, 0);
 }
 
 export function toolResultText(result: { content?: ReadonlyArray<{ type: string; text?: string }> }): string {
