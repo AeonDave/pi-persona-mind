@@ -1,5 +1,25 @@
 # pi-persona-mind — Design
 
+## Current host and lifecycle contract
+
+- Pi 1.0.0+ and Node 22.19.0+ are the supported floor. Host packages/typebox remain wildcard peers,
+  not runtime dependencies; all four development host packages are pinned to the qualified floor.
+- Session-local capture notices, hint deduplication, empty-store announcements and nested-call
+  provenance reset on start/shutdown. Generations suppress late UI/prompt callbacks. A user capture
+  accepted before replacement still completes in the original scope, never the new session's store.
+- Input without a capture cue does not wait for migration or scope reconciliation. Explicit captures
+  still await the bounded migration path before their deterministic write.
+- Nested tool results reach only their caller in Pi 1.0. A blocked nested report can suggest backlog
+  capture only when its outer, model-visible result relays the marker. Provenance is bounded to 256
+  parent call IDs and cleared at lifecycle boundaries.
+- `pi-persona-deferred-input` is a reserved trusted-extension convention for queued user input, not
+  authentication against arbitrary extensions that already execute with the same filesystem access.
+- Wakes remain display-only; storage migration remains non-destructive. Raising the host floor
+  never deletes user data or removes the importer.
+
+Real SDK regressions load the extension through Pi's public loader, use the host agent/tool pipeline
+and an offline provider, and isolate auth/model/cache/profile/workspace paths from the operator.
+
 A standalone Pi extension that gives a Pi supervisor a **durable, persona-aware mind**:
 three memory faculties on one cross-OS atomic store, captured deliberately and re-injected
 into context every turn so they survive **compaction** and **session restart**.

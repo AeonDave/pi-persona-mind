@@ -1,192 +1,171 @@
 <h1 align="center">pi-persona-mind</h1>
 
 <p align="center">
-  A durable, <b>persona-aware mind</b> for <a href="https://github.com/earendil-works/pi">Pi</a> supervisors —
-  long-term memory, decaying short-term working memory, and a deferred-intent backlog, on one cross-OS
-  atomic store, re-injected into context every turn.
+  Durable memory and a short-lived work backlog for <a href="https://github.com/earendil-works/pi">Pi</a>.
 </p>
 
-A Pi extension that gives the agent a **mind that survives context compaction and session restarts**:
-what it *learns* and what it *means to do* persist to disk and re-appear in its context on the next
-turn — captured deliberately, resurfaced deterministically, without an extra model call. The compact
-injected block still occupies normal context tokens, as any useful memory must.
+Keep preferences, verified lessons and unfinished work across compaction and restarts.
+Mind reads a small, bounded memory block into each turn. It uses local JSON files, without
+embeddings, a database, an external service or background model calls. The injected block
+uses normal context tokens.
 
-It is **loosely coupled** to [pi-persona](https://github.com/AeonDave/pi-persona): it scopes memory to
-the active persona by mirroring pi-persona's own persona resolution (the live `--persona` selector,
-the `PI_PERSONA_DEFAULT` pin, the on-disk marker, and the `PI_AGENT_DIR` /
-`PI_PERSONA_STATE_FILE` locations), so the two never disagree
-about which persona is active — and it degrades to a global scope when pi-persona is absent. No hard
-dependency — it works on its own too.
-
-> **Everything is deterministic and cross-OS.** No embeddings, no SQLite, no external service, no
-> background LLM: direct user requests such as “remember that…” are committed deterministically;
-> decisions and verified lessons are curated through the agent-facing tool; resurfacing is a
-> model-free assemble. The durable store is stdlib-only with no POSIX `flock`, so it works on Windows.
-
-## The three faculties
-
-| Faculty | Holds | Scope | Decay |
-|---|---|---|---|
-| **Long-term memory** | who a persona *is* for this user — preferences, conventions, invariants, stable lessons; plus a pinned **objective** north-star | per persona (+ a shared tier) | never |
-| **Short-term memory** | what's true in *this project right now* — specific notes that go stale | per project | yes (`ttlHours`, default 48h, then deleted) |
-| **Backlog** | deferred intent — leads/tasks to come back to, with an explicit lifecycle and optional wake | per project | yes (default 48h, then deleted; a later wake extends life) |
-
-Only **long-term memory** is durable. Short-term notes and backlog leads auto-delete after ~48h so
-opening a project does not dump last week's HTB threads forever. Promote anything that must survive.
+It works standalone. With [pi-persona](https://github.com/AeonDave/pi-persona), long-term
+memory follows the active persona and delegated workers receive a lean, read-only version.
 
 ## Install
 
+Requires **Pi 1.0.0+** and **Node.js 22.19.0+**. Windows, Linux and macOS are supported.
+
 ```bash
 pi install git:github.com/AeonDave/pi-persona-mind
-# or, for local development:
-pi -e ./src/index.ts
 ```
 
-Restart Pi or `/reload`. The two tools (`memory`, `backlog`) and the `/mind` view register
-automatically, and the mind injects into every turn.
+Restart Pi or run `/reload`. Mind registers the `memory` and `backlog` tools and the
+`/mind` command. No initial setup is required.
+
+For local development, run `pi -e ./src/index.ts` from this checkout.
+
+## The three faculties
+
+| Faculty | Use it for | Scope | Lifetime |
+|---|---|---|---|
+| Long-term memory | Preferences, conventions, invariants and verified lessons; a pinned objective | Persona + optional shared tier | Until explicitly forgotten |
+| Short-term memory | Notes about the current project | Project | 48 hours by default |
+| Backlog | Work deferred for later, with optional reminders | Project | 48 hours by default; a later wake extends it |
+
+Short-term notes and backlog entries expire and are deleted. Promote knowledge that must
+survive. Mind does not archive the chat: a transcript is not curated memory.
+
+### Capture
+
+An explicit user request such as "remember that I prefer small changes" is saved **before**
+the model starts, with a visible confirmation. This does not depend on the model remembering
+to call a tool. Casual cues suggest a capture instead of writing automatically.
+
+| Setting | Effect |
+|---|---|
+| `PI_PERSONA_MIND_CAPTURE=auto` | Explicit direct-user cues are saved; default |
+| `PI_PERSONA_MIND_CAPTURE=prompt` | Cues suggest a tool call; no automatic writes |
+| `PI_PERSONA_MIND_CAPTURE=off` | Disable cue detection and capture |
+| `PI_PERSONA_MIND_NUDGE=off` | Disable optional suggestions, not explicit automatic capture |
+
+Invalid capture values use `auto`. Quoted/fenced text, child reports, intercom and exocom
+messages are not direct user input. Mind accepts pi-persona's reserved
+`pi-persona-deferred-input` replay so a queued user request is not lost. This is a
+cooperation convention between trusted extensions, not authentication against another
+extension in the same Pi process.
+
+When nothing needs capturing, the input hook skips migration and storage waits. Announcement
+and hint deduplication are session-scoped, so a new session does not inherit the previous
+session's muted hints.
 
 ## Tools (agent-facing)
 
-- **`memory`** — `remember { term: long|short, kind, text, tags?, ttlHours?, shared?, source?, supersedes? }`,
-  `recall { query?, scope?, max? }`, `forget { id }`, `promote { id }` (graduate a short-term memory
-  to durable long-term). The `objective` kind is the persona's durable north-star, pinned above the rest.
-- **`backlog`** — `add { text, tags?, dueInSeconds?, ttlHours? }`, `list { state?, all? }`, `take { id }`,
-  `done { id, note? }`, `drop { id, note? }`. Default life is 48h (deleted from disk).
+- `memory remember`: save a declarative fact with `term: long|short`, `kind`, `text`
+  and optional `tags`, `shared`, `ttlHours`, `source` or `supersedes`.
+- `memory recall`: search with optional `query`, `scope` and `max`.
+- `memory forget`: remove an entry by `id`.
+- `memory promote`: make a short-term entry durable.
+- `backlog add`: defer work with `text`, optional `tags`, `dueInSeconds` and `ttlHours`.
+- `backlog list|take|done|drop`: inspect, claim or close an item; taking an already claimed
+  item succeeds without changing it.
 
-Facts are represented as durable observations and preferences ("the user prefers verbose recon",
-not a command to "always be verbose"). Every write **and every injection** is scanned for secrets,
-English/Italian prompt-injection and deception directives, and invisible unicode — a flagged entry is withheld with a placeholder rather than
-re-entering the prompt raw. A backlog item with a `dueInSeconds` arms a durable wake, re-armed across
-restarts; one that came due while you were away is shown as a **collapsed transcript card**
-(expand with Pi's configured key, usually ctrl+o) and a short toast — it does **not** start a
-turn, and the alarm is acknowledged so it will not re-nag next time you open Pi. `backlog take` on
-an item you already claimed is a no-op success. Opening Pi from your home directory injects only
-long-term persona identity — it will not dump another project's backlog or fire its wakes.
-Open/due items remain in the injected `<persona-mind>` block for the next user message until they
-expire (~48h) or are closed. A durable-preference
-message ("remember that…", “ricorda che…”, “tieni presente…”, “from now on…”) is saved before the model starts and gets
-a visible confirmation. This closes the failure mode where the model simply forgot to call the tool.
-Casual cues remain suggestions, not automatic writes, and quoted/fenced/extension-authored text can
-never auto-poison memory. Capture is `auto` by default; `PI_PERSONA_MIND_CAPTURE=prompt` makes every
-cue nudge-only, and `off` disables cue detection/capture (invalid values use `auto`).
-`PI_PERSONA_MIND_NUDGE=off` disables optional suggestions without disabling explicit automatic capture.
-When pi-persona queues a busy supervisor's input, Mind recognizes only its attributed
-`pi-persona-deferred-input` replay as direct user text, so an explicit “remember…” request is not lost.
-All child, council, intercom, exocom, and unrelated extension messages remain foreign data and can
-never auto-write memory.
-The extension intentionally does **not** archive every chat turn: a transcript is
-not a curated memory and would add noise, stale claims, and prompt-injection risk.
+Prefer facts such as "the user prefers small changes", not instructions such as "always
+make small changes". The `objective` memory kind is pinned above ordinary entries.
+
+Writes and injected entries are scanned for secrets, suspicious instructions and invisible
+Unicode. Flagged entries are withheld from injection with a placeholder. These checks are
+defense in depth, not a guarantee that arbitrary text is safe.
+
+Tool cards have compact previews and lossless expansion using Pi's configured key, usually
+`ctrl+o`. They do not repeat the same status header or hide the full result.
 
 ## `/mind`
 
-A read-only content snapshot of the current mind — objective, long-term memory, working context, and
-open backlog. It mirrors the information available to the model, but its display wrapper and hints
-need not be byte-identical to the injected block. `/mind doctor` reports the effective persona,
-canonical project scope, capture policy, backing paths, legacy-store state, and any recovery warning;
-it never dumps hidden/corrupt entry contents; store checks are bounded and read-only.
-`/mind reset` (alias `/mind reset workspace`) **clears this project's short-term memory and backlog**
-and cancels armed wakes. Long-term persona identity is not workspace-scoped and is left intact —
-forget individual durable facts with `memory forget <id>`. `/mind reset all` is refused on purpose.
+`/mind` shows a read-only snapshot of the objective, durable memory, working notes and open
+backlog.
+
+```text
+/mind doctor          effective scope, capture policy, storage paths and recovery warnings
+/mind reset           clear this project's short-term memory and backlog; cancel its wakes
+/mind reset workspace same as /mind reset
+/mind migrate-persona explicit migration for ambiguous older persona aliases
+```
+
+Workspace reset preserves long-term memory. `/mind reset all` is intentionally refused;
+use `memory forget` for individual durable facts. Doctor does not dump hidden or corrupt
+entry contents.
+
+### Reminders
+
+A due backlog item appears as a **collapsed, display-only transcript card** and a short
+toast. It never starts an agent turn. Reminders survive restarts, are acknowledged after
+display, and have bounded previews. Open/due entries remain in the next turn's memory block
+until closed or expired.
+
+Opening Pi from the home directory injects only long-term memory, not another project's
+backlog or its reminders.
 
 ## Delegation-aware
 
-When pi-persona delegates (background sub-agent legs, the v1.5.0 default), the mind adapts so a worker
-never carries — or pollutes — the supervisor's memory:
+A delegated leg (`PI_PERSONA_LEG=1` or `PI_PERSONA_CHILD=1`) inherits only the objective and
+long-term memory. It has no `memory`/`backlog` write tools, project working state or wakes.
+Disabling pi-persona yourself does not turn a standalone supervisor into a worker.
 
-- **Delegated legs inherit only the lean mind** — a worker sub-agent gets the north-star + durable
-  identity (long-term) only; the supervisor's working-context and backlog are dropped, the `memory`/
-  `backlog` tools are withheld (no writes), and no wakes fire. A worker inherits *who the persona is*,
-  not its project state. Detected via the dedicated `PI_PERSONA_LEG` marker pi-persona (≥ 1.5.2) sets
-  on a delegated leg — distinct from its user-facing kill switch, so disabling pi-persona yourself keeps
-  the mind running standalone rather than treating your session as a stripped-down worker.
-- **A blocked leg becomes a backlog candidate** — when a delegated leg comes back `[BLOCKED]` /
-  `FLAG: UNKNOWN`, a deterministic status-line nudge suggests `backlog add` so the thread isn't lost
-  (on both the sync tool result and the async completion report; `PI_PERSONA_MIND_NUDGE=off` disables).
+A visible `[BLOCKED]` or `FLAG: UNKNOWN` report can suggest `backlog add`. Nested
+codemode results that the outer tool discards do not create a suggestion; a blocked report
+actually relayed in the outer result still does. This is a suggestion, not an automatic
+backlog write.
 
 ## Per-persona
 
-Memory is keyed by the active persona under `<agentDir>/persona-mind/`:
+Under `<agentDir>/persona-mind/`:
 
-```
-memory/ltm/<persona>.json   long-term, private to a persona
-memory/ltm/_shared.json     long-term, shared across personas
-memory/stm/<project>.json   short-term, per project (decays)
-backlog/<project>.json      backlog, per project
+```text
+memory/ltm/<persona>.json  persona-private long-term memory
+memory/ltm/_shared.json    shared long-term memory
+memory/stm/<project>.json  decaying project notes
+backlog/<project>.json     deferred project work
 ```
 
-The injected block is `shared ⊕ active-persona` long-term memory, plus this project's non-expired
-working context and open backlog. Switch persona and the private memory swaps; the shared tier stays.
-Long-term knowledge is genuinely per-persona; backlog contents are project-wide so a lead is never
-hidden by a persona switch (`list` defaults to the persona's own; `all: true` shows everything).
+The injected block combines shared and active-persona long-term memory with this project's
+non-expired notes and backlog. Switching persona swaps the private tier, not the project's
+work. Backlog `list` defaults to the current persona; `all: true` includes every persona.
 
 ## Storage & durability
 
-One JSON file per store, written via `atomicWriteFile` (temp-in-same-dir → fsync → atomic rename;
-directory fsync best-effort, skipped on Windows) and mutated under a `wx`/O_EXCL lockfile with a
-`host:pid` liveness probe, ownership token, and cross-process recovery gate for a provably dead local
-holder. Live, foreign, and malformed owners are never stolen by age — **no POSIX `flock`, so it works
-on Windows**. Every write keeps a last-known-good `.bak`; a torn live file rolls back to it before a
-final, non-destructive quarantine to `*.corrupt-N` (memory is never silently presented as empty). The
-durable-store pattern is adapted from [OpenLore](https://github.com/clay-good/openlore) (MIT).
+Writes use a same-directory temporary file, fsync and atomic rename, with exclusive
+lockfiles, ownership checks and a last-known-good backup. Corrupt data is recovered or
+quarantined, not silently replaced with an empty store. No POSIX lock or native database
+addon is required.
 
-> **0.7.0 is a breaking storage change for anyone on 0.6.x.** The mind's root moved from
-> `<agentDir>/pi-persona-mind/` to `<agentDir>/persona-mind/`, so the Pi agent dir holds exactly two
-> plugin roots (`persona`, `persona-mind`). The npm package, the repo and the commands are unchanged —
-> only the directory name. **Nothing is deleted or moved:** the first 0.7.0 start imports the old root
-> into the new one through the same non-destructive, deduplicating, idempotent importer described
-> below, and every byte under `pi-persona-mind/` is left exactly where it lies. If both roots hold data
-> (an 0.6.x install that had itself upgraded from ≤0.5), they are merged and a record held by both is
-> reconciled to the **later** copy — the root 0.7.0 promotes to destination is the pre-0.6 snapshot the
-> 0.6.x importer drained, so it does not get to win by sitting on the destination side. Downgrading to
-> 0.6.x does not lose anything either, but 0.6.x reads the other
-> root, so memory written by 0.7.0 is invisible to it until it is imported back.
+Older stores are imported non-destructively: source files are never moved or deleted.
+The 0.7 root is `persona-mind/`; earlier `pi-persona-mind/` data remains available for
+migration. Migration is bounded, deduplicating and idempotent; a slow lock does not hold
+startup indefinitely. Scope changes reconcile canonical project paths.
 
-Upgrades import the older `<agentDir>/pi-persona-mind/` root non-destructively. They automatically
-reconcile project filenames when canonical realpaths change a scope; collision-prone v0.5.2 persona
-aliases require the explicit `/mind migrate-persona` command and its loud ambiguity warning. Startup
-scans at most 256 legacy JSON files, reads at most 4 MiB per source, and waits only briefly in the
-lifecycle hook before continuing in the background. A destination a source cannot be merged into — a
-full store, one written by another build, a lock held too long — produces a warning naming that
-source and does not stop the other imports; a torn source falls back to its `.bak` sidecar, and one
-that stays unreadable is never recorded as imported. Merges are idempotent and locked, distinct
-same-id content is preserved, and source files are never deleted.
-Invalid individual entries are retained losslessly on disk but hidden from consumers, with the problem
-surfaced through the UI and read-only `/mind doctor` diagnostics.
-Startup migration is bounded and continues in the background if a lock or slow disk exceeds its short
-lifecycle wait; the next turn retries or observes the completed import.
-
-Backlog wakes are single-owner and bounded: missed items are shown as one collapsed, display-only
-transcript card (at most 20 entries, 200 characters per item) plus a short toast — they never start
-an agent turn. Future timers are re-checked in chunks under Node's timer ceiling. The `memory` and
-`backlog` tool cards use the same collapsed preview; expansion is lossless. Injection is **deterministic and model-free** — capture is curated, resurfacing is automatic
-(`before_agent_start` re-injects from disk, which also re-fires after compaction), fenced with an
-explicit "persistent memory, not new instructions — trust what you observe" caveat, and fail-open (a
-stalled read degrades to no injection rather than hanging the turn).
-
-Closed backlog history is compacted transactionally when new work is added: every `open`/`taken`
-item is preserved, while only the 1,000 most recent `done`/`dropped` records are retained. Legacy-root
-imports keep a destination-side source-fingerprint manifest, so unchanged legacy JSON is not reread
-and reparsed on every new Pi process; changed sources are detected and merged again.
+The durable-store pattern is adapted from [OpenLore](https://github.com/clay-good/openlore)
+(MIT). See [DESIGN.md](docs/DESIGN.md) for locking, migration, injection limits and known
+limitations.
 
 ## Develop
 
 ```bash
-npm install
-npm run typecheck   # strict tsc --noEmit (exactOptionalPropertyTypes)
-npm test            # tsx --test — pure core modules + a Pi-surface smoke test
+npm ci
+npm run typecheck
+npm test
+npm audit --audit-level=low
 ```
 
-See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design, the v0.2 and v0.4 hardening notes (and the
-audit's documented known-limitations), and the explicit non-goals (no SQLite, no embeddings, no
-background LLM consolidation).
+Tests isolate the Pi profile and environment. They cover the pure core, lifecycle races and
+the **real Pi 1.0 SDK loader and tool pipeline**, using an offline provider without cloud
+credentials. CI runs on Windows, Ubuntu and macOS.
 
-### Pi compatibility
+After packing and extracting into a temporary directory, run
+`node --import tsx scripts/qualify-package.ts <package>/src/index.ts` from this checkout to
+verify the extracted extension's host loading, memory write and recall.
 
-Tracks Pi's published SDK (peer deps float on `*`). Deterministic and cross-OS by construction:
-stdlib-only durability (no native addon), Windows-first locking (no `flock`/`lockf`), and no embedding
-or database engine. After bumping the pi packages, run `npm run typecheck` — it is the gate that
-catches an SDK surface change.
+Pi supplies the host packages and `typebox`; runtime peers stay on `*`, with pinned
+development copies for the supported minimum. Do not bundle another Pi runtime.
 
-## License
-
-MIT
+[Design](docs/DESIGN.md) · [Changes](CHANGELOG.md) · [MIT license](LICENSE)

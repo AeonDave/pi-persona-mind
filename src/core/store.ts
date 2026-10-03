@@ -60,8 +60,11 @@ export interface AtomicWriteOptions {
 export type BoundedReadFailureKind = "bytes" | "entries" | "path";
 
 export class BoundedReadFailure extends Error {
-	constructor(readonly kind: BoundedReadFailureKind, message: string) {
+	readonly kind: BoundedReadFailureKind;
+
+	constructor(kind: BoundedReadFailureKind, message: string) {
 		super(message);
+		this.kind = kind;
 		this.name = "BoundedReadFailure";
 	}
 }
@@ -73,16 +76,28 @@ export class BoundedReadFailure extends Error {
  * or a migration — runs. Failing loudly is the only non-destructive answer available.
  */
 export class StoreVersionError extends Error {
-	constructor(readonly found: number, readonly expected: number) {
+	readonly found: number;
+	readonly expected: number;
+
+	constructor(found: number, expected: number) {
 		super(`mind store version ${found} was written by a different pi-persona-mind build (this one reads version ${expected}); the file is left untouched`);
+		this.found = found;
+		this.expected = expected;
 		this.name = "StoreVersionError";
 	}
 }
 
 /** Thrown before an update writes a store that the next bounded load would reject. */
 export class StoreCapacityError extends Error {
-	constructor(readonly kind: "bytes" | "entries", readonly actual: number, readonly limit: number) {
+	readonly kind: "bytes" | "entries";
+	readonly actual: number;
+	readonly limit: number;
+
+	constructor(kind: "bytes" | "entries", actual: number, limit: number) {
 		super(`mind store capacity: ${kind} ${actual} exceeds limit ${limit}`);
+		this.kind = kind;
+		this.actual = actual;
+		this.limit = limit;
 		this.name = "StoreCapacityError";
 	}
 }
@@ -682,15 +697,19 @@ export interface JsonStoreOptions<E> {
  * version and the CAS sequence.
  */
 export class JsonStore<E> {
+	readonly filePath: string;
+	private readonly opts: JsonStoreOptions<E>;
 	private readonly now: () => number;
 	private readonly onWarn: (message: string) => void;
 	private readonly maxBytes: number;
 	private readonly maxEntries: number;
 
 	constructor(
-		readonly filePath: string,
-		private readonly opts: JsonStoreOptions<E>,
+		filePath: string,
+		opts: JsonStoreOptions<E>,
 	) {
+		this.filePath = filePath;
+		this.opts = opts;
 		this.now = opts.now ?? Date.now;
 		this.onWarn = opts.onWarn ?? (() => {});
 		this.maxBytes = opts.maxBytes ?? DEFAULT_STORE_MAX_BYTES;

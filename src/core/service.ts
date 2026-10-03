@@ -145,6 +145,7 @@ function validPositiveFutureOffset(value: number | undefined, unitMs: number, no
 }
 
 export class MindService {
+	private readonly scope: Scope;
 	private readonly now: () => number;
 	private readonly budget: MindBudget | undefined;
 	private readonly ltm: JsonStore<MemoryEntry>;
@@ -155,9 +156,10 @@ export class MindService {
 	private readonly warn: (message: string) => void;
 
 	constructor(
-		private readonly scope: Scope,
+		scope: Scope,
 		opts: MindServiceOptions = {},
 	) {
+		this.scope = scope;
 		this.now = opts.now ?? Date.now;
 		this.budget = opts.budget;
 		this.warn = opts.onWarn ?? (() => {});

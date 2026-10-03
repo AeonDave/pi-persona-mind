@@ -5,12 +5,12 @@ import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, before, test } from "node:test";
 
-import { createExtension, ownerIsStale } from "../src/index.ts";
+import { createExtension, isSupportedPiVersion, ownerIsStale } from "../src/index.ts";
 import { makeBacklog } from "../src/core/backlog.ts";
 import { contentId, legacyContentId } from "../src/core/ids.ts";
 import { makeMemory } from "../src/core/memory.ts";
 import { projectSlug } from "../src/core/scope.ts";
-import type { MindService } from "../src/core/service.ts";
+import { MindService } from "../src/core/service.ts";
 
 type WakeStateForTest = Awaited<ReturnType<MindService["backlogList"]>>;
 
@@ -77,6 +77,17 @@ before(async () => {
 });
 after(async () => {
 	await rm(dir, { recursive: true, force: true });
+});
+
+test("the Pi host floor comparison accepts only stable 1.0.0 or newer releases", () => {
+	assert.equal(isSupportedPiVersion("0.99.9"), false);
+	assert.equal(isSupportedPiVersion("1.0.0-rc.1"), false);
+	assert.equal(isSupportedPiVersion("1.0.0"), true);
+	assert.equal(isSupportedPiVersion("1.0.0+host.1"), true);
+	assert.equal(isSupportedPiVersion("1.0.1-alpha.1"), true);
+	assert.equal(isSupportedPiVersion("2.0.0"), true);
+	assert.equal(isSupportedPiVersion("unknown"), false);
+	assert.equal(isSupportedPiVersion("01.0.0"), false);
 });
 
 test("createExtension registers the memory + backlog tools, /mind command, and lifecycle hooks", () => {
@@ -289,6 +300,32 @@ test("session startup migration is bounded and continues in the background", asy
 	assert.equal(recalled?.details.count, 1, "the next operation observes the completed background migration");
 });
 
+test("an ordinary direct input does not wait on migration before cue detection", async () => {
+	const m = mockPi();
+	const agentDir = join(dir, "no-cue-migration", "agent");
+	const cwd = join(dir, "no-cue-migration", "proj");
+	const legacyPath = join(agentDir, "pi-persona-mind", "memory", "ltm", "_default.json");
+	const destinationPath = join(agentDir, "persona-mind", "memory", "ltm", "_default.json");
+	const entry = makeMemory({ term: "long", kind: "note", text: "slow background import" }, Date.now());
+	await mkdir(dirname(legacyPath), { recursive: true });
+	await writeFile(legacyPath, JSON.stringify({ version: 1, sequence: 1, updatedAt: new Date().toISOString(), entries: [entry] }), "utf8");
+	await mkdir(dirname(destinationPath), { recursive: true });
+	const destinationLock = `${destinationPath}.lock`;
+	await writeFile(destinationLock, `${hostname()}:${process.pid}:test-holder`, "utf8");
+	createExtension(m.pi, { agentDir, migrationAwaitMs: 500 });
+	const input = m.handlers.get("input");
+	assert.ok(input);
+	const pending = Promise.resolve(input({ text: "Please inspect the current status.", source: "interactive" }, ctxFor(cwd)));
+	const fast = await Promise.race([
+		pending.then(() => true),
+		new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 50)),
+	]);
+	await new Promise((resolve) => setTimeout(resolve, 120));
+	await unlink(destinationLock);
+	await pending; // let the background migration settle after removing the synthetic lock
+	assert.equal(fast, true, "a prompt with no capture cue must not wait for legacy migration IO");
+});
+
 test("/mind doctor explains the effective scope and persistence policy without dumping memory text", async () => {
 	const m = mockPi();
 	const agentDir = join(dir, "doctor", "agent");
@@ -480,6 +517,43 @@ test("a direct capture notice survives prompt-template expansion", async () => {
 	assert.match(result?.systemPrompt ?? "", /already captured/i, "the direct-input acknowledgement follows provenance, not exact prompt text");
 });
 
+test("a capture finishing after session shutdown cannot leak its notice into the next session", async () => {
+	const m = mockPi();
+	const agentDir = join(dir, "capture-session-race", "agent");
+	const cwd = join(dir, "capture-session-race", "proj");
+	const legacyPath = join(agentDir, "pi-persona-mind", "backlog", "slow.json");
+	const destinationPath = join(agentDir, "persona-mind", "backlog", "slow.json");
+	const entry = makeBacklog({ text: "slow legacy import" }, Date.now());
+	await mkdir(dirname(legacyPath), { recursive: true });
+	await writeFile(legacyPath, JSON.stringify({ version: 1, sequence: 1, updatedAt: new Date().toISOString(), entries: [entry] }), "utf8");
+	await mkdir(dirname(destinationPath), { recursive: true });
+	const destinationLock = `${destinationPath}.lock`;
+	await writeFile(destinationLock, `${hostname()}:${process.pid}:test-holder`, "utf8");
+	const ctx = ctxFor(cwd);
+	createExtension(m.pi, { agentDir, migrationAwaitMs: 5 });
+	const input = m.handlers.get("input");
+	const start = m.handlers.get("session_start");
+	const shutdown = m.handlers.get("session_shutdown");
+	const before = m.handlers.get("before_agent_start");
+	assert.ok(input && start && shutdown && before);
+
+	try {
+		await start({}, ctx); // bounded wait leaves legacy migration blocked in the background
+		const staleCapture = Promise.resolve(input({ text: "Remember that this old-session fact must survive.", source: "interactive" }, ctx));
+		shutdown({}, ctx);
+		const nextSession = Promise.resolve(start({}, ctx));
+		await Promise.all([staleCapture, nextSession]);
+	} finally {
+		await unlink(destinationLock).catch(() => {});
+	}
+	await new Promise((resolve) => setTimeout(resolve, 60)); // allow the released background migration to settle
+	const recalled = await m.tools.get("memory")?.execute("old-session-recall", { action: "recall", query: "old-session fact" }, undefined, undefined, ctx);
+	assert.equal(recalled?.details.count, 1, "session shutdown must not discard a deterministic capture already accepted from user input");
+	const result = (await before({ systemPrompt: "BASE", prompt: "unrelated next-session turn" }, ctx)) as { systemPrompt?: string } | undefined;
+	assert.doesNotMatch(result?.systemPrompt ?? "", /already captured/, "the old input acknowledgement is session-local");
+	shutdown({}, ctx);
+});
+
 test("extension-authored follow-ups can never auto-poison durable memory", async () => {
 	const m = mockPi();
 	const agentDir = join(dir, "capture-trust", "agent");
@@ -558,6 +632,57 @@ test("an EMPTY supervisor mind injects one soft discoverability line (an unseen 
 	// Announced ONCE per session: a second turn with the mind still empty does NOT re-show the line.
 	const again = (await before({ systemPrompt: "BASE", prompt: "still here" }, ctxFor(join(dir, "empty", "proj")))) as { systemPrompt?: string } | undefined;
 	assert.doesNotMatch(again?.systemPrompt ?? "", /this mind is empty/);
+});
+
+test("the empty-mind announcement resets when Pi reuses the extension for a new session", async () => {
+	const m = mockPi();
+	const cwd = join(dir, "empty-session-reset", "proj");
+	const ctx = ctxFor(cwd);
+	createExtension(m.pi, { agentDir: join(dir, "empty-session-reset", "agent") });
+	const start = m.handlers.get("session_start");
+	const shutdown = m.handlers.get("session_shutdown");
+	const before = m.handlers.get("before_agent_start");
+	assert.ok(start && shutdown && before);
+
+	await start({}, ctx);
+	const first = (await before({ systemPrompt: "BASE", prompt: "first session" }, ctx)) as { systemPrompt?: string } | undefined;
+	assert.match(first?.systemPrompt ?? "", /this mind is empty/);
+	const repeated = (await before({ systemPrompt: "BASE", prompt: "same session" }, ctx)) as { systemPrompt?: string } | undefined;
+	assert.doesNotMatch(repeated?.systemPrompt ?? "", /this mind is empty/);
+
+	shutdown({}, ctx);
+	await start({}, ctx);
+	const next = (await before({ systemPrompt: "BASE", prompt: "new session" }, ctx)) as { systemPrompt?: string } | undefined;
+	assert.match(next?.systemPrompt ?? "", /this mind is empty/, "a new Pi session gets its own one-time announcement");
+	shutdown({}, ctx);
+});
+
+test("fallback cue-hint deduplication resets at a new Pi session", async () => {
+	const m = mockPi();
+	const statuses: string[] = [];
+	const cwd = join(dir, "cue-session-reset", "proj");
+	const ctx = {
+		...ctxFor(cwd),
+		ui: { setStatus: (_key: string, value: string) => statuses.push(value), notify: () => {}, theme: { fg: (_color: string, value: string) => value } },
+	};
+	createExtension(m.pi, { agentDir: join(dir, "cue-session-reset", "agent") });
+	const start = m.handlers.get("session_start");
+	const shutdown = m.handlers.get("session_shutdown");
+	const before = m.handlers.get("before_agent_start");
+	assert.ok(start && shutdown && before);
+	const prompt = "I prefer concise summaries.";
+
+	await start({}, ctx);
+	await before({ systemPrompt: "BASE", prompt }, ctx);
+	assert.equal(statuses.filter((value) => /worth remembering/.test(value)).length, 1);
+	await before({ systemPrompt: "BASE", prompt: "same session again" }, ctx);
+	assert.equal(statuses.filter((value) => /worth remembering/.test(value)).length, 1, "the fallback cue hint is deduplicated within a session");
+
+	shutdown({}, ctx);
+	await start({}, ctx);
+	await before({ systemPrompt: "BASE", prompt }, ctx);
+	assert.equal(statuses.filter((value) => /worth remembering/.test(value)).length, 2, "the same cue may be surfaced once in each session");
+	shutdown({}, ctx);
 });
 
 test("a memory whose TEXT quotes the empty-hint phrase is NOT mistaken for the announcement (no suppression)", async () => {
@@ -887,6 +1012,41 @@ test("a blocked delegated leg surfaces a backlog nudge on both delivery paths", 
 	assert.equal(status.length, 0, "a non-delegation tool result never nudges");
 });
 
+test("nested blocked reports nudge only when the model-visible outer result relays the marker", () => {
+	const m = mockPi();
+	const status: string[] = [];
+	const ctx = { cwd: join(dir, "nested-blocked", "proj"), mode: "tui", hasUI: true, ui: { setStatus: (_k: string, v: string) => status.push(v), notify: () => {}, theme: { fg: (_c: string, s: string) => s } } };
+	createExtension(m.pi, { agentDir: join(dir, "nested-blocked", "agent") });
+	const onResult = m.handlers.get("tool_result");
+	assert.ok(onResult);
+
+	onResult({ toolCallId: "discarded-inner", parentToolCallId: "discarded-outer", toolName: "delegate", content: [{ type: "text", text: "[BLOCKED: hidden from outer output]" }] }, ctx);
+	assert.equal(status.length, 0, "a nested result is not itself the supervisor-facing report");
+	onResult({ toolCallId: "discarded-outer", toolName: "codemode", content: [{ type: "text", text: "completed the script without relaying the inner report" }] }, ctx);
+	assert.equal(status.length, 0, "discarded nested output produces no stale backlog nudge");
+
+	onResult({ toolCallId: "relayed-inner", parentToolCallId: "relayed-outer", toolName: "council", content: [{ type: "text", text: "[BLOCKED: missing credentials]" }] }, ctx);
+	assert.equal(status.length, 0, "the nested result stays quiet until its caller reports it");
+	onResult({ toolCallId: "relayed-outer", toolName: "codemode", content: [{ type: "text", text: "Council result: [BLOCKED: missing credentials]" }] }, ctx);
+	assert.ok(status.some((value) => /backlog add/.test(value)), "the outer result nudges when it relays the marker");
+
+	status.length = 0;
+	for (let i = 0; i < 257; i++) {
+		onResult({ toolCallId: `bounded-inner-${i}`, parentToolCallId: `bounded-outer-${i}`, toolName: "delegate", content: [{ type: "text", text: "[BLOCKED: unresolved]" }] }, ctx);
+	}
+	assert.equal(status.length, 0, "remembering bounded relay provenance does not nudge nested results");
+	onResult({ toolCallId: "bounded-outer-0", toolName: "codemode", content: [{ type: "text", text: "[BLOCKED: unresolved]" }] }, ctx);
+	assert.equal(status.length, 0, "oldest pending relay provenance is evicted at the cap");
+	onResult({ toolCallId: "bounded-outer-256", toolName: "codemode", content: [{ type: "text", text: "[BLOCKED: unresolved]" }] }, ctx);
+	assert.ok(status.some((value) => /backlog add/.test(value)), "recent relay provenance remains available");
+
+	status.length = 0;
+	onResult({ toolCallId: "stale-inner", parentToolCallId: "stale-outer", toolName: "delegate", content: [{ type: "text", text: "[BLOCKED: stale session]" }] }, ctx);
+	m.handlers.get("session_shutdown")?.({}, ctx);
+	onResult({ toolCallId: "stale-outer", toolName: "codemode", content: [{ type: "text", text: "[BLOCKED: stale session]" }] }, ctx);
+	assert.equal(status.length, 0, "nested relay provenance is cleared at session shutdown");
+});
+
 test("PI_PERSONA_MIND_NUDGE=off suppresses async blocked-leg nudges", async () => {
 	const previous = process.env.PI_PERSONA_MIND_NUDGE;
 	process.env.PI_PERSONA_MIND_NUDGE = "off";
@@ -1019,6 +1179,37 @@ test("the backlog tool queues and lists an item through the Pi surface", async (
 });
 
 const plainTheme = { fg: (_name: string, text: string) => text, bold: (text: string) => text };
+
+test("a late injection from a stopped session cannot mutate the next session's announcement", async (t) => {
+  const m = mockPi();
+  const ctx = ctxFor(join(dir, "late-injection", "project"));
+  createExtension(m.pi, { agentDir: join(dir, "late-injection", "agent") });
+  await m.handlers.get("session_start")?.({}, ctx);
+  let entered!: () => void;
+  let release!: () => void;
+  const reading = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const held = t.mock.method(MindService.prototype, "buildInjection", async () => {
+    entered();
+    await gate;
+    return "<persona-mind>OLD-SESSION-CONTENT</persona-mind>";
+  });
+  const before = m.handlers.get("before_agent_start")!;
+  const pending = Promise.resolve(before({ systemPrompt: "BASE", prompt: "Old turn" }, ctx));
+  try {
+    await reading;
+    await m.handlers.get("session_shutdown")?.({}, ctx);
+    release();
+    assert.equal(await pending, undefined, "a stopped session must not return stale memory");
+  } finally {
+    release();
+    held.mock.restore();
+  }
+  await m.handlers.get("session_start")?.({}, ctx);
+  const fresh = await before({ systemPrompt: "BASE", prompt: "New turn" }, ctx) as { systemPrompt?: string } | undefined;
+  assert.match(fresh?.systemPrompt ?? "", /mind|memory/i, "the fresh session still receives its own discoverability hint");
+  await m.handlers.get("session_shutdown")?.({}, ctx);
+});
 
 test("memory saves show one useful line and retain the machine-readable receipt", async () => {
 	const m = mockPi();

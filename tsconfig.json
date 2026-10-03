@@ -6,6 +6,7 @@
     "allowImportingTsExtensions": true,
     "noEmit": true,
     "strict": true,
+    "erasableSyntaxOnly": true,
     "exactOptionalPropertyTypes": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
@@ -14,5 +15,5 @@
     "forceConsistentCasingInFileNames": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts", "scripts/**/*.ts"]
 }

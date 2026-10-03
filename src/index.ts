@@ -14,7 +14,7 @@ import { closeSync, existsSync, fstatSync, lstatSync, openSync, readSync, unlink
 import { hostname } from "node:os";
 import { join } from "node:path";
 
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, VERSION } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { detectBlockedLeg } from "./core/blocked.ts";
@@ -38,10 +38,24 @@ const MAX_TIMER_DELAY_MS = 2_147_000_000;
 const MAX_WAKE_REMINDERS = 20;
 const MAX_WAKE_TEXT_CHARS = 200;
 const MAX_WAKE_OWNER_BYTES = 1024;
+const MIN_PI_VERSION = [1, 0, 0] as const;
 type WakeState = Awaited<ReturnType<MindService["backlogList"]>>;
 // Unique per extension instance (not just per process): two instances in one process must not both
 // believe they own the wake lock. Date/random are fine in the real runtime (unlike workflow scripts).
 let ownerInstanceSeq = 0;
+
+/** Pure semver floor check, kept local so the extension can fail closed before using newer Pi APIs. */
+export function isSupportedPiVersion(version: string): boolean {
+	const parsed = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(version);
+	if (!parsed) return false;
+	const parts = parsed.slice(1, 4).map((part) => Number(part));
+	if (parts.some((part) => !Number.isSafeInteger(part))) return false;
+	const [major, minor, patch] = parts as [number, number, number];
+	if (major !== MIN_PI_VERSION[0]) return major > MIN_PI_VERSION[0];
+	if (minor !== MIN_PI_VERSION[1]) return minor > MIN_PI_VERSION[1];
+	if (patch !== MIN_PI_VERSION[2]) return patch > MIN_PI_VERSION[2];
+	return parsed[4] === undefined;
+}
 
 export interface ExtensionOptions {
 	/** Override the agent dir (tests). Defaults to Pi's getAgentDir(). */
@@ -224,6 +238,8 @@ function withDeadline<T>(p: Promise<T>, ms: number, fallback: T, onTimeout?: () 
 
 /** Build the extension. Exported (separately from the default factory) so tests can inject agentDir. */
 export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): void {
+	// Do not touch the host API when loaded by a Pi release below the supported contract floor.
+	if (!isSupportedPiVersion(VERSION)) throw new Error(`pi-persona-mind requires Pi 1.0.0+ (found ${VERSION}).`);
 	// Mirror pi-persona's own PI_AGENT_DIR precedence so both extensions co-locate their data (and the
 	// mind never reads a stale/missing marker under the wrong root). getAgentDir() stays lazy — only
 	// called when neither an explicit override (tests) nor PI_AGENT_DIR is set.
@@ -531,7 +547,9 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		}
 	};
 	let activeScopeKey: string | undefined;
-	const reconcileScope = async (ctx: ExtensionContext): Promise<void> => {
+	let sessionLifecycleGeneration = 0;
+	const reconcileScope = async (ctx: ExtensionContext, lifecycleGeneration = sessionLifecycleGeneration): Promise<void> => {
+		if (lifecycleGeneration !== sessionLifecycleGeneration) return;
 		const scope = resolveMindScope(ctx);
 		const nextKey = JSON.stringify([scope.persona, scope.projectRoot]);
 		if (activeScopeKey === undefined) {
@@ -544,6 +562,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		activeScopeKey = nextKey;
 		if (sessionActive && !isDelegatedLeg) {
 			await armWakes(ctx);
+			if (lifecycleGeneration !== sessionLifecycleGeneration) return;
 			lastArmedMigrationGeneration = migrationGeneration;
 			await refreshStatus(ctx);
 		}
@@ -582,6 +601,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	let pendingCaptureNotice: CaptureNotice | undefined;
 	let pendingInputProvenance: { source: "interactive" | "rpc" | "extension" } | undefined;
 	let latestDirectInputPrompt: string | undefined;
+	let captureInputGeneration = 0;
 	const directInputPrompts = new Set<string>();
 	const rememberDirectInputPrompt = (prompt: string): void => {
 		directInputPrompts.delete(prompt);
@@ -594,6 +614,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	};
 	// Cue snippets already surfaced in the prompt this session: at most once per direct statement.
 	const cueHinted = new Set<string>();
+	const nestedBlockedRelays = new Set<string>();
 	const rememberCueHint = (snippet: string): void => {
 		cueHinted.delete(snippet);
 		cueHinted.add(snippet);
@@ -606,16 +627,45 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	// The empty-mind discoverability line is an ANNOUNCEMENT — shown once per session, not a banner that
 	// persists every turn while the mind stays empty (that would be the nag we avoid).
 	let emptyAnnounced = false;
-	const captureDirectCues = async (text: string, ctx: ExtensionContext): Promise<CaptureNotice | undefined> => {
-		await ensureLegacyMigrated(ctx);
-		await reconcileScope(ctx);
+	const resetSessionTransientState = (): number => {
+		sessionLifecycleGeneration++;
+		captureInputGeneration++;
+		pendingCaptureNotice = undefined;
+		pendingInputProvenance = undefined;
+		latestDirectInputPrompt = undefined;
+		directInputPrompts.clear();
+		cueHinted.clear();
+		nestedBlockedRelays.clear();
+		emptyAnnounced = false;
+		return sessionLifecycleGeneration;
+	};
+	const rememberNestedBlockedRelay = (toolCallId: string): void => {
+		nestedBlockedRelays.delete(toolCallId);
+		nestedBlockedRelays.add(toolCallId);
+		while (nestedBlockedRelays.size > 256) {
+			const oldest = nestedBlockedRelays.values().next().value as string | undefined;
+			if (oldest === undefined) break;
+			nestedBlockedRelays.delete(oldest);
+		}
+	};
+	const captureDirectCues = async (
+		text: string,
+		ctx: ExtensionContext,
+		lifecycleGeneration: number,
+		inputGeneration: number,
+	): Promise<CaptureNotice | undefined> => {
 		const cues = detectCaptureCues(text);
 		if (cues.length === 0) return undefined;
 		const explicit = capturePolicy === "auto" ? cues.filter((cue) => cue.strong) : [];
+		const mind = explicit.length > 0 ? getMind(ctx) : undefined;
+		const isCurrent = (): boolean => lifecycleGeneration === sessionLifecycleGeneration && inputGeneration === captureInputGeneration;
+		if (explicit.length > 0) {
+			await ensureLegacyMigrated(ctx);
+			if (isCurrent()) await reconcileScope(ctx, lifecycleGeneration);
+		}
 		const stored: string[] = [];
 		const failures: string[] = [];
-		if (explicit.length > 0) {
-			const mind = getMind(ctx);
+		if (mind) {
 			for (const cue of explicit) {
 				const label = cue.kind === "preference" ? "User preference" : cue.kind === "rationale" ? "Durable user decision" : "User explicitly asked to retain";
 				const result = await mind.remember({
@@ -627,9 +677,12 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 				});
 				if (result.ok) stored.push(result.entry.id);
 				else failures.push(result.reason);
-				rememberCueHint(cue.snippet);
 			}
 		}
+		// Durable writes from the accepted user input are preserved across a session change, but its
+		// acknowledgement and prompt/UI state belong only to the session/input that accepted it.
+		if (!isCurrent()) return undefined;
+		for (const cue of explicit) rememberCueHint(cue.snippet);
 
 		let hint = "";
 		if (stored.length > 0) {
@@ -667,18 +720,22 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	// explicit persist-intent is safe to commit deterministically before the model runs. Everything
 	// softer remains a model-visible candidate governed by the standing tool guideline.
 	pi.on("input", async (event, ctx) => {
+		const lifecycleGeneration = sessionLifecycleGeneration;
+		const inputGeneration = ++captureInputGeneration;
 		pendingInputProvenance = { source: event.source };
+		pendingCaptureNotice = undefined;
 		if (event.source === "extension") {
-			pendingCaptureNotice = undefined;
 			return;
 		}
 		if (isDelegatedLeg || capturePolicy === "off") {
-			pendingCaptureNotice = undefined;
 			return;
 		}
 		latestDirectInputPrompt = event.text;
 		rememberDirectInputPrompt(event.text);
-		pendingCaptureNotice = await captureDirectCues(event.text, ctx);
+		const notice = await captureDirectCues(event.text, ctx, lifecycleGeneration, inputGeneration);
+		if (lifecycleGeneration === sessionLifecycleGeneration && inputGeneration === captureInputGeneration && latestDirectInputPrompt === event.text) {
+			pendingCaptureNotice = notice;
+		}
 	});
 
 	const customMessageText = (content: unknown): string => {
@@ -696,11 +753,13 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	pi.on("message_start", async (event, ctx) => {
 		const message = event.message;
 		if (message.role !== "custom") return;
+		const lifecycleGeneration = sessionLifecycleGeneration;
+		const inputGeneration = ++captureInputGeneration;
+		pendingInputProvenance = { source: "extension" };
+		pendingCaptureNotice = undefined;
 		const text = customMessageText(message.content);
 		if (!text) return;
 		if (message.customType === "pi-persona") {
-			pendingInputProvenance = { source: "extension" };
-			pendingCaptureNotice = undefined;
 			const blocked = nudgeEnabled && isDelegatedReport(text) ? detectBlockedLeg(text) : undefined;
 			if (blocked) nudgeBlocked(ctx, blocked.snippet);
 			return;
@@ -710,7 +769,10 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			pendingInputProvenance = { source: "interactive" };
 			latestDirectInputPrompt = text;
 			rememberDirectInputPrompt(text);
-			pendingCaptureNotice = await captureDirectCues(text, ctx);
+			const notice = await captureDirectCues(text, ctx, lifecycleGeneration, inputGeneration);
+			if (lifecycleGeneration === sessionLifecycleGeneration && inputGeneration === captureInputGeneration && latestDirectInputPrompt === text) {
+				pendingCaptureNotice = notice;
+			}
 			return;
 		}
 		pendingInputProvenance = { source: "extension" };
@@ -721,8 +783,11 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	// how memory survives compaction: it re-injects from disk. Fail-open: a stalled read (slow disk,
 	// lock contention) degrades to no injection rather than hanging the turn.
 	pi.on("before_agent_start", async (event, ctx) => {
+		const lifecycleGeneration = sessionLifecycleGeneration;
 		await ensureLegacyMigrated(ctx);
-		await reconcileScope(ctx);
+		if (lifecycleGeneration !== sessionLifecycleGeneration) return;
+		await reconcileScope(ctx, lifecycleGeneration);
+		if (lifecycleGeneration !== sessionLifecycleGeneration) return;
 		const provenance = pendingInputProvenance?.source;
 		pendingInputProvenance = undefined;
 		let cueHint = "";
@@ -761,12 +826,13 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		let block = "";
 		try {
 			// A worker inherits the LEAN mind (north-star + identity only); the supervisor gets it all.
-			block = await withDeadline(getMind(ctx).buildInjection({ lean: isDelegatedLeg }), INJECT_DEADLINE_MS, "", () =>
-				surfaceWarning(ctx, `memory injection exceeded ${INJECT_DEADLINE_MS}ms and was skipped for this turn`),
-			);
+			block = await withDeadline(getMind(ctx).buildInjection({ lean: isDelegatedLeg }), INJECT_DEADLINE_MS, "", () => {
+				if (lifecycleGeneration === sessionLifecycleGeneration) surfaceWarning(ctx, `memory injection exceeded ${INJECT_DEADLINE_MS}ms and was skipped for this turn`);
+			});
 		} catch (err) {
-			surfaceWarning(ctx, `memory injection failed: ${err instanceof Error ? err.message : String(err)}`);
+			if (lifecycleGeneration === sessionLifecycleGeneration) surfaceWarning(ctx, `memory injection failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
+		if (lifecycleGeneration !== sessionLifecycleGeneration) return;
 		// The empty-mind hint announces the faculty ONCE per session, then goes quiet even if the mind
 		// stays empty — a state indicator, not a per-turn nag. Matched by PREFIX: a content block starts
 		// with `<persona-mind …` and a memory's text sits inside the fence, so this only ever recognises
@@ -785,6 +851,8 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	// status-line nudge — so it composes cleanly alongside pi-persona's own tool_result hook.
 	const REPORT_TOOLS = new Set(["delegate", "council"]);
 	pi.on("tool_result", async (event, ctx) => {
+		const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : "";
+		const relaysNestedBlocked = toolCallId ? nestedBlockedRelays.delete(toolCallId) : false;
 		if (isDelegatedLeg) return undefined;
 		if (event.toolName === "memory" || event.toolName === "backlog") {
 			const details = event.details && typeof event.details === "object" ? (event.details as Record<string, unknown>) : undefined;
@@ -799,14 +867,19 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			return undefined;
 		}
 		if (!nudgeEnabled) return undefined;
-		if (!REPORT_TOOLS.has(event.toolName)) return undefined;
 		const text = event.content.reduce((s, c) => (c.type === "text" ? s + c.text : s), "");
 		const blocked = detectBlockedLeg(text);
-		if (blocked) nudgeBlocked(ctx, blocked.snippet);
+		const parentToolCallId = typeof event.parentToolCallId === "string" && event.parentToolCallId.length > 0 ? event.parentToolCallId : undefined;
+		if (parentToolCallId) {
+			if (blocked && (REPORT_TOOLS.has(event.toolName) || relaysNestedBlocked)) rememberNestedBlockedRelay(parentToolCallId);
+			return undefined;
+		}
+		if (blocked && (REPORT_TOOLS.has(event.toolName) || relaysNestedBlocked)) nudgeBlocked(ctx, blocked.snippet);
 		return undefined;
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		const lifecycleGeneration = resetSessionTransientState();
 		// A reused Pi process must not inherit the previous session's persona-switch latch.
 		resetPersonaMarkerLatch();
 		// A worker never arms/fires the supervisor's backlog wakes (nor shows a status line).
@@ -815,23 +888,31 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		sessionStarting = true;
 		try {
 			await ensureLegacyMigrated(ctx);
-			await reconcileScope(ctx);
+			if (lifecycleGeneration !== sessionLifecycleGeneration) return;
+			await reconcileScope(ctx, lifecycleGeneration);
+			if (lifecycleGeneration !== sessionLifecycleGeneration) return;
 			await armWakes(ctx);
+			if (lifecycleGeneration !== sessionLifecycleGeneration) return;
 			lastArmedMigrationGeneration = migrationGeneration;
 			try {
 				await getMind(ctx).sweepExpired();
 			} catch {
 				/* expired STM/backlog must not block session start */
 			}
+			if (lifecycleGeneration !== sessionLifecycleGeneration) return;
 			await refreshStatus(ctx);
 		} finally {
-			sessionStarting = false;
-			rearmAfterMigration(ctx);
+			if (lifecycleGeneration === sessionLifecycleGeneration) {
+				sessionStarting = false;
+				rearmAfterMigration(ctx);
+			}
 		}
 	});
 
 	pi.on("session_shutdown", () => {
+		resetSessionTransientState();
 		sessionActive = false;
+		sessionStarting = false;
 		resetPersonaMarkerLatch();
 		wakeGeneration++;
 		clearTimers();
