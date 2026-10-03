@@ -3,6 +3,7 @@ import { existsSync, utimesSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { after, before, test } from "node:test";
 
 import { createExtension, isSupportedPiVersion, ownerIsStale } from "../src/index.ts";
@@ -65,6 +66,14 @@ function mockPi(flags: Readonly<Record<string, boolean | string | undefined>> = 
 
 function wakeTexts(m: { entries: WakeEntry[] }): string[] {
 	return m.entries.filter((entry) => entry.type === "pi-persona-mind-wake").map((entry) => entry.data.content ?? "");
+}
+
+async function waitForCondition(description: string, condition: () => boolean, timeoutMs = 1_500): Promise<void> {
+	const deadline = performance.now() + timeoutMs;
+	while (!condition() && performance.now() < deadline) {
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+	assert.ok(condition(), `timed out waiting for ${description}`);
 }
 
 function ctxFor(cwd: string) {
@@ -1119,40 +1128,314 @@ test("ownerIsStale fails closed for old foreign and unparseable owners", () => {
 	assert.equal(ownerIsStale(lock, "someone:1:1"), false, "an unverifiable owner is never time-stolen");
 });
 
-test("an armed wake does not fire for a backlog item dropped before it comes due", async () => {
+test("an armed wake is canceled when its item is dropped before the deadline", async (t) => {
+	const epoch = 1_800_000_000_000;
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: epoch });
 	const m = mockPi();
 	const agentDir = join(dir, "stalefire", "agent");
 	createExtension(m.pi, { agentDir });
 	const ctx = ctxFor(join(dir, "stalefire", "proj"));
 	const backlog = m.tools.get("backlog");
 	assert.ok(backlog);
-	const add = await backlog.execute("t1", { action: "add", text: "ping CI", dueInSeconds: 0.2 }, undefined, undefined, ctx);
-	const id = (add.details as { id?: string }).id;
-	assert.ok(id, "the add returned an id");
-	await m.handlers.get("session_start")?.({}, ctx); // arms the ~200ms timer
-	await backlog.execute("t2", { action: "drop", id }, undefined, undefined, ctx); // close it before it fires
-	await new Promise((r) => setTimeout(r, 400)); // let the timer elapse
-	assert.ok(!wakeTexts(m).some((t) => /backlog due/.test(t) && /ping CI/.test(t)), "no stale wake fired for a dropped item");
+	try {
+		const add = await backlog.execute("t1", { action: "add", text: "ping CI", dueInSeconds: 10 }, undefined, undefined, ctx);
+		const id = add.details.id;
+		assert.equal(typeof id, "string", "the add returned an id");
+		await m.handlers.get("session_start")?.({}, ctx); // arms the timer while the mocked clock is before its deadline
+		const dropped = await backlog.execute("t2", { action: "drop", id }, undefined, undefined, ctx);
+		await m.handlers.get("tool_result")?.({
+			toolName: "backlog",
+			input: { action: "drop", id },
+			details: dropped.details,
+			content: dropped.content,
+		}, ctx);
+		// Advance through the deadline only after the persisted drop and the Pi result hook have completed.
+		t.mock.timers.tick(10_001);
+		assert.ok(!wakeTexts(m).some((text) => /backlog due/.test(text) && /ping CI/.test(text)), "no stale wake fired for a dropped item");
+	} finally {
+		m.handlers.get("session_shutdown")?.({}, ctx);
+		t.mock.timers.reset();
+	}
 });
 
-test("a due backlog item added during an active session is armed immediately", async () => {
+test("a newly queued item already due when its tool result rearms wakes immediately", async (t) => {
+	const epoch = 1_800_000_000_000;
+	t.mock.timers.enable({ apis: ["Date"], now: epoch });
 	const m = mockPi();
 	const agentDir = join(dir, "live-wake", "agent");
 	const ctx = ctxFor(join(dir, "live-wake", "proj"));
 	createExtension(m.pi, { agentDir });
-	await m.handlers.get("session_start")?.({}, ctx);
+	try {
+		await m.handlers.get("session_start")?.({}, ctx);
 
+		const backlog = m.tools.get("backlog");
+		assert.ok(backlog);
+		const added = await backlog.execute("t1", { action: "add", text: "check the live timer", dueInSeconds: 0.0001 }, undefined, undefined, ctx);
+		assert.equal(added.details.ok, true);
+		const id = added.details.id;
+		assert.equal(typeof id, "string");
+		// Advance past the valid sub-millisecond deadline before Pi reports the tool result.
+		t.mock.timers.setTime(epoch + 1);
+		await m.handlers.get("tool_result")?.({
+			toolName: "backlog",
+			input: { action: "add", text: "check the live timer", dueInSeconds: 0.0001 },
+			details: added.details,
+			content: added.content,
+		}, ctx);
+
+		assert.ok(wakeTexts(m).some((text) => /backlog due/.test(text) && /check the live timer/.test(text)), "a newly overdue item must not wait for the next session restart");
+		assert.equal(m.messages.length, 0, "a live wake is a collapsed card, not a follow-up that starts a turn");
+		assert.equal(m.messageOptions.length, 0, "a live wake never queues sendUserMessage");
+	} finally {
+		m.handlers.get("session_shutdown")?.({}, ctx);
+		t.mock.timers.reset();
+	}
+});
+
+test("a previously armed wake that becomes due during a backlog mutation is delivered", async (t) => {
+	const epoch = 1_800_000_000_000;
+	t.mock.timers.enable({ apis: ["Date"], now: epoch });
+	const m = mockPi();
+	const agentDir = join(dir, "rearm-due", "agent");
+	const ctx = ctxFor(join(dir, "rearm-due", "proj"));
+	createExtension(m.pi, { agentDir });
 	const backlog = m.tools.get("backlog");
 	assert.ok(backlog);
-	const added = await backlog.execute("t1", { action: "add", text: "check the live timer", dueInSeconds: 0.03 }, undefined, undefined, ctx);
-	assert.equal(added.details.ok, true);
-	await m.handlers.get("tool_result")?.({ toolName: "backlog", details: added.details, content: added.content }, ctx);
-	await new Promise((resolve) => setTimeout(resolve, 250));
+	try {
+		const existing = await backlog.execute("t1", { action: "add", text: "old alarm crossing rearm", dueInSeconds: 10 }, undefined, undefined, ctx);
+		assert.equal(existing.details.ok, true);
+		await m.handlers.get("session_start")?.({}, ctx); // arms the existing future alarm
+		const mutation = await backlog.execute("t2", { action: "add", text: "unrelated new item" }, undefined, undefined, ctx);
+		assert.equal(mutation.details.ok, true);
+		t.mock.timers.setTime(epoch + 10_001);
+		await m.handlers.get("tool_result")?.({
+			toolName: "backlog",
+			input: { action: "add", text: "unrelated new item" },
+			details: mutation.details,
+			content: mutation.content,
+		}, ctx);
 
-	assert.ok(wakeTexts(m).some((text) => /backlog due/.test(text) && /check the live timer/.test(text)), "a new wake must not wait for the next session restart");
-	assert.equal(m.messages.length, 0, "a live wake is a collapsed card, not a follow-up that starts a turn");
-	assert.equal(m.messageOptions.length, 0, "a live wake never queues sendUserMessage");
-	m.handlers.get("session_shutdown")?.({}, ctx);
+		assert.ok(wakeTexts(m).some((text) => /backlog due/.test(text) && /old alarm crossing rearm/.test(text)), "rearming must preserve a previously armed item whose deadline passed");
+		assert.equal(m.messages.length, 0, "the due reminder stays display-only");
+	} finally {
+		m.handlers.get("session_shutdown")?.({}, ctx);
+		t.mock.timers.reset();
+	}
+});
+
+test("concurrent backlog wake rearms preserve every newly due item", async (t) => {
+	const epoch = 1_800_000_000_000;
+	t.mock.timers.enable({ apis: ["Date"], now: epoch });
+	const m = mockPi();
+	const agentDir = join(dir, "concurrent-due-rearm", "agent");
+	const ctx = ctxFor(join(dir, "concurrent-due-rearm", "proj"));
+	let synchronizeReads = false;
+	let readers = 0;
+	let releaseReads!: () => void;
+	const bothReaders = new Promise<void>((resolve) => { releaseReads = resolve; });
+	createExtension(m.pi, {
+		agentDir,
+		wakeStateReader: async (mind) => {
+			const state = await mind.backlogList({ all: true });
+			if (synchronizeReads) {
+				readers++;
+				if (readers === 2) releaseReads();
+				await bothReaders;
+			}
+			return state;
+		},
+	});
+	const backlog = m.tools.get("backlog");
+	assert.ok(backlog);
+	try {
+		await m.handlers.get("session_start")?.({}, ctx);
+		const first = await backlog.execute("t1", { action: "add", text: "first concurrent due item", dueInSeconds: 0.0001 }, undefined, undefined, ctx);
+		const second = await backlog.execute("t2", { action: "add", text: "second concurrent due item", dueInSeconds: 0.0001 }, undefined, undefined, ctx);
+		assert.equal(first.details.ok, true);
+		assert.equal(second.details.ok, true);
+		t.mock.timers.setTime(epoch + 1);
+		synchronizeReads = true;
+		const toolResult = (result: Awaited<ReturnType<typeof backlog.execute>>, text: string) =>
+			m.handlers.get("tool_result")?.({
+				toolName: "backlog",
+				input: { action: "add", text, dueInSeconds: 0.0001 },
+				details: result.details,
+				content: result.content,
+			}, ctx);
+		await Promise.all([
+			toolResult(first, "first concurrent due item"),
+			toolResult(second, "second concurrent due item"),
+		]);
+
+		const visible = wakeTexts(m).join("\n");
+		assert.match(visible, /first concurrent due item/, "the first concurrent add remains pending across a superseding rearm");
+		assert.match(visible, /second concurrent due item/, "the second concurrent add is also delivered");
+	} finally {
+		m.handlers.get("session_shutdown")?.({}, ctx);
+		t.mock.timers.reset();
+	}
+});
+
+test("a migration re-arm does not repeat a wake while its acknowledgement is in flight", async (t) => {
+	const epoch = 1_800_000_000_000;
+	t.mock.timers.enable({ apis: ["Date"], now: epoch });
+	const m = mockPi();
+	const agentDir = join(dir, "wake-migration-ack-race", "agent");
+	const cwd = join(dir, "wake-migration-ack-race", "project");
+	const legacyPath = join(agentDir, "pi-persona-mind", "memory", "ltm", "_default.json");
+	const destinationPath = join(agentDir, "persona-mind", "memory", "ltm", "_default.json");
+	const migrationLock = `${destinationPath}.lock`;
+	const legacyEntry = makeMemory({ term: "long", kind: "note", text: "background migration witness" }, epoch);
+	await mkdir(dirname(legacyPath), { recursive: true });
+	await writeFile(legacyPath, JSON.stringify({ version: 1, sequence: 1, updatedAt: new Date(epoch).toISOString(), entries: [legacyEntry] }), "utf8");
+	await mkdir(dirname(destinationPath), { recursive: true });
+	await writeFile(migrationLock, `${hostname()}:${process.pid}:test-holder`, "utf8");
+	const statuses: string[] = [];
+	const ctx = {
+		...ctxFor(cwd),
+		ui: { setStatus: (_key: string, value: string) => statuses.push(value), notify: () => {}, theme: { fg: (_c: string, text: string) => text } },
+	};
+	let releasedMigrationLock = false;
+	let migrationWakeReadSeen = false;
+	let signalMigrationWakeRead!: () => void;
+	const migrationWakeRead = new Promise<void>((resolve) => { signalMigrationWakeRead = resolve; });
+	let migrationRearmStatus: number | undefined;
+	let targetId: string | undefined;
+	let firstAckHeld = false;
+	let releaseFirstAck!: () => void;
+	const firstAckGate = new Promise<void>((resolve) => { releaseFirstAck = resolve; });
+	const originalAcknowledgeDue = MindService.prototype.acknowledgeDue;
+	let liveToolResult: Promise<unknown> | undefined;
+	createExtension(m.pi, {
+		agentDir,
+		migrationAwaitMs: 0,
+		wakeStateReader: async (mind) => {
+			const state = await mind.backlogList({ all: true });
+			if (releasedMigrationLock && !migrationWakeReadSeen) {
+				migrationWakeReadSeen = true;
+				signalMigrationWakeRead();
+			}
+			return state;
+		},
+	});
+	const start = m.handlers.get("session_start");
+	const shutdown = m.handlers.get("session_shutdown");
+	assert.ok(start && shutdown);
+	const backlog = m.tools.get("backlog");
+	assert.ok(backlog);
+	const matchingWakes = () => wakeTexts(m).filter((text) => /live reminder across migration/.test(text));
+	try {
+		await start({}, ctx); // the held legacy-store lock leaves migration running in the background
+		const added = await backlog.execute("t1", { action: "add", text: "live reminder across migration", dueInSeconds: 0.0001 }, undefined, undefined, ctx);
+		assert.equal(added.details.ok, true);
+		assert.equal(typeof added.details.id, "string");
+		targetId = String(added.details.id);
+		MindService.prototype.acknowledgeDue = async function (this: MindService, ids?: readonly string[]) {
+			if (!firstAckHeld && targetId && ids?.includes(targetId)) {
+				firstAckHeld = true;
+				await firstAckGate;
+			}
+			return originalAcknowledgeDue.call(this, ids);
+		};
+		t.mock.timers.setTime(epoch + 1);
+		liveToolResult = Promise.resolve(m.handlers.get("tool_result")?.({
+			toolName: "backlog",
+			input: { action: "add", text: "live reminder across migration", dueInSeconds: 0.0001 },
+			details: added.details,
+			content: added.content,
+		}, ctx));
+		await waitForCondition("the first due-wake acknowledgement to remain in flight", () => firstAckHeld);
+		assert.equal(matchingWakes().length, 1, "the live due item has already been displayed once");
+
+		releasedMigrationLock = true;
+		await unlink(migrationLock);
+		await Promise.race([migrationWakeRead, waitForCondition("the migration wake-state read", () => migrationWakeReadSeen)]);
+		const statusBeforeRearm = statuses.length;
+		migrationRearmStatus = statusBeforeRearm;
+		await waitForCondition(
+			"the background migration's wake re-arm and refreshed summary",
+			() => statuses.length > statusBeforeRearm,
+		);
+		assert.equal(matchingWakes().length, 1, "a migration re-arm must not repeat the reminder before the pending ack settles");
+
+		releaseFirstAck();
+		await liveToolResult;
+		const renewed = await backlog.execute("t2", { action: "add", text: "live reminder across migration", dueInSeconds: 0.0001 }, undefined, undefined, ctx);
+		assert.equal(renewed.details.id, targetId, "renewing the same backlog item retains its routing id");
+		t.mock.timers.setTime(epoch + 2);
+		await m.handlers.get("tool_result")?.({
+			toolName: "backlog",
+			input: { action: "add", text: "live reminder across migration", dueInSeconds: 0.0001 },
+			details: renewed.details,
+			content: renewed.content,
+		}, ctx);
+		assert.equal(matchingWakes().length, 2, "a changed due deadline for the same id is eligible for a new reminder");
+	} finally {
+		releasedMigrationLock = true;
+		await unlink(migrationLock).catch(() => {});
+		releaseFirstAck();
+		MindService.prototype.acknowledgeDue = originalAcknowledgeDue;
+		await liveToolResult?.catch(() => {});
+		if (migrationWakeReadSeen && migrationRearmStatus !== undefined && statuses.length <= migrationRearmStatus) {
+			await waitForCondition("background migration wake re-arm cleanup", () => statuses.length > migrationRearmStatus!).catch(() => {});
+		}
+		shutdown({}, ctx);
+		t.mock.timers.reset();
+	}
+});
+
+test("a future wake fires once at its deadline and later maintenance does not repeat it", async (t) => {
+	const epoch = 1_800_000_000_000;
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: epoch });
+	const m = mockPi();
+	const agentDir = join(dir, "future-wake", "agent");
+	const ctx = ctxFor(join(dir, "future-wake", "proj"));
+	createExtension(m.pi, { agentDir });
+	const backlog = m.tools.get("backlog");
+	assert.ok(backlog);
+	const originalAcknowledgeDue = MindService.prototype.acknowledgeDue;
+	let acknowledged = false;
+	try {
+		await m.handlers.get("session_start")?.({}, ctx);
+		const added = await backlog.execute("t1", { action: "add", text: "future wake exactly once", dueInSeconds: 10 }, undefined, undefined, ctx);
+		assert.equal(added.details.ok, true);
+		assert.equal(typeof added.details.id, "string", "the new alarm has an id to acknowledge");
+		const id = String(added.details.id);
+		await m.handlers.get("tool_result")?.({
+			toolName: "backlog",
+			input: { action: "add", text: "future wake exactly once", dueInSeconds: 10 },
+			details: added.details,
+			content: added.content,
+		}, ctx);
+		const matchingWakes = () => wakeTexts(m).filter((text) => /future wake exactly once/.test(text));
+		assert.equal(matchingWakes().length, 0, "the future alarm stays quiet before its deadline");
+
+		MindService.prototype.acknowledgeDue = async function (this: MindService, ids?: readonly string[]) {
+			const cleared = await originalAcknowledgeDue.call(this, ids);
+			if (ids?.includes(id)) acknowledged = true;
+			return cleared;
+		};
+		t.mock.timers.tick(9_999);
+		assert.equal(matchingWakes().length, 0, "the alarm does not fire before its deadline");
+		t.mock.timers.tick(1);
+		await waitForCondition("the timer's persisted acknowledgement", () => acknowledged);
+		assert.equal(matchingWakes().length, 1, "the timer delivers exactly one collapsed reminder");
+		assert.equal(m.messages.length, 0, "the reminder never starts an agent turn");
+
+		const maintenance = await backlog.execute("t2", { action: "add", text: "unrelated maintenance item" }, undefined, undefined, ctx);
+		assert.equal(maintenance.details.ok, true);
+		await m.handlers.get("tool_result")?.({
+			toolName: "backlog",
+			input: { action: "add", text: "unrelated maintenance item" },
+			details: maintenance.details,
+			content: maintenance.content,
+		}, ctx);
+		assert.equal(matchingWakes().length, 1, "a later re-arm does not repeat an acknowledged wake");
+	} finally {
+		MindService.prototype.acknowledgeDue = originalAcknowledgeDue;
+		m.handlers.get("session_shutdown")?.({}, ctx);
+		t.mock.timers.reset();
+	}
 });
 
 test("the backlog tool queues and lists an item through the Pi surface", async () => {

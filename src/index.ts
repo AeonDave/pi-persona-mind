@@ -436,12 +436,22 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	// Backlog wake timers — only the elected owner session arms/fires them, so concurrent sessions
 	// never double-deliver. In-memory, unref'd, re-armed from disk on session start; cleared on shutdown.
 	const timers = new Map<string, ReturnType<typeof setTimeout>>();
+	// Undelivered alarms outlive their timeout handles: a concurrent re-arm or slow store read
+	// must not turn a deadline that just passed into an ignored, apparently old overdue item.
+	const pendingWakeIds = new Set<string>();
+	// Keep the exact displayed deadline until a fresh snapshot observes its acknowledgement.
+	// An in-flight-only guard would miss a pre-ack snapshot that returns after the write settles.
+	const displayedWakeDeadlines = new Map<string, number>();
 	let ownerPath: string | undefined;
 	let wakeGeneration = 0;
 	const readWakeState = opts.wakeStateReader ?? ((mind: MindService): Promise<WakeState> => mind.backlogList({ all: true }));
-	const clearTimers = (): void => {
+	const clearTimers = (preservePending = false): void => {
 		for (const t of timers.values()) clearTimeout(t);
 		timers.clear();
+		if (!preservePending) {
+			pendingWakeIds.clear();
+			displayedWakeDeadlines.clear();
+		}
 	};
 	const releaseWakeOwner = (): void => {
 		if (!ownerPath) return;
@@ -453,11 +463,14 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		}
 		ownerPath = undefined;
 	};
-	const armWakes = async (ctx: ExtensionContext, deliverPastDue = true): Promise<void> => {
+	const armWakes = async (ctx: ExtensionContext, deliverPastDue = true, newlyQueuedId?: string): Promise<void> => {
 		const generation = ++wakeGeneration;
-		clearTimers();
+		if (newlyQueuedId) pendingWakeIds.add(newlyQueuedId);
+		clearTimers(true);
 		const scope = resolveMindScope(ctx);
 		if (scope.homeWorkspace) {
+			pendingWakeIds.clear();
+			displayedWakeDeadlines.clear();
 			releaseWakeOwner();
 			return;
 		}
@@ -488,17 +501,26 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		// Deliver items that came due while offline as ONE combined reminder, instead of dropping them.
 		// Display-only: the mind is already injected on the next user turn; a follow-up would start the
 		// agent unprompted (it used to treat "Use backlog take" as an order to resume work).
-		const due = all.filter((item) => item.dueAtEpochMs !== undefined && item.dueAtEpochMs <= now);
-		if (deliverPastDue && due.length > 0) {
+		const activeWakeDeadlines = new Map<string, number>();
+		for (const item of all) if (item.dueAtEpochMs !== undefined) activeWakeDeadlines.set(item.id, item.dueAtEpochMs);
+		for (const id of pendingWakeIds) if (!activeWakeDeadlines.has(id)) pendingWakeIds.delete(id);
+		for (const [id, deadline] of displayedWakeDeadlines) if (activeWakeDeadlines.get(id) !== deadline) displayedWakeDeadlines.delete(id);
+		const due = all.filter((item) => item.dueAtEpochMs !== undefined && item.dueAtEpochMs <= now && displayedWakeDeadlines.get(item.id) !== item.dueAtEpochMs && (deliverPastDue || pendingWakeIds.has(item.id)));
+		if (due.length > 0) {
 			try {
 				const shown = due.slice(0, MAX_WAKE_REMINDERS);
 				const list = shown.map((e) => `• ${compactMemoryText(e.text, MAX_WAKE_TEXT_CHARS)} (id ${e.id})`).join("\n");
 				const omitted = due.length - shown.length;
 				const more = omitted > 0 ? `\n… +${omitted} more due item(s); use \`backlog list\` to review them.` : "";
 				if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
+				for (const item of due) {
+					pendingWakeIds.delete(item.id);
+					if (item.dueAtEpochMs !== undefined) displayedWakeDeadlines.set(item.id, item.dueAtEpochMs);
+				}
+				const headline = deliverPastDue ? `${due.length} backlog item(s) came due while you were away:` : `backlog due — ${due.length} item(s):`;
 				deliverWake(
 					ctx,
-					`${due.length} backlog item(s) came due while you were away:\n${list}${more}\nReview when ready — stale leads auto-remove after ~48h; keep durable facts in long-term memory.`,
+					`${headline}\n${list}${more}\nReview when ready — stale leads auto-remove after ~48h; keep durable facts in long-term memory.`,
 				);
 				await mind.acknowledgeDue(due.map((item) => item.id));
 			} catch {
@@ -508,6 +530,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		// Schedule the future ones.
 		const scheduleWake = (item: (typeof all)[number], remainingMs: number): void => {
 			if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
+			pendingWakeIds.add(item.id);
 			const delay = Math.min(Math.max(1, remainingMs), wakeTimerMaxDelayMs);
 			const t = setTimeout(() => {
 				if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
@@ -519,13 +542,22 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 						if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
 						const live = (await mind.backlogList({ all: true })).find((entry) => entry.id === item.id);
 						if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
-						if (!live || (live.state !== "open" && live.state !== "taken") || live.dueAtEpochMs === undefined) return;
+						if (!live || (live.state !== "open" && live.state !== "taken") || live.dueAtEpochMs === undefined) {
+							pendingWakeIds.delete(item.id);
+							return;
+						}
+						if (displayedWakeDeadlines.get(live.id) === live.dueAtEpochMs) {
+							pendingWakeIds.delete(live.id);
+							return;
+						}
 						const left = live.dueAtEpochMs - Date.now();
 						if (left > 0) {
 							scheduleWake(live, left);
 							return;
 						}
 						if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
+						pendingWakeIds.delete(item.id);
+						displayedWakeDeadlines.set(live.id, live.dueAtEpochMs);
 						deliverWake(
 							ctx,
 							`backlog due — ${compactMemoryText(live.text, MAX_WAKE_TEXT_CHARS)} (id ${live.id}). Review when ready.`,
@@ -862,7 +894,10 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 				// A due item added during a running session must be armed now, not only after the next
 				// restart. Re-arm on every successful backlog mutation so take/done/drop also cancel
 				// stale timers. Existing overdue items are not re-announced by this maintenance pass.
-				if (event.toolName === "backlog" && sessionActive) await armWakes(ctx, false);
+				if (event.toolName === "backlog" && sessionActive) {
+					const newlyQueuedId = event.input?.action === "add" && typeof details.id === "string" ? details.id : undefined;
+					await armWakes(ctx, false, newlyQueuedId);
+				}
 			}
 			return undefined;
 		}

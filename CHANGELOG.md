@@ -8,10 +8,14 @@
 - Reset capture hints and empty-store announcements when a session changes; prevent late capture
   notices and memory injection from leaking into the next session.
 - Skip migration/storage waits for ordinary input with no capture cue.
+- Preserve undelivered backlog alarms across slow storage reads and concurrent re-arm calls; a
+  newly queued reminder that is already due is shown immediately, without restarting Pi.
+- Deduplicate a reminder's displayed deadline while acknowledgement persists, including re-arms
+  triggered by background migration; a later deadline remains eligible.
 - Suggest backlog capture only for blocked nested output actually relayed by its outer tool.
 - Enforce erasable-only TypeScript, including store/service constructors.
-- Isolate test profiles; exercise capture, persistence, tool execution and read-only workers in real
-  Pi 1.0 SDK sessions with an offline provider.
+- Isolate test profiles; exercise capture, persistence, tool execution, display-only reminders and
+  read-only workers in real Pi 1.0 SDK sessions with an offline provider.
 - Align package/lock metadata, upgrade development dependencies and pin three-platform CI actions.
 
 Older storage roots remain readable through non-destructive migration. No existing store is deleted

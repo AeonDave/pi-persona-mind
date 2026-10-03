@@ -16,6 +16,13 @@
   authentication against arbitrary extensions that already execute with the same filesystem access.
 - Wakes remain display-only; storage migration remains non-destructive. Raising the host floor
   never deletes user data or removes the importer.
+- Undelivered wake IDs survive maintenance re-arms and in-flight reads. An added item already due
+  when its tool result arrives is delivered immediately; dropped/acknowledged IDs are removed,
+  and scope changes or shutdown clear this session state. Existing overdue reminders are not
+  repeatedly announced by unrelated backlog tool results.
+- Displayed reminders are deduplicated by item ID and deadline until a fresh read observes their
+  acknowledgement. A background migration re-arm cannot repeat a card while that write is pending;
+  a different deadline for the same item remains eligible. These markers are session-local.
 
 Real SDK regressions load the extension through Pi's public loader, use the host agent/tool pipeline
 and an offline provider, and isolate auth/model/cache/profile/workspace paths from the operator.

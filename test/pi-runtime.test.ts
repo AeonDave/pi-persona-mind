@@ -11,6 +11,37 @@ import { runtimeHarness } from "./setup/pi-runtime.ts";
 
 const entry = fileURLToPath(new URL("../src/index.ts", import.meta.url));
 
+test("real Pi 1.0: a newly overdue backlog alarm is displayed once without another model turn", { timeout: 30_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "mind-native-live-wake-"));
+  let h: Awaited<ReturnType<typeof runtimeHarness>> | undefined;
+  try {
+    h = await runtimeHarness(root, entry);
+    await h.bind();
+    h.session.setActiveToolsByName(["backlog"]);
+    h.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("backlog", { action: "add", text: "Review the finished CI run.", dueInSeconds: 0.0001 }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Queued."),
+    ]);
+    await h.session.prompt("Queue the verified reminder.", { source: "interactive" });
+    const results = h.session.messages.filter((message) => message.role === "toolResult");
+    assert.equal(results.length, 1);
+    assert.equal(results[0]!.isError, false);
+    const wakes = h.session.sessionManager.getEntries().filter((item) => item.type === "custom" && item.customType === "pi-persona-mind-wake");
+    assert.equal(wakes.length, 1, "the native tool-result pipeline emits exactly one durable display card");
+    assert.match(JSON.stringify(wakes[0]), /Review the finished CI run/);
+    assert.equal(h.faux.state.callCount, 2, "the display-only reminder does not wake the model");
+    h.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("backlog", { action: "list" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Reviewed."),
+    ]);
+    await h.session.prompt("List the queued work.");
+    assert.equal(h.session.sessionManager.getEntries().filter((item) => item.type === "custom" && item.customType === "pi-persona-mind-wake").length, 1, "maintenance does not repeat an acknowledged reminder");
+  } finally {
+    await h?.dispose();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("real Pi 1.0 codemode: only relayed blocked output nudges the supervisor", { timeout: 30_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "mind-native-codemode-"));
   let h: Awaited<ReturnType<typeof runtimeHarness>> | undefined;

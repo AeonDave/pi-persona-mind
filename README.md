@@ -103,6 +103,9 @@ toast. It never starts an agent turn. Reminders survive restarts, are acknowledg
 display, and have bounded previews. Open/due entries remain in the next turn's memory block
 until closed or expired.
 
+New reminders are armed immediately, even if their deadline passes during a storage write.
+Re-arming preserves pending alarms; closing an item cancels its reminder.
+
 Opening Pi from the home directory injects only long-term memory, not another project's
 backlog or its reminders.
 
