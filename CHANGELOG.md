@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## [0.8.1](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.8.1) - 2026-10-13
+
+- Handle Pi 1.2 custom-triggered completion reports from their attributed `before_agent_start`
+  message event, deduplicate follow-up nudges, and keep custom report text out of direct-user capture.
+
 ## [0.8.0](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.8.0) - 2026-10-03
 
 - Require Pi 1.0.0+ and Node.js 22.19.0+; keep host libraries and typebox as host-provided peers.

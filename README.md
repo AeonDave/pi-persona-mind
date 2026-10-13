@@ -20,6 +20,8 @@ Requires **Pi 1.0.0+** and **Node.js 22.19.0+**. Windows, Linux and macOS are su
 pi install git:github.com/AeonDave/pi-persona-mind
 ```
 
+To pin this release: `pi install git:github.com/AeonDave/pi-persona-mind@v0.8.1`.
+
 Restart Pi or run `/reload`. Mind registers the `memory` and `backlog` tools and the
 `/mind` command. No initial setup is required.
 

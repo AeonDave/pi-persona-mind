@@ -14,6 +14,10 @@
   parent call IDs and cleared at lifecycle boundaries.
 - `pi-persona-deferred-input` is a reserved trusted-extension convention for queued user input, not
   authentication against arbitrary extensions that already execute with the same filesystem access.
+- Pi 1.2 distinguishes user and custom `before_agent_start` triggers. A custom trigger has `message`,
+  not `prompt`, and precedes `message_start`. Preserve memory injection on both paths; read capture
+  intent only from user input or the attributed deferred-input convention, and process one custom
+  message once across the two hooks.
 - Wakes remain display-only; storage migration remains non-destructive. Raising the host floor
   never deletes user data or removes the importer.
 - Undelivered wake IDs survive maintenance re-arms and in-flight reads. An added item already due
@@ -290,8 +294,10 @@ sessions routinely. Two deterministic, model-free changes make the mind delegati
   surrender markers pi-persona's PersistenceNudge uses, and surfaces a deterministic status-line nudge
   to `backlog add` so a surrendered hand-off becomes captured deferred intent. Reached on both delivery
   paths: the sync `delegate`/`council` tool_result, and the background/async default where the report
-  arrives as an attributed custom message (observed at `message_start`, because Pi custom messages
-  bypass `input` and `before_agent_start`). Nudge-only, never auto-writes.
+  arrives as an attributed custom message. Pi 1.2 custom-triggered runs carry that message in the
+  `before_agent_start` custom variant (which has no `prompt`); the later `message_start` is deduplicated.
+  Only the dedicated `pi-persona-deferred-input` custom type represents replayed direct-user text.
+  Nudge-only, never auto-writes.
 
 ## v0.4 — audit hardening (correctness, durability, coupling parity)
 

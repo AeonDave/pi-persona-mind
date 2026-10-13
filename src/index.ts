@@ -626,6 +626,18 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		}
 	};
 	const isDelegatedReport = (prompt: string): boolean => /^(?:\[pi-persona\]\s+)?\d+\s+async runs? settled\b/i.test(prompt.trim());
+	const customMessagesHandledBeforeStart = new WeakSet<object>();
+	const customReportsNudged = new WeakSet<object>();
+	const deferredInputsProcessed = new WeakSet<object>();
+	const nudgeCustomDelegatedReport = (message: object, text: string, ctx: ExtensionContext) => {
+		if (!nudgeEnabled || !isDelegatedReport(text)) return undefined;
+		const blocked = detectBlockedLeg(text);
+		if (blocked && !customReportsNudged.has(message)) {
+			customReportsNudged.add(message);
+			nudgeBlocked(ctx, blocked.snippet);
+		}
+		return blocked;
+	};
 
 	interface CaptureNotice {
 		hint: string;
@@ -779,12 +791,16 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			.join("\n");
 	};
 
-	// pi-persona's custom follow-ups call Pi's sendMessage(), which bypasses BOTH the input and
-	// before_agent_start hooks. Observe their attributed message type directly: a deferred input is
-	// still the user's own text and may be auto-captured; async child/exocom reports remain foreign.
+	// Custom messages bypass `input`. Pi 1.2 custom-triggered starts are handled in before_agent_start;
+	// messages appended inside an existing run still arrive only here. A deferred input is replayed
+	// user text and may be auto-captured; async child/exocom reports remain foreign.
 	pi.on("message_start", async (event, ctx) => {
 		const message = event.message;
 		if (message.role !== "custom") return;
+		if (customMessagesHandledBeforeStart.has(message)) {
+			customMessagesHandledBeforeStart.delete(message);
+			return;
+		}
 		const lifecycleGeneration = sessionLifecycleGeneration;
 		const inputGeneration = ++captureInputGeneration;
 		pendingInputProvenance = { source: "extension" };
@@ -792,12 +808,13 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		const text = customMessageText(message.content);
 		if (!text) return;
 		if (message.customType === "pi-persona") {
-			const blocked = nudgeEnabled && isDelegatedReport(text) ? detectBlockedLeg(text) : undefined;
-			if (blocked) nudgeBlocked(ctx, blocked.snippet);
+			nudgeCustomDelegatedReport(message, text, ctx);
 			return;
 		}
 		if (message.customType === "pi-persona-deferred-input") {
 			if (isDelegatedLeg || capturePolicy === "off") return;
+			if (deferredInputsProcessed.has(message)) return;
+			deferredInputsProcessed.add(message);
 			pendingInputProvenance = { source: "interactive" };
 			latestDirectInputPrompt = text;
 			rememberDirectInputPrompt(text);
@@ -820,27 +837,68 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		if (lifecycleGeneration !== sessionLifecycleGeneration) return;
 		await reconcileScope(ctx, lifecycleGeneration);
 		if (lifecycleGeneration !== sessionLifecycleGeneration) return;
-		const provenance = pendingInputProvenance?.source;
+		let provenance = pendingInputProvenance?.source;
 		pendingInputProvenance = undefined;
+		// Pi 1.2 can start a run from an idle custom message. Its BeforeAgentStartEvent has
+		// messageType="custom" + message and deliberately has no prompt; Pi 1.0 only exposes prompt.
+		const currentEvent = event as typeof event & {
+			messageType?: unknown;
+			message?: { customType?: unknown; content?: unknown };
+		};
+		const customMessage = currentEvent.messageType === "custom" ? currentEvent.message : undefined;
+		if (customMessage) {
+			customMessagesHandledBeforeStart.add(customMessage);
+			provenance = customMessage.customType === "pi-persona-deferred-input" ? "interactive" : "extension";
+			const deferredWasAlreadyProcessed = customMessage.customType === "pi-persona-deferred-input" && deferredInputsProcessed.has(customMessage);
+			if (!deferredWasAlreadyProcessed) pendingCaptureNotice = undefined;
+		}
+		const userPrompt = currentEvent.messageType === "custom" ? undefined : event.prompt;
+		// Only the attributed deferred-input convention represents direct user text in a custom event.
+		// Other custom messages remain extension-authored, even if their bodies resemble user intent.
+		const directInputPrompt = customMessage
+			? customMessage.customType === "pi-persona-deferred-input" ? customMessageText(customMessage.content) : undefined
+			: userPrompt;
+		const delegatedReport = customMessage
+			? customMessage.customType === "pi-persona" ? customMessageText(customMessage.content) : undefined
+			: userPrompt;
+		if (customMessage?.customType === "pi-persona-deferred-input") {
+			provenance = "interactive";
+			if (typeof directInputPrompt === "string" && !deferredInputsProcessed.has(customMessage)) {
+				deferredInputsProcessed.add(customMessage);
+				const inputGeneration = ++captureInputGeneration;
+				latestDirectInputPrompt = directInputPrompt;
+				rememberDirectInputPrompt(directInputPrompt);
+				const notice = isDelegatedLeg || capturePolicy === "off"
+					? undefined
+					: await captureDirectCues(directInputPrompt, ctx, lifecycleGeneration, inputGeneration);
+				if (lifecycleGeneration === sessionLifecycleGeneration && inputGeneration === captureInputGeneration && latestDirectInputPrompt === directInputPrompt) {
+					pendingCaptureNotice = notice;
+				}
+			}
+		}
 		let cueHint = "";
 		if (!isDelegatedLeg) {
 			// A delegated leg that came back BLOCKED arrives HERE on the v1.5.0 async/background-default
-			// path: pi-persona delivers the completion report as a fresh follow-up user message, so it
-			// shows up as event.prompt (not a delegate tool_result). A blocked leg is deferred intent —
-			// nudge a backlog capture so the thread isn't lost. This takes precedence over the capture cue.
-			const blocked = nudgeEnabled && provenance === "extension" && isDelegatedReport(event.prompt) ? detectBlockedLeg(event.prompt) : undefined;
+			// path: pi-persona delivers the completion report as a follow-up user message; on Pi 1.2 an
+			// idle `sendMessage(..., { triggerTurn: true })` instead arrives in the custom-message variant.
+			// In both cases, provenance and the host's event discriminator keep foreign reports out of capture.
+			const blocked = customMessage?.customType === "pi-persona"
+				? nudgeCustomDelegatedReport(customMessage, delegatedReport ?? "", ctx)
+				: nudgeEnabled && provenance === "extension" && delegatedReport !== undefined && isDelegatedReport(delegatedReport)
+					? detectBlockedLeg(delegatedReport)
+					: undefined;
 			if (blocked) {
-				nudgeBlocked(ctx, blocked.snippet);
+				if (customMessage?.customType !== "pi-persona") nudgeBlocked(ctx, blocked.snippet);
 			} else if (capturePolicy !== "off") {
 				const notice = pendingCaptureNotice;
 				pendingCaptureNotice = undefined;
-				const promptBelongsToAnOlderDirectInput = directInputPrompts.has(event.prompt) && event.prompt !== latestDirectInputPrompt;
-				if (notice && (provenance === "interactive" || provenance === "rpc") && !promptBelongsToAnOlderDirectInput) {
+				const promptBelongsToAnOlderDirectInput = directInputPrompt !== undefined && directInputPrompts.has(directInputPrompt) && directInputPrompt !== latestDirectInputPrompt;
+				if (notice && directInputPrompt !== undefined && (provenance === "interactive" || provenance === "rpc") && !promptBelongsToAnOlderDirectInput) {
 					cueHint = notice.hint;
 				} else if (nudgeEnabled && provenance !== "extension") {
 					// Compatibility fallback for host paths that do not emit `input`: nudge only. Never auto-write
 					// here because an extension-authored follow-up is indistinguishable from direct user input.
-					const cue: CaptureCue | undefined = detectCaptureCues(event.prompt)[0];
+					const cue: CaptureCue | undefined = directInputPrompt === undefined ? undefined : detectCaptureCues(directInputPrompt)[0];
 					if (cue && !cueHinted.has(cue.snippet)) {
 						rememberCueHint(cue.snippet);
 						try {

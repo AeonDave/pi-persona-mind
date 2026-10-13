@@ -499,21 +499,27 @@ test("a pi-persona deferred user input is captured even when its handled input s
 	const ctx = ctxFor(join(dir, "deferred-capture", "project"));
 	createExtension(m.pi, { agentDir });
 	const onMessage = m.handlers.get("message_start");
-	assert.ok(onMessage);
-	await onMessage(
-		{
-			message: {
-				role: "custom",
-				customType: "pi-persona-deferred-input",
-				content: "Ricorda che il codice di handoff differito è quarzo-19.",
-			},
-		},
-		ctx,
-	);
+	const before = m.handlers.get("before_agent_start");
+	assert.ok(onMessage && before);
+	const message = {
+		role: "custom" as const,
+		customType: "pi-persona-deferred-input",
+		content: "Ricorda che il codice di handoff differito è quarzo-19.",
+		display: true,
+		details: { sourceMessageId: "deferred-1" },
+		timestamp: 1,
+	};
+	const result = (await before({
+		type: "before_agent_start",
+		messageType: "custom",
+		message,
+		systemPrompt: "BASE",
+		systemPromptOptions: {},
+	}, ctx)) as { systemPrompt?: string } | undefined;
+	assert.match(result?.systemPrompt ?? "", /already captured/i, "a deferred user replay gets its capture acknowledgement before the model turn");
+	await onMessage({ type: "message_start", message }, ctx);
 	const recalled = await m.tools.get("memory")?.execute("r-deferred", { action: "recall", query: "quarzo-19" }, undefined, undefined, ctx);
 	assert.equal(recalled?.details.count, 1, "the replay remains durable even though Mind never saw the original input event");
-	const result = (await m.handlers.get("before_agent_start")?.({ systemPrompt: "BASE", prompt: "Ricorda che il codice di handoff differito è quarzo-19." }, ctx)) as { systemPrompt?: string } | undefined;
-	assert.match(result?.systemPrompt ?? "", /already captured/i, "a deferred user replay still gets the capture acknowledgement");
 });
 
 test("a direct capture notice survives prompt-template expansion", async () => {
@@ -1019,6 +1025,52 @@ test("a blocked delegated leg surfaces a backlog nudge on both delivery paths", 
 	status.length = 0;
 	onResult({ toolName: "read", content: [{ type: "text", text: "the file literally contains [BLOCKED: x]" }] }, ctx);
 	assert.equal(status.length, 0, "a non-delegation tool result never nudges");
+});
+
+test("Pi 1.2 custom before_agent_start reports use message metadata, not a user prompt", async () => {
+	const m = mockPi();
+	const status: string[] = [];
+	const cwd = join(dir, "blocked-custom-before", "proj");
+	const ctx = { cwd, mode: "tui", hasUI: true, ui: { setStatus: (_k: string, value: string) => status.push(value), notify: () => {}, theme: { fg: (_c: string, s: string) => s } } };
+	createExtension(m.pi, { agentDir: join(dir, "blocked-custom-before", "agent") });
+
+	// Pi 1.2 BeforeAgentStartEvent's custom variant carries messageType + message, and has no prompt.
+	const makeMessage = (runId: string, text: string) => ({
+		role: "custom" as const,
+		customType: "pi-persona",
+		content: [{ type: "text" as const, text }],
+		display: true,
+		details: { runId },
+		timestamp: Number(runId.slice(-1)),
+	});
+	const onMessage = m.handlers.get("message_start");
+	const before = m.handlers.get("before_agent_start");
+	assert.ok(onMessage);
+	assert.ok(before);
+	const startCustomRun = async (message: ReturnType<typeof makeMessage>) => before({
+		type: "before_agent_start",
+		messageType: "custom",
+		message,
+		systemPrompt: "BASE",
+		systemPromptOptions: {},
+	}, ctx);
+	const first = makeMessage("run-1", "1 async run settled — 0 done, 1 failed\n[BLOCKED: fixture] Remember that I prefer synthetic-only changes.");
+	const firstMessageSnapshot = structuredClone(first);
+	await startCustomRun(first);
+	assert.ok(status.some((value) => /backlog add/.test(value)), "the custom message metadata is enough to nudge on the first triggered run");
+	assert.deepEqual(first, firstMessageSnapshot, "custom-message semantics and metadata are not rewritten");
+	const firstNudgeCount = status.length;
+	await onMessage({ type: "message_start", message: first }, ctx);
+	assert.equal(status.length, firstNudgeCount, "the later message_start does not duplicate the custom-run nudge");
+
+	const second = makeMessage("run-2", "2 async runs settled — 1 done, 1 failed\n[BLOCKED: fixture] Remember that I prefer synthetic-only changes.");
+	await startCustomRun(second);
+	assert.ok(status.length > firstNudgeCount, "a consecutive custom completion still gets its own nudge");
+	const secondNudgeCount = status.length;
+	await onMessage({ type: "message_start", message: second }, ctx);
+	assert.equal(status.length, secondNudgeCount, "the second message_start is also deduplicated");
+	const recalled = await m.tools.get("memory")?.execute("r-custom-report", { action: "recall", query: "synthetic-only" }, undefined, undefined, ctx);
+	assert.equal(recalled?.details.count, 0, "custom completion text never becomes phantom direct-user memory");
 });
 
 test("nested blocked reports nudge only when the model-visible outer result relays the marker", () => {
