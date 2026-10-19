@@ -18,6 +18,9 @@
   not `prompt`, and precedes `message_start`. Preserve memory injection on both paths; read capture
   intent only from user input or the attributed deferred-input convention, and process one custom
   message once across the two hooks.
+- Pi 1.3 keeps that trigger union and explicit `parentToolCallId` provenance. Keep minimum-host
+  SDK tests on Pi 1.0; `scripts/qualify-host.mjs` separately exercises the installed Pi 1.3 host,
+  optionally with pi-persona loaded in the same session and its delegated worker.
 - Wakes remain display-only; storage migration remains non-destructive. Raising the host floor
   never deletes user data or removes the importer.
 - Undelivered wake IDs survive maintenance re-arms and in-flight reads. An added item already due
@@ -133,8 +136,12 @@ interface BacklogEntry {
   when `PI_PERSONA_PERSIST` ≠ "off", else `_default`. The marker path follows
   `PI_PERSONA_STATE_FILE` and the agent dir follows
   `PI_AGENT_DIR`, so an env-pinned / persist-off / relocated session scopes to the same persona
-  pi-persona actually activated. CLI-argument and marker reads are read-only and best-effort; this is the
-  only pi-persona coupling.
+  selected at launch. CLI parsing stops at `--`, just like Pi: later `--persona` tokens are prompt
+  text. CLI-argument and marker reads are read-only and best-effort; this is the only pi-persona
+  coupling. Mind does not validate persona installation: standalone labels are supported, so when
+  using pi-persona, select an installed persona and heed its invalid-selection warning.
+- **Model assignments:** `/persona models [council-persona]` writes pi-persona's model configuration,
+  not its active-persona marker. It must not change Mind's memory scope or start inference.
 - **Persona → filename:** sanitized to one safe path segment. Any lossy spelling gets a stable hash
   suffix, so `alpha ops` cannot alias `alpha-ops`; internal sentinels and Windows device basenames are
   disambiguated, and non-Latin names get a stable content-derived segment.

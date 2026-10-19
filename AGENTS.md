@@ -8,6 +8,8 @@ A standalone Pi extension: durable persona-aware memory + backlog, loosely coupl
 - Typecheck: `npm run typecheck` (`tsc --noEmit`, strict + `exactOptionalPropertyTypes`)
 - Tests: `npm test` · both: `npm run verify`
 - Hermetic choke point: `node --import tsx --import ./test/setup/hermetic-env.ts --test test/*.test.ts`
+- Installed Pi 1.3 qualification: `node --import tsx scripts/qualify-host.mjs <absolute-pi-package-root> [<absolute-pi-persona-extension-path>]`
+  (isolated profile, offline synthetic provider; no cloud authentication/model-quality claim).
 
 ## Conventions
 
@@ -18,6 +20,8 @@ A standalone Pi extension: durable persona-aware memory + backlog, loosely coupl
   Keep the hermetic import on every direct test invocation. Real SDK tests use an offline provider.
 - No hard dependency on pi-persona. Mirror its persona resolution, `PI_PERSONA_LEG` /
   `PI_PERSONA_CHILD`, and `pi-persona-deferred-input` by env/customType only.
+- Respect CLI `--` as end-of-options. Model configuration changes are not persona switches;
+  `/persona models` must leave Mind's scope unchanged. Do not duplicate persona discovery here.
 - Wakes are display-only (`appendEntry` + toast). Never `sendUserMessage` / `triggerTurn`.
 - Lifecycle generations bound capture/injection UI state to the accepting session. An accepted
   explicit capture may finish in its original store; its acknowledgement must not leak to a new turn.

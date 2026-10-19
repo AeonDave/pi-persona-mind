@@ -20,7 +20,7 @@ Requires **Pi 1.0.0+** and **Node.js 22.19.0+**. Windows, Linux and macOS are su
 pi install git:github.com/AeonDave/pi-persona-mind
 ```
 
-To pin this release: `pi install git:github.com/AeonDave/pi-persona-mind@v0.8.1`.
+To pin this release: `pi install git:github.com/AeonDave/pi-persona-mind@v0.8.2`.
 
 Restart Pi or run `/reload`. Mind registers the `memory` and `backlog` tools and the
 `/mind` command. No initial setup is required.
@@ -137,6 +137,10 @@ The injected block combines shared and active-persona long-term memory with this
 non-expired notes and backlog. Switching persona swaps the private tier, not the project's
 work. Backlog `list` defaults to the current persona; `all: true` includes every persona.
 
+With pi-persona, `/persona models magi` changes council model assignments, not the active
+persona or its memory scope. CLI scope selection respects Pi's `--` end-of-options marker:
+`--persona` appearing after it is prompt text, not a persona switch.
+
 ## Storage & durability
 
 Writes use a same-directory temporary file, fsync and atomic rename, with exclusive
@@ -165,6 +169,17 @@ npm audit --audit-level=low
 Tests isolate the Pi profile and environment. They cover the pure core, lifecycle races and
 the **real Pi 1.0 SDK loader and tool pipeline**, using an offline provider without cloud
 credentials. CI runs on Windows, Ubuntu and macOS.
+
+To qualify against an installed **Pi 1.3.0** host, run:
+
+```bash
+node --import tsx scripts/qualify-host.mjs <absolute-pi-package-root> [<absolute-pi-persona-extension-path>]
+```
+
+The optional second path loads pi-persona alongside Mind to check persona switching, council
+model refresh and a real in-process worker's lean, read-only memory. The qualification uses
+temporary profiles and a local synthetic provider, blocks outbound fetches and removes its
+fixtures on exit. It checks host integration, not cloud authentication or live model quality.
 
 After packing and extracting into a temporary directory, run
 `node --import tsx scripts/qualify-package.ts <package>/src/index.ts` from this checkout to

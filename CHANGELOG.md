@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## [0.8.2](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.8.2) - 2026-10-19
+
+- Respect Pi's `--` CLI separator when resolving persona memory scope; prompt text resembling
+  `--persona` no longer selects a different memory store.
+- Add isolated installed-Pi 1.3 qualification alongside the minimum-Pi 1.0 SDK suite, including
+  optional pi-persona integration for model refresh and delegated read-only memory.
+
 ## [0.8.1](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.8.1) - 2026-10-13
 
 - Handle Pi 1.2 custom-triggered completion reports from their attributed `before_agent_start`

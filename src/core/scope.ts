@@ -156,6 +156,7 @@ export function personaFromCliArgs(args: readonly string[]): string | undefined 
 	let selected: string | undefined;
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
+		if (arg === "--") break;
 		if (arg === "-p" || arg === "--print") {
 			const next = args[i + 1];
 			// Match Pi's parser: a normal value (or the special `---`-prefixed form) is the print

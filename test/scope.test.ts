@@ -86,6 +86,10 @@ test("personaFromCliArgs mirrors Pi's string-flag forms without treating print p
 	assert.equal(personaFromCliArgs(["--print", "ordinary prompt mentioning --persona"]), undefined);
 	assert.equal(personaFromCliArgs(["-p", "--persona", "selected-after-empty-print"]), "selected-after-empty-print");
 	assert.equal(personaFromCliArgs(["--persona", "   "]), undefined);
+	assert.equal(personaFromCliArgs(["--", "--persona", "after-separator"]), undefined);
+	assert.equal(personaFromCliArgs(["--", "--persona=after-separator"]), undefined);
+	assert.equal(personaFromCliArgs(["--persona=before-separator", "--", "--persona=after-separator"]), "before-separator");
+	assert.equal(personaFromCliArgs(["-p", "--", "--persona", "after-separator"]), undefined);
 });
 
 test("activePersona mirrors pi-persona's precedence: PI_PERSONA_DEFAULT > (persist ? marker : none)", async () => {
