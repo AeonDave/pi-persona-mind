@@ -12,6 +12,7 @@
   cannot reset their supervisor's active scope or companion controls.
 - Match pi-persona's extension-factory snapshot for the scalar persona selectors, keeping Mind's
   memory scope aligned across `/new` sessions until Pi reloads/restarts extensions.
+- Reject malformed UTF-8 in canonical and legacy persona markers rather than deriving a replacement-character memory scope.
 
 ## [0.8.2](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.8.2) - 2026-10-19
 
