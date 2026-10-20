@@ -17,6 +17,7 @@ import { closeSync, existsSync, fstatSync, openSync, realpathSync, readSync, sta
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, win32 } from "node:path";
+import { TextDecoder } from "node:util";
 
 import { captureMode } from "./capture.ts";
 
@@ -535,7 +536,8 @@ function tryRead(path: string, maxBytes = MAX_PERSONA_STATE_BYTES): MarkerRead {
 		}
 		const final = fstatSync(fd);
 		if (!final.isFile() || final.size !== opened.size) return UNREADABLE;
-		return { kind: "present", raw: bytes.toString("utf8"), stamp: `${final.mtimeMs}:${final.size}:${final.ino}:${final.dev}` };
+		const raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+		return { kind: "present", raw, stamp: `${final.mtimeMs}:${final.size}:${final.ino}:${final.dev}` };
 	} catch {
 		return UNREADABLE;
 	} finally {

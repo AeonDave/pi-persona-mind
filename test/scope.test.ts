@@ -224,6 +224,32 @@ test("canonical mindCapture must be a string, not a coercible array", async () =
 	assert.equal(rawActivePersona(agentDir, {}, undefined, "array-mind-capture-session"), null);
 });
 
+test("canonical settings with malformed UTF-8 are unreadable instead of creating a replacement-character persona", async () => {
+	const agentDir = join(dir, "canonical-invalid-utf8-agent");
+	const settingsPath = await writeCanonicalSettings(agentDir, {
+		version: 1,
+		preferences: {},
+		personas: {},
+		lastPersona: "placeholder",
+		selectionRevision: 0,
+	});
+	const prefix = Buffer.from('{"version":1,"preferences":{},"personas":{},"lastPersona":"broken', "utf8");
+	const suffix = Buffer.from('","selectionRevision":0}', "utf8");
+	await writeFile(settingsPath, Buffer.concat([prefix, Buffer.from([0xc3, 0x28]), suffix]));
+	assert.equal(rawActivePersona(agentDir, {}, undefined, "canonical-invalid-utf8-session"), null);
+});
+
+test("legacy state with malformed UTF-8 is unreadable instead of creating a replacement-character persona", async () => {
+	const agentDir = join(dir, "legacy-invalid-utf8-agent");
+	const legacyFile = join(dir, "legacy-invalid-utf8.json");
+	await writeFile(legacyFile, Buffer.concat([
+		Buffer.from('{"lastPersona":"broken', "utf8"),
+		Buffer.from([0xc3, 0x28]),
+		Buffer.from('"}', "utf8"),
+	]));
+	assert.equal(rawActivePersona(agentDir, { PI_PERSONA_STATE_FILE: legacyFile }, undefined, "legacy-invalid-utf8-session"), null);
+});
+
 test("the first canonical persona off gesture beats a CLI seed when settings did not exist at startup", async () => {
 	const agentDir = join(dir, "canonical-first-off-agent");
 	const sessionId = "canonical-first-off-session";
