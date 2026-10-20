@@ -313,18 +313,34 @@ try {
 	assert.equal(fauxModel.state.callCount, callsBeforeWake, "A backlog display card must not trigger another model request");
 
 	if (hasParent) {
-		const alphaMarkerBeforePicker = await readFile(join(agentDir, "persona", "state.json"), "utf8");
+		const personaSettingsPath = join(agentDir, "persona", "settings.json");
+		const settingsBeforePicker = JSON.parse(await readFile(personaSettingsPath, "utf8"));
+		const selectionBeforePicker = {
+			lastPersona: settingsBeforePicker.lastPersona,
+			selectionRevision: settingsBeforePicker.selectionRevision ?? 0,
+		};
 		const requestsBeforePicker = fauxModel.state.callCount;
 		await session.prompt("/persona models magi");
 		assert.equal(fauxModel.state.callCount, requestsBeforePicker, "The real model picker must not issue a model request");
 		assert.equal(selectCalls.length, 3, `Expected 3 RPC selections for the MAGI cores; got ${selectCalls.length}`);
 		assert.ok(selectCalls.every(({ options }) => options.includes(mainRef)), "The local faux model was not offered in every picker");
-		assert.equal(await readFile(join(agentDir, "persona", "state.json"), "utf8"), alphaMarkerBeforePicker, "Model assignment changed the active persona/Mind marker");
-		const assignments = JSON.parse(await readFile(join(agentDir, "persona", "config.json"), "utf8"));
+		const settingsAfterPicker = JSON.parse(await readFile(personaSettingsPath, "utf8"));
+		assert.deepEqual({
+			lastPersona: settingsAfterPicker.lastPersona,
+			selectionRevision: settingsAfterPicker.selectionRevision ?? 0,
+		}, selectionBeforePicker, "Model assignment changed the active persona/Mind selection revision");
+		const assignments = settingsAfterPicker.personas;
 		assert.deepEqual(assignments.alpha?.models, { melchior: mainRef, balthasar: mainRef, casper: mainRef }, "MAGI model assignments were not stored under the active caller");
 		assert.equal(assignments.magi, undefined, "The borrowed MAGI profile was modified instead of the active caller");
 		const afterPickerRecall = await runTool("memory", { action: "recall", query: "Alpha-private convention", scope: "long" });
 		mustContain(textOf(afterPickerRecall.result?.content), alphaPrivate, "active memory scope after MAGI model refresh");
+		const callsBeforeSettingsReport = fauxModel.state.callCount;
+		const notificationOffset = notifications.length;
+		await session.prompt("/persona-settings show");
+		assert.equal(fauxModel.state.callCount, callsBeforeSettingsReport, "The unified settings report must not issue a model request");
+		const settingsReport = notifications.slice(notificationOffset).map(({ message }) => message).join("\n");
+		mustContain(settingsReport, "mindCapture: active=auto", "unified settings report Mind capture contribution");
+		mustContain(settingsReport, "mindNudge: active=On", "unified settings report Mind nudge contribution");
 	}
 
 	if (hasParent) {
@@ -387,6 +403,7 @@ try {
 		...(hasParent ? {
 			magiPickerSelections: selectCalls.length,
 			magiScopeUnchanged: true,
+			mindSettingsContributor: true,
 			alphaBetaIsolationAndSharedLtm: true,
 			delegatedLeanMind: true,
 			workerMindWriteTools: false,

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## [0.8.3](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.8.3) - 2026-10-20
+
+- Read persona selection and startup `defaultPersona`/`persist` preferences from pi-persona's
+  canonical settings store, preserving legacy marker fallback only when canonical settings are absent.
+- Contribute Mind's capture/nudge settings to pi-persona's unified settings panel, while retaining
+  environment overrides and session-start snapshot behavior.
+- Scope marker latches and Mind-specific preference snapshots to Pi session IDs so child sessions
+  cannot reset their supervisor's active scope or companion controls.
+- Match pi-persona's extension-factory snapshot for the scalar persona selectors, keeping Mind's
+  memory scope aligned across `/new` sessions until Pi reloads/restarts extensions.
+
 ## [0.8.2](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.8.2) - 2026-10-19
 
 - Respect Pi's `--` CLI separator when resolving persona memory scope; prompt text resembling

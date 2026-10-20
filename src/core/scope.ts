@@ -1,10 +1,10 @@
 /**
  * Scope resolution — where a mind's stores live, and which persona owns the view.
  *
- * The ONE coupling to pi-persona: the active persona is read (best-effort, read-only) from
- * pi-persona's own marker at `<agentDir>/persona/state.json` (`{ lastPersona }`). When pi-persona
- * is absent or no persona is selected, everything degrades to a `_default` scope, so the extension
- * is fully usable on its own.
+ * The ONE coupling to pi-persona: the active persona and startup preferences are read
+ * (best-effort, read-only) from `<agentDir>/persona/settings.json`. Older installs fall back to
+ * pi-persona's legacy `<agentDir>/persona/state.json` marker only while the canonical file is absent.
+ * When pi-persona is absent or no persona is selected, everything degrades to a `_default` scope.
  *
  * Layout under `<agentDir>/persona-mind/`:
  *   memory/ltm/<persona>.json   long-term, per persona (identity)
@@ -17,6 +17,8 @@ import { closeSync, existsSync, fstatSync, openSync, realpathSync, readSync, sta
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, win32 } from "node:path";
+
+import { captureMode } from "./capture.ts";
 
 export const DEFAULT_PERSONA = "_default";
 export const SHARED_SCOPE = "_shared";
@@ -54,8 +56,27 @@ export interface Scope {
 interface MarkerReading {
 	readable: boolean;
 	persona: string | null;
-	/** mtime/size/inode identity of the marker file; "" when it is absent or unreadable. */
+	/** Legacy file identity or canonical explicit-selection revision. */
 	stamp: string;
+	source?: "canonical" | "legacy";
+}
+
+interface StartupPreferences {
+	defaultPersona?: string;
+	persist?: boolean;
+	mindCapture?: MindSettings["mindCapture"];
+	mindNudge?: boolean;
+}
+
+export interface MindSettings {
+	mindCapture: "auto" | "prompt" | "off";
+	mindNudge: boolean;
+}
+
+/** Persona's own startup selectors are fixed for the lifetime of an activated extension factory. */
+export interface PersonaStartupSelectors {
+	defaultPersona?: string;
+	persist: boolean;
 }
 
 function readPersonaState(raw: string | undefined): MarkerReading {
@@ -73,7 +94,63 @@ function readMarker(path: string): MarkerReading {
 	const read = tryRead(path);
 	if (read.kind === "absent") return { readable: true, persona: null, stamp: "" };
 	if (read.kind === "unreadable") return { readable: false, persona: null, stamp: "" };
-	return { ...readPersonaState(read.raw), stamp: read.stamp };
+	return { ...readPersonaState(read.raw), stamp: read.stamp, source: "legacy" };
+}
+
+type CanonicalSettingsRead =
+	| { kind: "absent" }
+	| { kind: "unreadable" }
+	| { kind: "present"; reading: MarkerReading; preferences: StartupPreferences };
+
+/** Canonical settings are authoritative once present; malformed data never falls back to a stale marker. */
+function readCanonicalSettings(path: string): CanonicalSettingsRead {
+	const read = tryRead(path, MAX_PERSONA_SETTINGS_BYTES);
+	if (read.kind !== "present") return read;
+	try {
+		const parsed: unknown = JSON.parse(read.raw.replace(/^\uFEFF/, ""));
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { kind: "unreadable" };
+		const value = parsed as Record<string, unknown>;
+		if (value.version !== 1 || !Object.hasOwn(value, "lastPersona")) return { kind: "unreadable" };
+		const persona = value.lastPersona;
+		if (persona !== null && (typeof persona !== "string" || persona.length === 0)) return { kind: "unreadable" };
+		const preferencesValue = value.preferences;
+		if (!preferencesValue || typeof preferencesValue !== "object" || Array.isArray(preferencesValue)) return { kind: "unreadable" };
+		const preferenceRecord = preferencesValue as Record<string, unknown>;
+		if (Object.hasOwn(preferenceRecord, "defaultPersona") && typeof preferenceRecord.defaultPersona !== "string") return { kind: "unreadable" };
+		if (Object.hasOwn(preferenceRecord, "persist") && typeof preferenceRecord.persist !== "boolean") return { kind: "unreadable" };
+		if (Object.hasOwn(preferenceRecord, "mindCapture") && (typeof preferenceRecord.mindCapture !== "string" || !["auto", "prompt", "off"].includes(preferenceRecord.mindCapture))) return { kind: "unreadable" };
+		if (Object.hasOwn(preferenceRecord, "mindNudge") && typeof preferenceRecord.mindNudge !== "boolean") return { kind: "unreadable" };
+		const revision = Object.hasOwn(value, "selectionRevision") ? value.selectionRevision : 0;
+		if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0) return { kind: "unreadable" };
+		const preferences: StartupPreferences = {};
+		if (typeof preferenceRecord.defaultPersona === "string") preferences.defaultPersona = preferenceRecord.defaultPersona;
+		if (typeof preferenceRecord.persist === "boolean") preferences.persist = preferenceRecord.persist;
+		if (preferenceRecord.mindCapture === "auto" || preferenceRecord.mindCapture === "prompt" || preferenceRecord.mindCapture === "off") {
+			preferences.mindCapture = preferenceRecord.mindCapture;
+		}
+		if (typeof preferenceRecord.mindNudge === "boolean") preferences.mindNudge = preferenceRecord.mindNudge;
+		return {
+			kind: "present",
+			reading: { readable: true, persona: persona as string | null, stamp: `revision:${revision}`, source: "canonical" },
+			preferences,
+		};
+	} catch {
+		return { kind: "unreadable" };
+	}
+}
+
+function markerForPersona(
+	agentDir: string,
+	env: NodeJS.ProcessEnv,
+	canonical: CanonicalSettingsRead,
+): { path: string; reading: MarkerReading } {
+	const canonicalPath = join(agentDir, "persona", "settings.json");
+	if (canonical.kind === "present") return { path: canonicalPath, reading: canonical.reading };
+	if (canonical.kind === "unreadable") return { path: canonicalPath, reading: { readable: false, persona: null, stamp: "", source: "canonical" } };
+	const legacyPath = personaStateFile(agentDir, env);
+	// Keep one latch identity as the canonical store appears during this session. The source and
+	// revision on the reading distinguish a migration from a real explicit selection.
+	return { path: canonicalPath, reading: readMarker(legacyPath) };
 }
 
 /** Read pi-persona's `{ lastPersona }` marker; the selected persona NAME, or null when none is
@@ -92,8 +169,11 @@ const RESERVED_SCOPES: ReadonlySet<string> = new Set([DEFAULT_PERSONA, SHARED_SC
  *  write-to-void) in legacy Win32 path resolution, so a persona named after one must not be a filename. */
 const WIN_RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 const MAX_PERSONA_STATE_BYTES = 64 * 1024;
+const MAX_PERSONA_SETTINGS_BYTES = 1024 * 1024;
 const MAX_CANONICAL_CACHE_ENTRIES = 256;
 const canonicalProjectCache = new Map<string, string>();
+const startupPreferences = new Map<string, StartupPreferences>();
+const resolvedMindSettings = new Map<string, MindSettings>();
 
 function isReservedSegment(s: string): boolean {
 	const deviceBase = s.split(".", 1)[0] ?? s;
@@ -189,27 +269,72 @@ export function personaFromCliArgs(args: readonly string[]): string | undefined 
  * `/persona off`) outranks them from that turn on. Mirroring both stages keeps the mind from injecting
  * or writing a different persona's memory than the one pi-persona actually activated.
  */
-export function activePersona(agentDir: string, env: NodeJS.ProcessEnv = process.env, cliPersona?: string): string {
-	const named = rawActivePersona(agentDir, env, cliPersona);
+export function activePersona(agentDir: string, env: NodeJS.ProcessEnv = process.env, cliPersona?: string, sessionId?: string): string {
+	const named = rawActivePersona(agentDir, env, cliPersona, sessionId);
 	return named ? sanitizePersona(named) : DEFAULT_PERSONA;
 }
 
 /**
  * The marker as this process FIRST observed it, per marker path, plus whether it has changed since.
- * `--persona` and `PI_PERSONA_DEFAULT` are session-start SEEDS: pi-persona activates them without
- * persisting anything, so a marker that changes afterwards can only be a live `/persona` switch (or
- * `/persona off`), which pi-persona DOES persist. The change is latched, so switching back to the
- * name the marker originally held is still recognised as a switch rather than read as the seed.
+ * `--persona`, `PI_PERSONA_DEFAULT`, and the saved default/persist selectors are activation-time
+ * SEEDS: pi-persona resolves its config when the extension factory activates, without persisting
+ * those values. A marker that changes afterwards can only be a live `/persona` switch (or `/persona
+ * off`), which pi-persona DOES persist. The change is latched, so switching back to the name the
+ * marker originally held is still recognised as a switch rather than read as the seed.
  *
- * Process-global until {@link resetPersonaMarkerLatch} — "a switch happened" is a fact about the
- * current Pi session. Call the reset from `session_start`/`session_shutdown` so a reused process
- * does not inherit the previous session's latch.
+ * Scoped to a Pi session and marker path — "a switch happened" is a fact about that session.
+ * Call the reset from `session_start`/`session_shutdown` with the session id so an in-process child
+ * cannot clear its supervisor's marker latch or Mind-specific preference snapshot.
  */
-const personaMarkers = new Map<string, { baseline: string | null; stamp: string; switched: boolean }>();
+const personaMarkers = new Map<string, { baseline: string | null; stamp: string; source?: MarkerReading["source"]; switched: boolean }>();
 
-/** Drop every session-scoped marker latch. A new Pi session must start from the launch seed. */
-export function resetPersonaMarkerLatch(): void {
-	personaMarkers.clear();
+function sessionPathKey(sessionId: string | undefined, path: string): string {
+	return `${sessionId ?? "<standalone>"}\0${path}`;
+}
+
+/** Drop one session's marker latches and preference snapshot, or all state for legacy callers. */
+export function resetPersonaMarkerLatch(sessionId?: string): void {
+	if (sessionId === undefined) {
+		personaMarkers.clear();
+		startupPreferences.clear();
+		resolvedMindSettings.clear();
+		return;
+	}
+	const prefix = `${sessionId}\0`;
+	for (const key of personaMarkers.keys()) if (key.startsWith(prefix)) personaMarkers.delete(key);
+	for (const key of startupPreferences.keys()) if (key.startsWith(prefix)) startupPreferences.delete(key);
+	for (const key of resolvedMindSettings.keys()) if (key.startsWith(prefix)) resolvedMindSettings.delete(key);
+}
+
+function preferenceSnapshot(agentDir: string, canonical: CanonicalSettingsRead, sessionId?: string): StartupPreferences {
+	const path = join(agentDir, "persona", "settings.json");
+	const key = sessionPathKey(sessionId, path);
+	let preferences = startupPreferences.get(key);
+	if (preferences === undefined) {
+		preferences = canonical.kind === "present" ? canonical.preferences : {};
+		startupPreferences.set(key, preferences);
+	}
+	return preferences;
+}
+
+function selectorsFromPreferences(preferences: StartupPreferences, env: NodeJS.ProcessEnv): PersonaStartupSelectors {
+	const defaultPersona = env.PI_PERSONA_DEFAULT !== undefined
+		? env.PI_PERSONA_DEFAULT.trim()
+		: preferences.defaultPersona?.trim();
+	const envPersist = env.PI_PERSONA_PERSIST;
+	const persist = envPersist !== undefined
+		? envPersist.trim().toLowerCase() !== "off"
+		: preferences.persist ?? true;
+	return {
+		...(defaultPersona ? { defaultPersona } : {}),
+		persist,
+	};
+}
+
+/** Snapshot Persona's persisted/env selectors at its extension-factory activation boundary. */
+export function resolvePersonaStartupSelectors(agentDir: string, env: NodeJS.ProcessEnv = process.env): PersonaStartupSelectors {
+	const canonical = readCanonicalSettings(join(agentDir, "persona", "settings.json"));
+	return selectorsFromPreferences(canonical.kind === "present" ? canonical.preferences : {}, env);
 }
 
 /** Has pi-persona rewritten its marker since this process started? Only a READABLE (or ABSENT) marker
@@ -217,15 +342,38 @@ export function resetPersonaMarkerLatch(): void {
  *  the named persona AND the file identity are compared: pi-persona persists only on a user gesture
  *  (`/persona <name>`, the F8 cycle, `/persona off`), so ANY rewrite it made is a live selection, even
  *  when it re-selects the name the marker already held. */
-function markerSwitched(path: string, marker: MarkerReading): boolean {
-	const seen = personaMarkers.get(path);
+function markerSwitched(path: string, marker: MarkerReading, sessionId?: string): boolean {
+	const key = sessionPathKey(sessionId, path);
+	const seen = personaMarkers.get(key);
 	if (seen === undefined) {
-		if (marker.readable) personaMarkers.set(path, { baseline: marker.persona, stamp: marker.stamp, switched: false });
+		if (marker.readable) personaMarkers.set(key, { baseline: marker.persona, stamp: marker.stamp, source: marker.source, switched: false });
 		return false;
 	}
 	if (seen.switched) return true;
 	if (!marker.readable) return false;
-	if (seen.baseline === marker.persona && seen.stamp === marker.stamp) return false;
+	if (seen.baseline === marker.persona) {
+		// A canonical rev-0 file is only a migration/preferences write. Adopt it as the new baseline
+		// so a later revision increment remains visible. The first rev>0 canonical file, however,
+		// represents an explicit gesture even when its selected name matches the old marker.
+		if (seen.source !== marker.source && marker.source === "canonical") {
+			const revision = /^revision:(\d+)$/.exec(marker.stamp)?.[1];
+			if (revision !== undefined && Number(revision) > 0) {
+				seen.switched = true;
+				return true;
+			}
+			seen.source = marker.source;
+			seen.stamp = marker.stamp;
+			return false;
+		}
+		// If canonical data disappears and the fallback has the same name, treat it as another
+		// source transition, not a user selection.
+		if (seen.source === "canonical" && marker.source !== "canonical") {
+			seen.source = marker.source;
+			seen.stamp = marker.stamp;
+			return false;
+		}
+		if (seen.stamp === marker.stamp) return false;
+	}
 	seen.switched = true;
 	return true;
 }
@@ -235,16 +383,40 @@ function markerSwitched(path: string, marker: MarkerReading): boolean {
  * rewritten its marker mid-session — the persona it switched TO. Initialization also uses this to
  * reconcile old filenames before the current collision-proof segment is applied.
  */
-export function rawActivePersona(agentDir: string, env: NodeJS.ProcessEnv = process.env, cliPersona?: string): string | null {
+export function rawActivePersona(
+	agentDir: string,
+	env: NodeJS.ProcessEnv = process.env,
+	cliPersona?: string,
+	sessionId?: string,
+	startupSelectors?: PersonaStartupSelectors,
+): string | null {
 	const live = cliPersona?.trim();
-	const pin = env.PI_PERSONA_DEFAULT?.trim();
-	const persist = env.PI_PERSONA_PERSIST?.trim().toLowerCase() !== "off";
-	const seed = live ? live : pin ? pin : null;
+	const canonicalPath = join(agentDir, "persona", "settings.json");
+	const canonical = readCanonicalSettings(canonicalPath);
+	const selectors = startupSelectors ?? selectorsFromPreferences(preferenceSnapshot(agentDir, canonical, sessionId), env);
+	const seed = live ? live : selectors.defaultPersona ?? null;
 	// persist=off: pi-persona neither reads nor writes the marker, so there is no live signal to follow.
-	if (!persist) return seed;
-	const path = personaStateFile(agentDir, env);
-	const marker = readMarker(path);
-	return seed === null || markerSwitched(path, marker) ? marker.persona : seed;
+	if (!selectors.persist) return seed;
+	const marker = markerForPersona(agentDir, env, canonical);
+	const path = marker.path;
+	return seed === null || markerSwitched(path, marker.reading, sessionId) ? marker.reading.persona : seed;
+}
+
+export function resolveMindSettings(agentDir: string, env: NodeJS.ProcessEnv = process.env, sessionId?: string): MindSettings {
+	const canonicalPath = join(agentDir, "persona", "settings.json");
+	const key = sessionPathKey(sessionId, canonicalPath);
+	const cached = resolvedMindSettings.get(key);
+	if (cached !== undefined) return { ...cached };
+	const preferences = preferenceSnapshot(agentDir, readCanonicalSettings(canonicalPath), sessionId);
+	const mindCapture = env.PI_PERSONA_MIND_CAPTURE !== undefined
+		? captureMode({ PI_PERSONA_MIND_CAPTURE: env.PI_PERSONA_MIND_CAPTURE })
+		: preferences.mindCapture ?? "auto";
+	const mindNudge = env.PI_PERSONA_MIND_NUDGE !== undefined
+		? env.PI_PERSONA_MIND_NUDGE !== "off"
+		: preferences.mindNudge ?? true;
+	const settings = { mindCapture, mindNudge };
+	resolvedMindSettings.set(key, settings);
+	return { ...settings };
 }
 
 export interface ProjectSlugOptions {
@@ -341,7 +513,7 @@ const UNREADABLE: MarkerRead = { kind: "unreadable" };
  * {@link markerSwitched} — absence is pi-persona's own "nothing persisted yet", while an unreadable
  * marker is no evidence at all. The stamp is the file identity a later read is compared against.
  */
-function tryRead(path: string): MarkerRead {
+function tryRead(path: string, maxBytes = MAX_PERSONA_STATE_BYTES): MarkerRead {
 	let fd: number | undefined;
 	try {
 		let listed;
@@ -350,10 +522,10 @@ function tryRead(path: string): MarkerRead {
 		} catch (err) {
 			return (err as NodeJS.ErrnoException).code === "ENOENT" ? ABSENT : UNREADABLE;
 		}
-		if (!listed.isFile() || !Number.isSafeInteger(listed.size) || listed.size > MAX_PERSONA_STATE_BYTES) return UNREADABLE;
+		if (!listed.isFile() || !Number.isSafeInteger(listed.size) || listed.size > maxBytes) return UNREADABLE;
 		fd = openSync(path, "r");
 		const opened = fstatSync(fd);
-		if (!opened.isFile() || opened.size !== listed.size || opened.size > MAX_PERSONA_STATE_BYTES) return UNREADABLE;
+		if (!opened.isFile() || opened.size !== listed.size || opened.size > maxBytes) return UNREADABLE;
 		const bytes = Buffer.allocUnsafe(opened.size);
 		let offset = 0;
 		while (offset < bytes.length) {
@@ -374,6 +546,10 @@ function tryRead(path: string): MarkerRead {
 export interface ScopeResolutionOptions {
 	/** Live pi-persona `--persona` value. It outranks env and the persisted marker. */
 	cliPersona?: string;
+	/** Pi session identity; marker latches and startup preferences are scoped to this session. */
+	sessionId?: string;
+	/** Persona selectors captured when the owning Pi extension factory was activated. */
+	startupSelectors?: PersonaStartupSelectors;
 	/** Injectable process environment for tests/embedders. */
 	env?: NodeJS.ProcessEnv;
 	/** Injectable home directory; defaults to os.homedir(). */
@@ -382,7 +558,8 @@ export interface ScopeResolutionOptions {
 
 /** Resolve the full scope for a turn: active persona, project root, and the store paths. */
 export function resolveScope(agentDir: string, cwd: string, opts: ScopeResolutionOptions = {}): Scope {
-	const persona = activePersona(agentDir, opts.env ?? process.env, opts.cliPersona);
+	const rawPersona = rawActivePersona(agentDir, opts.env ?? process.env, opts.cliPersona, opts.sessionId, opts.startupSelectors);
+	const persona = rawPersona ? sanitizePersona(rawPersona) : DEFAULT_PERSONA;
 	const home = opts.homedir ?? homedir();
 	const start = resolve(cwd);
 	const projectRoot = findProjectRoot(start, (d) => existsSync(join(d, ".git")), {

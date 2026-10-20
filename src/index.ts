@@ -18,11 +18,11 @@ import { getAgentDir, VERSION } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { detectBlockedLeg } from "./core/blocked.ts";
-import { captureMode, detectCaptureCues, type CaptureCue } from "./core/capture.ts";
+import { detectCaptureCues, type CaptureCue } from "./core/capture.ts";
 import { EMPTY_HINT_PREFIX } from "./core/inject.ts";
 import { compactMemoryText } from "./core/memory.ts";
 import { inspectStoreFile, migrateCurrentScopeAliases, migrateLegacyRoot, type MigrationReport, type StoreDiagnostic } from "./core/migrate.ts";
-import { personaFromCliArgs, preferredAgentDir, rawActivePersona, resetPersonaMarkerLatch, resolveScope } from "./core/scope.ts";
+import { personaFromCliArgs, preferredAgentDir, rawActivePersona, resetPersonaMarkerLatch, resolveMindSettings, resolvePersonaStartupSelectors, resolveScope } from "./core/scope.ts";
 import { MindService } from "./core/service.ts";
 import { registerBacklogTool } from "./tools/backlog.ts";
 import { registerMemoryTool } from "./tools/memory.ts";
@@ -244,17 +244,26 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	// mind never reads a stale/missing marker under the wrong root). getAgentDir() stays lazy — only
 	// called when neither an explicit override (tests) nor PI_AGENT_DIR is set.
 	const agentDir = preferredAgentDir(opts.agentDir) ?? getAgentDir();
-	const nudgeEnabled = process.env.PI_PERSONA_MIND_NUDGE !== "off";
-	const capturePolicy = captureMode();
+	// Persona reads defaultPersona/persist when its extension factory activates. Keep Mind's scope
+	// selectors on that same snapshot even when the host reuses this factory for `/new` sessions.
+	const personaStartupSelectors = resolvePersonaStartupSelectors(agentDir);
+	let { mindCapture: capturePolicy, mindNudge: nudgeEnabled } = resolveMindSettings(agentDir);
+	let settingsCollectUnsubscribe: (() => void) | undefined;
 	// pi-persona's one-shot `--persona` selector deliberately does not update its persisted marker.
 	// Pi scopes getFlag() to the extension that registered a flag and rejects duplicate declarations,
 	// so a companion extension must mirror this CLI-only selector from argv. Persona names stay opaque.
 	const liveCliPersona = (): string | undefined => personaFromCliArgs(opts.cliArgs ?? process.argv.slice(2));
+	const sessionIdOf = (ctx: ExtensionContext): string | undefined => ctx.sessionManager?.getSessionId();
 	const resolveMindScope = (ctx: ExtensionContext) => {
 		const cliPersona = liveCliPersona();
-		return cliPersona === undefined ? resolveScope(agentDir, ctx.cwd) : resolveScope(agentDir, ctx.cwd, { cliPersona });
+		const sessionId = sessionIdOf(ctx);
+		return resolveScope(agentDir, ctx.cwd, {
+			...(cliPersona === undefined ? {} : { cliPersona }),
+			...(sessionId === undefined ? {} : { sessionId }),
+			startupSelectors: personaStartupSelectors,
+		});
 	};
-	const rawMindPersona = (): string | null => rawActivePersona(agentDir, process.env, liveCliPersona());
+	const rawMindPersona = (ctx: ExtensionContext): string | null => rawActivePersona(agentDir, process.env, liveCliPersona(), sessionIdOf(ctx), personaStartupSelectors);
 	const migrationWaitMs = Math.max(0, opts.migrationAwaitMs ?? MIGRATION_AWAIT_MS);
 	const wakeTimerMaxDelayMs = Math.min(MAX_TIMER_DELAY_MS, Math.max(1, opts.wakeTimerMaxDelayMs ?? MAX_TIMER_DELAY_MS));
 	const ownerToken = `${hostname()}:${process.pid}:${++ownerInstanceSeq}`;
@@ -342,7 +351,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	const runMigration = async (ctx: ExtensionContext, includeAmbiguousPersonaAlias: boolean): Promise<MigrationReport> => {
 		const rootReport = await (rootMigration ??= migrateLegacyRoot(agentDir));
 		const scope = resolveMindScope(ctx);
-		const rawPersona = rawMindPersona();
+		const rawPersona = rawMindPersona(ctx);
 		const aliasKey = JSON.stringify([rawPersona, scope.projectRoot, includeAmbiguousPersonaAlias]);
 		let aliasPromise = aliasMigrations.get(aliasKey);
 		if (!aliasPromise) {
@@ -367,7 +376,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	};
 	const startBackgroundMigration = (ctx: ExtensionContext): Promise<MigrationReport> => {
 		const scope = resolveMindScope(ctx);
-		const key = JSON.stringify([rawMindPersona(), scope.projectRoot]);
+		const key = JSON.stringify([rawMindPersona(ctx), scope.projectRoot]);
 		if (backgroundMigration && backgroundMigrationKey === key) return backgroundMigration;
 		const task = runMigration(ctx, false);
 		backgroundMigration = task;
@@ -973,10 +982,28 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 
 	pi.on("session_start", async (_event, ctx) => {
 		const lifecycleGeneration = resetSessionTransientState();
+		const sessionId = sessionIdOf(ctx);
+		settingsCollectUnsubscribe?.();
+		settingsCollectUnsubscribe = undefined;
 		// A reused Pi process must not inherit the previous session's persona-switch latch.
-		resetPersonaMarkerLatch();
+		resetPersonaMarkerLatch(sessionId);
+		const mindSettings = resolveMindSettings(agentDir, process.env, sessionId);
+		capturePolicy = mindSettings.mindCapture;
+		nudgeEnabled = mindSettings.mindNudge;
 		// A worker never arms/fires the supervisor's backlog wakes (nor shows a status line).
 		if (isDelegatedLeg) return;
+		if (pi.events && typeof pi.events.on === "function") {
+			settingsCollectUnsubscribe = pi.events.on("pi-persona:settings:collect:v1", (payload) => {
+				if (!payload || typeof payload !== "object") return;
+				const add = (payload as { add?: unknown }).add;
+				if (typeof add !== "function") return;
+				try {
+					add("mind", { mindCapture: capturePolicy, mindNudge: nudgeEnabled });
+				} catch {
+					/* an optional settings consumer must not interrupt a Pi lifecycle event */
+				}
+			});
+		}
 		sessionActive = true;
 		sessionStarting = true;
 		try {
@@ -1002,11 +1029,13 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		}
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (_event, ctx) => {
 		resetSessionTransientState();
 		sessionActive = false;
 		sessionStarting = false;
-		resetPersonaMarkerLatch();
+		settingsCollectUnsubscribe?.();
+		settingsCollectUnsubscribe = undefined;
+		resetPersonaMarkerLatch(sessionIdOf(ctx));
 		wakeGeneration++;
 		clearTimers();
 		releaseWakeOwner();
@@ -1023,7 +1052,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 				return;
 			}
 			if (command === "migrate-persona") {
-				const rawPersona = rawMindPersona();
+				const rawPersona = rawMindPersona(ctx);
 				await ensureLegacyMigrated(ctx, true, true);
 				surfaceWarning(
 					ctx,

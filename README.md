@@ -11,6 +11,14 @@ uses normal context tokens.
 
 It works standalone. With [pi-persona](https://github.com/AeonDave/pi-persona), long-term
 memory follows the active persona and delegated workers receive a lean, read-only version.
+Mind reads persona selection plus `defaultPersona`/`persist` from pi-persona's canonical
+`persona/settings.json` without writing it. It mirrors pi-persona's extension-activation snapshot:
+saved preference edits remain pending until Pi reloads/restarts extensions, not merely until `/new`.
+The live CLI and environment pins still win, and a persisted in-session persona switch is followed.
+Mind's own capture/nudge preferences can refresh at the next session start. Older installs fall
+back to the legacy state marker only while the canonical settings file is absent.
+The unified settings panel also reads Mind's `mindCapture` and `mindNudge` values from that file;
+`PI_PERSONA_MIND_CAPTURE` and `PI_PERSONA_MIND_NUDGE` remain explicit environment overrides.
 
 ## Install
 
@@ -20,7 +28,7 @@ Requires **Pi 1.0.0+** and **Node.js 22.19.0+**. Windows, Linux and macOS are su
 pi install git:github.com/AeonDave/pi-persona-mind
 ```
 
-To pin this release: `pi install git:github.com/AeonDave/pi-persona-mind@v0.8.2`.
+To pin this release: `pi install git:github.com/AeonDave/pi-persona-mind@v0.8.3`.
 
 Restart Pi or run `/reload`. Mind registers the `memory` and `backlog` tools and the
 `/mind` command. No initial setup is required.

@@ -18,7 +18,12 @@ A standalone Pi extension: durable persona-aware memory + backlog, loosely coupl
   with all four Pi development packages pinned together. Never bundle a second host runtime.
 - Tests clear `PI_PERSONA_*` case-insensitively and pin `PI_AGENT_DIR` to a throwaway directory.
   Keep the hermetic import on every direct test invocation. Real SDK tests use an offline provider.
-- No hard dependency on pi-persona. Mirror its persona resolution, `PI_PERSONA_LEG` /
+- No hard dependency on pi-persona. Read its canonical `<agentDir>/persona/settings.json` when valid,
+  fall back to `PI_PERSONA_STATE_FILE` / `persona/state.json` only when that file is absent, and
+  mirror persona resolution without writing or hot-applying saved preferences. Snapshot Persona's
+  `defaultPersona`/`persist` selectors at extension-factory activation; keep Mind's own
+  `mindCapture`/`mindNudge` preference snapshots session-scoped. Contribute effective Mind settings
+  only from a supervisor via the shared settings event bus. Mirror `PI_PERSONA_LEG` /
   `PI_PERSONA_CHILD`, and `pi-persona-deferred-input` by env/customType only.
 - Respect CLI `--` as end-of-options. Model configuration changes are not persona switches;
   `/persona models` must leave Mind's scope unchanged. Do not duplicate persona discovery here.

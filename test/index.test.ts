@@ -44,6 +44,22 @@ function mockPi(flags: Readonly<Record<string, boolean | string | undefined>> = 
 	const messages: string[] = [];
 	const messageOptions: Array<{ deliverAs?: "steer" | "followUp" }> = [];
 	const entries: WakeEntry[] = [];
+	const eventHandlers = new Map<string, Set<(data: unknown) => void>>();
+	const events = {
+		on: (channel: string, handler: (data: unknown) => void) => {
+			const handlers = eventHandlers.get(channel) ?? new Set<(data: unknown) => void>();
+			handlers.add(handler);
+			eventHandlers.set(channel, handlers);
+			return () => {
+				handlers.delete(handler);
+				if (handlers.size === 0) eventHandlers.delete(channel);
+			};
+		},
+		emit: (channel: string, data: unknown) => {
+			for (const handler of eventHandlers.get(channel) ?? []) handler(data);
+		},
+		listenerCount: (channel: string) => eventHandlers.get(channel)?.size ?? 0,
+	};
 	const pi = {
 		registerTool: (t: ToolLike) => tools.set(t.name, t),
 		registerCommand: (name: string, def: CommandLike) => commands.set(name, def),
@@ -60,8 +76,9 @@ function mockPi(flags: Readonly<Record<string, boolean | string | undefined>> = 
 		appendEntry: (type: string, data: { content?: string }) => {
 			entries.push({ type, data });
 		},
+		events,
 	};
-	return { pi: pi as never, tools, commands, handlers, messages, messageOptions, entries };
+	return { pi: pi as never, tools, commands, handlers, messages, messageOptions, entries, events };
 }
 
 function wakeTexts(m: { entries: WakeEntry[] }): string[] {
@@ -76,8 +93,16 @@ async function waitForCondition(description: string, condition: () => boolean, t
 	assert.ok(condition(), `timed out waiting for ${description}`);
 }
 
-function ctxFor(cwd: string) {
-	return { cwd, mode: "tui", hasUI: true, ui: { setStatus: () => {}, notify: () => {}, theme: { fg: (_c: string, s: string) => s } } };
+function ctxFor(cwd: string, sessionId = cwd) {
+	const notifications: string[] = [];
+	return {
+		cwd,
+		mode: "tui",
+		hasUI: true,
+		sessionManager: { getSessionId: () => sessionId },
+		notifications,
+		ui: { setStatus: () => {}, notify: (text: string) => notifications.push(text), theme: { fg: (_c: string, s: string) => s } },
+	};
 }
 
 let dir: string;
@@ -97,6 +122,74 @@ test("the Pi host floor comparison accepts only stable 1.0.0 or newer releases",
 	assert.equal(isSupportedPiVersion("2.0.0"), true);
 	assert.equal(isSupportedPiVersion("unknown"), false);
 	assert.equal(isSupportedPiVersion("01.0.0"), false);
+});
+
+test("persona selectors stay at factory activation while Mind controls refresh for a new session", async () => {
+	const m = mockPi();
+	const agentDir = join(dir, "session-preference-cache", "agent");
+	const cwd = join(dir, "session-preference-cache", "project");
+	const settingsFile = join(agentDir, "persona", "settings.json");
+	await mkdir(join(agentDir, "persona"), { recursive: true });
+	const settings = (defaultPersona: string, mindCapture: "auto" | "prompt" | "off", mindNudge: boolean) => JSON.stringify({
+		version: 1,
+		preferences: { defaultPersona, persist: false, mindCapture, mindNudge },
+		personas: {},
+		lastPersona: null,
+		selectionRevision: 0,
+	}, null, 2);
+	await writeFile(settingsFile, `${settings("parent-startup", "auto", true)}\n`, "utf8");
+	const parent = ctxFor(cwd, "parent-session");
+	const child = ctxFor(cwd, "child-session");
+	createExtension(m.pi, { agentDir });
+	const doctor = m.commands.get("mind")?.handler;
+	assert.ok(doctor);
+	await doctor("doctor", parent);
+	assert.match(parent.notifications.at(-1) ?? "", /persona: parent-startup/);
+	await writeFile(settingsFile, `${settings("child-next-session", "off", false)}\n`, "utf8");
+	await m.handlers.get("session_start")?.({}, child);
+	await doctor("doctor", parent);
+	assert.match(parent.notifications.at(-1) ?? "", /persona: parent-startup/, "a later session must not change the persona selected by the existing Pi factory");
+	await doctor("doctor", child);
+	assert.match(child.notifications.at(-1) ?? "", /persona: parent-startup/, "Mind's persona scope must match Persona's factory-activation config");
+	const contributed: Array<{ id: string; values: unknown }> = [];
+	m.events.emit("pi-persona:settings:collect:v1", { add: (id: string, values: unknown) => contributed.push({ id, values }) });
+	assert.deepEqual(contributed, [{ id: "mind", values: { mindCapture: "off", mindNudge: false } }], "Mind's own controls may load for the newly started session");
+	await m.handlers.get("session_shutdown")?.({}, child);
+	await m.handlers.get("session_shutdown")?.({}, parent);
+});
+
+test("Mind contributes its effective session options to the shared settings collector only as supervisor", async () => {
+	const m = mockPi();
+	const agentDir = join(dir, "settings-collector", "agent");
+	await mkdir(join(agentDir, "persona"), { recursive: true });
+	await writeFile(join(agentDir, "persona", "settings.json"), `${JSON.stringify({
+		version: 1,
+		preferences: { mindCapture: "prompt", mindNudge: false },
+		personas: {},
+		lastPersona: null,
+		selectionRevision: 0,
+	}, null, 2)}\n`, "utf8");
+	const supervisor = ctxFor(join(dir, "settings-collector", "project"), "settings-supervisor");
+	createExtension(m.pi, { agentDir });
+	await m.handlers.get("session_start")?.({}, supervisor);
+	assert.equal(m.events.listenerCount("pi-persona:settings:collect:v1"), 1);
+	const contributed: Array<{ id: string; values: unknown }> = [];
+	m.events.emit("pi-persona:settings:collect:v1", { add: (id: string, values: unknown) => contributed.push({ id, values }) });
+	assert.deepEqual(contributed, [{ id: "mind", values: { mindCapture: "prompt", mindNudge: false } }]);
+	await m.handlers.get("session_shutdown")?.({}, supervisor);
+	assert.equal(m.events.listenerCount("pi-persona:settings:collect:v1"), 0, "session shutdown unregisters the contributor");
+
+	const previousLeg = process.env.PI_PERSONA_LEG;
+	process.env.PI_PERSONA_LEG = "1";
+	try {
+		const leg = mockPi();
+		createExtension(leg.pi, { agentDir });
+		await leg.handlers.get("session_start")?.({}, ctxFor(supervisor.cwd, "settings-worker"));
+		assert.equal(leg.events.listenerCount("pi-persona:settings:collect:v1"), 0, "a lean delegated leg does not appear as the supervisor's settings section");
+	} finally {
+		if (previousLeg === undefined) delete process.env.PI_PERSONA_LEG;
+		else process.env.PI_PERSONA_LEG = previousLeg;
+	}
 });
 
 test("createExtension registers the memory + backlog tools, /mind command, and lifecycle hooks", () => {

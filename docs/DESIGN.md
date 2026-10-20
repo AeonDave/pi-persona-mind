@@ -320,11 +320,30 @@ covered by tests.
   `_shared.json`) and also covers Windows reserved device names (`NUL`/`CON`/`COM1`…).
 
 **Coupling parity with pi-persona (`scope.ts`):**
-- Active-persona resolution mirrors pi-persona's precedence: live `--persona` selector >
-  `PI_PERSONA_DEFAULT` pin > (`PI_PERSONA_PERSIST` ≠ off ? marker : none), so a one-shot CLI persona,
-  an env-pinned session, or persist-off session no longer scopes to a stale marker.
-- The agent dir honors `PI_AGENT_DIR` (raw value, as pi-persona does) and the marker path honors
-  `PI_PERSONA_STATE_FILE`, so the two co-locate and never desync.
+- The canonical read-only source is `<agentDir>/persona/settings.json` (version 1). Mind reads only
+  `preferences.defaultPersona`, `preferences.persist`, `preferences.mindCapture`,
+  `preferences.mindNudge`, `lastPersona` and `selectionRevision`; it does not load persona model
+  assignments or write/migrate companion settings. A malformed or oversized canonical file is
+  authoritative-but-unreadable: never resurrect a stale legacy marker or backup.
+- Active-persona resolution is live `--persona` > non-empty `PI_PERSONA_DEFAULT` > saved startup
+  `defaultPersona` > (`persist` ? remembered selection : `_default`). Environment values override
+  saved preferences. Mind snapshots `defaultPersona`/`persist` and their environment selectors when
+  the extension factory activates, matching pi-persona's own `resolvePersonaConfig` boundary. Edits
+  made while the extension is loaded stay pending until Pi reloads/restarts extensions (a plain
+  `/new` does not reconfigure the existing factory); this extension does not reload them or change
+  pi-persona's current selection. Marker switches remain live within that loaded configuration.
+- Canonical `selectionRevision` (default 0) is the live-selection stamp: same-name explicit persona
+  selections still switch scope, while preference/model edits do not. The canonical file is bounded
+  at 1 MiB and accepts a UTF-8 BOM/CRLF. Only when it is absent does Mind fall back to the legacy
+  `PI_PERSONA_STATE_FILE` path (or `<agentDir>/persona/state.json`), retaining its old mtime behavior.
+- `mindCapture` (`auto|prompt|off`, default `auto`) and `mindNudge` (default `true`) use a per-session
+  startup snapshot. Their existing `PI_PERSONA_MIND_CAPTURE`/`PI_PERSONA_MIND_NUDGE` env
+  controls override saved values with their existing parsers. On the shared settings-collection bus,
+  Mind reports these effective values as the `mind` contributor only from a supervisor instance;
+  the mind itself never edits the canonical file.
+- The agent dir honors `PI_AGENT_DIR` (raw value, as pi-persona does). Marker latches and preference
+  snapshots are keyed by Pi session id as well as path, so an in-process child session reset cannot
+  hot-apply a pending preference in its supervisor.
 
 **Injection / scanner (`scanner.ts`, `inject.ts`):**
 - The content scanner matches a whitespace-collapsed copy too, closing a newline-split injection

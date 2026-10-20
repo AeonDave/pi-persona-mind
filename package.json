@@ -1,6 +1,6 @@
 {
   "name": "pi-persona-mind",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "private": false,
   "type": "module",
   "description": "Persona-aware persistent memory and a short-lived task backlog for Pi, with automatic capture and bounded context injection.",

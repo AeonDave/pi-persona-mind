@@ -5,7 +5,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 
-import { activePersona, findProjectRoot, mindPaths, parsePersonaState, personaFromCliArgs, personaStateFile, preferredAgentDir, projectSlug, rawActivePersona, resetPersonaMarkerLatch, resolveScope, sanitizePersona } from "../src/core/scope.ts";
+import { activePersona, findProjectRoot, mindPaths, parsePersonaState, personaFromCliArgs, personaStateFile, preferredAgentDir, projectSlug, rawActivePersona, resetPersonaMarkerLatch, resolveMindSettings, resolveScope, sanitizePersona } from "../src/core/scope.ts";
+
+async function writeCanonicalSettings(agentDir: string, value: unknown, options: { bom?: boolean; crlf?: boolean } = {}): Promise<string> {
+	const folder = join(agentDir, "persona");
+	await mkdir(folder, { recursive: true });
+	const file = join(folder, "settings.json");
+	let text = `${JSON.stringify(value, null, 2)}\n`;
+	if (options.crlf) text = text.replace(/\n/g, "\r\n");
+	if (options.bom) text = `\ufeff${text}`;
+	await writeFile(file, text, "utf8");
+	return file;
+}
 
 test("parsePersonaState reads a named lastPersona, else null (absent/invalid)", () => {
 	assert.equal(parsePersonaState(JSON.stringify({ lastPersona: "elite" })), "elite");
@@ -173,6 +184,274 @@ test("a switch TO the name the marker already held is still a switch", async () 
 	await new Promise((resolve) => setTimeout(resolve, 20));
 	await writeFile(statePath, `${JSON.stringify({ lastPersona: "ada" }, null, 2)}\n`, "utf8");
 	assert.equal(activePersona(agentDir, {}, "grace"), "ada", "an explicit re-selection outranks the launch flag");
+});
+
+test("canonical settings outrank the legacy state override and accept BOM/CRLF", async () => {
+	const agentDir = join(dir, "canonical-precedence-agent");
+	const legacyFile = join(dir, "legacy-override.json");
+	await writeFile(legacyFile, JSON.stringify({ lastPersona: "legacy-persona" }), "utf8");
+	await writeCanonicalSettings(agentDir, {
+		version: 1,
+		preferences: {},
+		personas: {},
+		lastPersona: "canonical-marker",
+		selectionRevision: 0,
+	}, { bom: true, crlf: true });
+	assert.equal(rawActivePersona(agentDir, { PI_PERSONA_STATE_FILE: legacyFile }, undefined, "canonical-session"), "canonical-marker");
+});
+
+test("a defined but empty environment default suppresses the saved default", async () => {
+	const agentDir = join(dir, "canonical-empty-env-default-agent");
+	await writeCanonicalSettings(agentDir, {
+		version: 1,
+		preferences: { defaultPersona: "saved-default", persist: true },
+		personas: {},
+		lastPersona: null,
+		selectionRevision: 0,
+	});
+	assert.equal(rawActivePersona(agentDir, { PI_PERSONA_DEFAULT: "" }, undefined, "empty-env-session"), null);
+});
+
+test("canonical mindCapture must be a string, not a coercible array", async () => {
+	const agentDir = join(dir, "canonical-array-mind-capture-agent");
+	await writeCanonicalSettings(agentDir, {
+		version: 1,
+		preferences: { defaultPersona: "must-not-load", mindCapture: ["off"] },
+		personas: {},
+		lastPersona: null,
+		selectionRevision: 0,
+	});
+	assert.equal(rawActivePersona(agentDir, {}, undefined, "array-mind-capture-session"), null);
+});
+
+test("the first canonical persona off gesture beats a CLI seed when settings did not exist at startup", async () => {
+	const agentDir = join(dir, "canonical-first-off-agent");
+	const sessionId = "canonical-first-off-session";
+	assert.equal(rawActivePersona(agentDir, {}, "launch-seed", sessionId), "launch-seed");
+	await writeCanonicalSettings(agentDir, {
+		version: 1,
+		preferences: {},
+		personas: {},
+		lastPersona: null,
+		selectionRevision: 1,
+	});
+	assert.equal(rawActivePersona(agentDir, {}, "launch-seed", sessionId), null);
+});
+
+test("the first canonical named selection beats a CLI seed when settings did not exist at startup", async () => {
+	const agentDir = join(dir, "canonical-first-named-agent");
+	const sessionId = "canonical-first-named-session";
+	assert.equal(rawActivePersona(agentDir, {}, "launch-seed", sessionId), "launch-seed");
+	await writeCanonicalSettings(agentDir, {
+		version: 1,
+		preferences: {},
+		personas: {},
+		lastPersona: "first-selection",
+		selectionRevision: 1,
+	});
+	assert.equal(rawActivePersona(agentDir, {}, "launch-seed", sessionId), "first-selection");
+});
+
+test("canonical revision zero migration is not a switch but the first later off gesture is", async () => {
+	const agentDir = join(dir, "canonical-first-migration-agent");
+	const sessionId = "canonical-first-migration-session";
+	assert.equal(rawActivePersona(agentDir, {}, "launch-seed", sessionId), "launch-seed");
+	const settingsPath = await writeCanonicalSettings(agentDir, {
+		version: 1,
+		preferences: { mindNudge: false },
+		personas: {},
+		lastPersona: null,
+		selectionRevision: 0,
+	});
+	assert.equal(rawActivePersona(agentDir, {}, "launch-seed", sessionId), "launch-seed", "a preference-only first write must not switch scope");
+	await writeFile(settingsPath, `${JSON.stringify({
+		version: 1,
+		preferences: { mindNudge: false },
+		personas: {},
+		lastPersona: null,
+		selectionRevision: 1,
+	}, null, 2)}\n`, "utf8");
+	assert.equal(rawActivePersona(agentDir, {}, "launch-seed", sessionId), null, "the next explicit selection gesture must be observed");
+});
+
+test("a legacy marker migrating to canonical revision zero does not masquerade as a selection", async () => {
+	const agentDir = join(dir, "canonical-legacy-migration-agent");
+	const statePath = join(agentDir, "persona", "state.json");
+	await mkdir(join(agentDir, "persona"), { recursive: true });
+	await writeFile(statePath, JSON.stringify({ lastPersona: "remembered" }), "utf8");
+	const sessionId = "canonical-legacy-migration-session";
+	assert.equal(rawActivePersona(agentDir, {}, "launch-seed", sessionId), "launch-seed");
+	await writeCanonicalSettings(agentDir, {
+		version: 1,
+		preferences: {},
+		personas: {},
+		lastPersona: "remembered",
+		selectionRevision: 0,
+	});
+	assert.equal(rawActivePersona(agentDir, {}, "launch-seed", sessionId), "launch-seed");
+});
+
+test("canonical preference and model rewrites do not turn a CLI seed into a marker switch", async () => {
+	const agentDir = join(dir, "canonical-cli-agent");
+	const settingsPath = await writeCanonicalSettings(agentDir, {
+		version: 1,
+		preferences: {},
+		personas: { reviewer: { models: { agent: "provider/first" } } },
+		lastPersona: "old-selection",
+		selectionRevision: 8,
+	});
+	assert.equal(rawActivePersona(agentDir, {}, "cli-seed", "cli-session"), "cli-seed");
+	await writeFile(settingsPath, `${JSON.stringify({
+		version: 1,
+		preferences: { defaultPersona: "new-saved-default", persist: true },
+		personas: { reviewer: { models: { agent: "provider/second" } } },
+		lastPersona: "old-selection",
+		selectionRevision: 8,
+	}, null, 2)}\n`, "utf8");
+	assert.equal(rawActivePersona(agentDir, {}, "cli-seed", "cli-session"), "cli-seed");
+});
+
+test("a canonical same-name selection revision overrides a launch seed", async () => {
+	const agentDir = join(dir, "canonical-reselect-agent");
+	const settingsPath = await writeCanonicalSettings(agentDir, {
+		version: 1,
+		preferences: {},
+		personas: {},
+		lastPersona: "remembered",
+		selectionRevision: 12,
+	});
+	assert.equal(rawActivePersona(agentDir, {}, "launch-seed", "reselect-session"), "launch-seed");
+	await writeFile(settingsPath, `${JSON.stringify({
+		version: 1,
+		preferences: {},
+		personas: {},
+		lastPersona: "remembered",
+		selectionRevision: 13,
+	}, null, 2)}\n`, "utf8");
+	assert.equal(rawActivePersona(agentDir, {}, "launch-seed", "reselect-session"), "remembered");
+});
+
+test("saved startup preferences are cached per session and environment still wins", async () => {
+	const agentDir = join(dir, "canonical-preferences-agent");
+	const settingsPath = await writeCanonicalSettings(agentDir, {
+		version: 1,
+		preferences: { defaultPersona: "saved-first", persist: false },
+		personas: {},
+		lastPersona: "remembered",
+		selectionRevision: 0,
+	});
+	assert.equal(rawActivePersona(agentDir, {}, undefined, "prefs-session-a"), "saved-first");
+	await writeFile(settingsPath, `${JSON.stringify({
+		version: 1,
+		preferences: { defaultPersona: "saved-second", persist: true },
+		personas: {},
+		lastPersona: "remembered",
+		selectionRevision: 0,
+	}, null, 2)}\n`, "utf8");
+	assert.equal(rawActivePersona(agentDir, {}, undefined, "prefs-session-a"), "saved-first", "settings changes are pending until this session ends");
+	assert.equal(rawActivePersona(agentDir, {}, undefined, "prefs-session-b"), "saved-second", "a new session loads the next preferences");
+	assert.equal(rawActivePersona(agentDir, { PI_PERSONA_DEFAULT: "env-default" }, undefined, "prefs-session-c"), "env-default");
+});
+
+test("Mind startup settings use saved defaults, keep session snapshots, and preserve env grammar", async () => {
+	const agentDir = join(dir, "canonical-mind-settings-agent");
+	const settingsPath = await writeCanonicalSettings(agentDir, {
+		version: 1,
+		preferences: { mindCapture: "off", mindNudge: false },
+		personas: {},
+		lastPersona: null,
+		selectionRevision: 0,
+	});
+	assert.deepEqual(resolveMindSettings(agentDir, {}, "mind-session-a"), { mindCapture: "off", mindNudge: false });
+	await writeFile(settingsPath, `${JSON.stringify({
+		version: 1,
+		preferences: { mindCapture: "prompt", mindNudge: true },
+		personas: {},
+		lastPersona: null,
+		selectionRevision: 0,
+	}, null, 2)}\n`, "utf8");
+	assert.deepEqual(resolveMindSettings(agentDir, {}, "mind-session-a"), { mindCapture: "off", mindNudge: false }, "saved options stay pending in the current session");
+	assert.deepEqual(resolveMindSettings(agentDir, {}, "mind-session-b"), { mindCapture: "prompt", mindNudge: true });
+	assert.deepEqual(resolveMindSettings(agentDir, { PI_PERSONA_MIND_CAPTURE: "invalid", PI_PERSONA_MIND_NUDGE: "off" }, "mind-session-c"), {
+		mindCapture: "auto",
+		mindNudge: false,
+	}, "explicit env values override saved values using Mind's existing parsing rules");
+	assert.deepEqual(resolveMindSettings(agentDir, {}, "mind-session-d"), { mindCapture: "prompt", mindNudge: true });
+	const defaults = join(dir, "canonical-mind-defaults-agent");
+	await writeCanonicalSettings(defaults, { version: 1, preferences: {}, personas: {}, lastPersona: null, selectionRevision: 0 });
+	assert.deepEqual(resolveMindSettings(defaults, {}, "mind-defaults-session"), { mindCapture: "auto", mindNudge: true });
+});
+
+test("persist=false suppresses the marker and absent preferences preserve the default marker behavior", async () => {
+	const agentDir = join(dir, "canonical-persist-agent");
+	await writeCanonicalSettings(agentDir, {
+		version: 1,
+		preferences: { defaultPersona: "saved-default", persist: false },
+		personas: {},
+		lastPersona: "remembered",
+		selectionRevision: 0,
+	});
+	assert.equal(rawActivePersona(agentDir, {}, undefined, "persist-off-session"), "saved-default");
+	const defaultAgent = join(dir, "canonical-defaults-agent");
+	await writeCanonicalSettings(defaultAgent, {
+		version: 1,
+		preferences: {},
+		personas: {},
+		lastPersona: "remembered-by-default",
+		selectionRevision: 0,
+	});
+	assert.equal(rawActivePersona(defaultAgent, {}, undefined, "default-prefs-session"), "remembered-by-default");
+});
+
+test("invalid canonical settings never fall back to a stale legacy marker or backup", async () => {
+	const agentDir = join(dir, "canonical-invalid-agent");
+	const settingsPath = await writeCanonicalSettings(agentDir, {
+		version: 1,
+		preferences: { persist: "off" },
+		personas: {},
+		lastPersona: "bad-canonical",
+	});
+	await writeFile(`${settingsPath}.bak`, JSON.stringify({
+		version: 1, preferences: {}, personas: {}, lastPersona: "backup-persona", selectionRevision: 1,
+	}), "utf8");
+	const legacyFile = join(dir, "canonical-invalid-legacy.json");
+	await writeFile(legacyFile, JSON.stringify({ lastPersona: "stale-legacy" }), "utf8");
+	assert.equal(rawActivePersona(agentDir, { PI_PERSONA_STATE_FILE: legacyFile }, undefined, "invalid-canonical-session"), null);
+});
+
+test("canonical settings accept valid files larger than the legacy marker limit", async () => {
+	const agentDir = join(dir, "canonical-large-agent");
+	await writeCanonicalSettings(agentDir, {
+		version: 1,
+		preferences: { defaultPersona: "large-canonical" },
+		personas: {},
+		lastPersona: null,
+		selectionRevision: 0,
+		padding: "x".repeat(70 * 1024),
+	});
+	assert.equal(rawActivePersona(agentDir, {}, undefined, "large-canonical-session"), "large-canonical");
+});
+
+test("resetting a child session cache does not hot-apply preferences in its parent", async () => {
+	const agentDir = join(dir, "canonical-child-cache-agent");
+	const settingsPath = await writeCanonicalSettings(agentDir, {
+		version: 1,
+		preferences: { defaultPersona: "parent-startup" },
+		personas: {},
+		lastPersona: null,
+		selectionRevision: 0,
+	});
+	assert.equal(rawActivePersona(agentDir, {}, undefined, "parent-session"), "parent-startup");
+	await writeFile(settingsPath, `${JSON.stringify({
+		version: 1,
+		preferences: { defaultPersona: "child-next-session" },
+		personas: {},
+		lastPersona: null,
+		selectionRevision: 0,
+	}, null, 2)}\n`, "utf8");
+	resetPersonaMarkerLatch("child-session");
+	assert.equal(rawActivePersona(agentDir, {}, undefined, "parent-session"), "parent-startup");
+	assert.equal(rawActivePersona(agentDir, {}, undefined, "child-session"), "child-next-session");
 });
 
 test("persist=off leaves the seed authoritative — pi-persona writes no marker to follow", async () => {
