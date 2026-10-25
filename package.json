@@ -1,9 +1,9 @@
 {
-  "name": "pi-persona-mind",
-  "version": "0.8.3",
+  "name": "@aeondave/pi-persona-mind",
+  "version": "0.8.4",
   "private": false,
   "type": "module",
-  "description": "Persona-aware persistent memory and a short-lived task backlog for Pi, with automatic capture and bounded context injection.",
+  "description": "Local memory for Pi with pi-persona — durable project and persona facts, session notes, bounded retrieval, and supervised automatic consolidation.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -28,9 +28,14 @@
   "bugs": {
     "url": "https://github.com/AeonDave/pi-persona-mind/issues"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "src",
     "docs/DESIGN.md",
+    "docs/MEMORY-RESEARCH.md",
+    "assets/banner.png",
     "README.md",
     "CHANGELOG.md",
     "AGENTS.md",
@@ -43,19 +48,30 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --import ./test/setup/hermetic-env.ts --test test/*.test.ts",
+    "eval:memory": "node --import tsx scripts/evaluate-memory.ts",
     "verify": "npm run typecheck && npm test"
   },
+  "overrides": {
+    "@earendil-works/pi-coding-agent@1.4.0": {
+      "undici": "8.12.3"
+    }
+  },
   "pi": {
+    "image": "https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v0.8.4/assets/banner.png",
     "extensions": [
       "./src/index.ts"
     ]
   },
   "peerDependencies": {
+    "@aeondave/pi-persona": ">=1.17.5",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "peerDependenciesMeta": {
+    "@aeondave/pi-persona": {
+      "optional": true
+    },
     "@earendil-works/pi-coding-agent": {
       "optional": true
     },
@@ -67,10 +83,10 @@
     }
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "1.0.0",
-    "@earendil-works/pi-agent-core": "1.0.0",
-    "@earendil-works/pi-coding-agent": "1.0.0",
-    "@earendil-works/pi-tui": "1.0.0",
+    "@earendil-works/pi-agent-core": "1.4.0",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-tui": "1.4.0",
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typebox": "*",

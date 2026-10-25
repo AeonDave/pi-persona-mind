@@ -1,8 +1,8 @@
 /**
  * One-way importer for the superseded `pi-`prefixed storage root.
  *
- * The old root is only read.  Destination writes go through JsonStore so two Pi
- * processes importing at the same time cannot lose entries. Two copies of one fact
+ * The old root is only read. Memory merges join the profile transaction lock before JsonStore's
+ * per-file lock, coordinating background import with foreground edits across projects. Two copies of one fact
  * are reconciled by which copy is LATER, not by which root it sits in; distinct
  * same-id content is preserved. Filenames and legacy bytes are not rewritten or removed.
  */
@@ -16,8 +16,8 @@ import { validateBacklog } from "./backlog.ts";
 import type { MemoryEntry } from "./memory.ts";
 import { validateLongMemory, validateShortMemory } from "./memory.ts";
 import { contentId } from "./ids.ts";
-import { DEFAULT_PERSONA, projectSlug, sanitizePersona, type ProjectSlugOptions } from "./scope.ts";
-import { DEFAULT_STORE_MAX_ENTRIES, JsonStore, readTextFileBounded, StoreCapacityError, type JsonStoreOptions } from "./store.ts";
+import { DEFAULT_PERSONA, memoryMutationLockPath, projectSlug, sanitizePersona, SHARED_SCOPE, type ProjectSlugOptions } from "./scope.ts";
+import { DEFAULT_STORE_MAX_ENTRIES, JsonStore, readTextFileBounded, StoreCapacityError, withFileLock, type JsonStoreOptions } from "./store.ts";
 
 const STORE_VERSION = 1;
 const WIN_RESERVED_DEVICE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
@@ -355,6 +355,7 @@ async function importFile(
 	report: MigrationReport,
 	now: (() => number) | undefined,
 	maxFileBytes: number,
+	memoryLock: string,
 ): Promise<boolean> {
 	if (kind === "ltm" || kind === "stm") {
 		const validate = kind === "ltm" ? validateLongMemory : validateShortMemory;
@@ -364,7 +365,8 @@ async function importFile(
 		report.invalidEntries += parsed.invalidEntries;
 		if (parsed.entries.length === 0) return true;
 		const store = new JsonStore<MemoryEntry>(destinationPath, makeStoreOptions(validate, now, report));
-		return mergeImport(store, parsed.entries, report, legacyPath, "legacy mind", reconcileMemory);
+		// Source IO remains outside the lock; only destination selection/merge shares foreground ordering.
+		return withFileLock(memoryLock, () => mergeImport(store, parsed.entries, report, legacyPath, "legacy mind", reconcileMemory));
 	} else {
 		const parsed = await readLegacyStore<BacklogEntry>(legacyPath, validateBacklog, report, maxFileBytes);
 		if (parsed === null) return false;
@@ -521,6 +523,7 @@ async function importAliasFile(
 	report: MigrationReport,
 	now: (() => number) | undefined,
 	maxFileBytes: number,
+	memoryLock: string,
 ): Promise<void> {
 	if (!(await regularFileExists(sourcePath))) return;
 	report.filesScanned++;
@@ -534,7 +537,7 @@ async function importAliasFile(
 		report.entriesSeen += parsed.entries.length;
 		report.invalidEntries += parsed.invalidEntries;
 		if (parsed.entries.length === 0) return;
-		await mergeImport(new JsonStore<MemoryEntry>(destinationPath, makeStoreOptions(validate, now, report)), parsed.entries, report, sourcePath, "scope alias", reconcileMemory);
+		await withFileLock(memoryLock, () => mergeImport(new JsonStore<MemoryEntry>(destinationPath, makeStoreOptions(validate, now, report)), parsed.entries, report, sourcePath, "scope alias", reconcileMemory));
 		return;
 	}
 
@@ -604,6 +607,7 @@ export async function migrateCurrentScopeAliases(
 	const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
 	const legacyRoot = options.legacyRoot ?? join(agentDir, "pi-persona-mind");
 	const currentRoot = options.currentRoot ?? join(agentDir, "persona-mind");
+	const memoryLock = memoryMutationLockPath({ shared: join(currentRoot, "memory", "ltm", `${SHARED_SCOPE}.json`) });
 	const currentBase = currentRoot;
 	const roots = [currentRoot, legacyRoot];
 	const aliases: readonly { kind: ImportKind; oldRelative: string; newRelative: string }[] = [
@@ -621,7 +625,7 @@ export async function migrateCurrentScopeAliases(
 			const sourcePath = join(root, alias.oldRelative);
 			if (sourcePath === destination || visited.has(sourcePath)) continue;
 			visited.add(sourcePath);
-			await importAliasFile(sourcePath, destination, alias.kind, report, options.now, maxFileBytes);
+			await importAliasFile(sourcePath, destination, alias.kind, report, options.now, maxFileBytes, memoryLock);
 		}
 	}
 	// After the filenames are reconciled, repair the persona segment embedded in the backlog records
@@ -641,6 +645,7 @@ export async function migrateLegacyRoot(agentDir: string, options: LegacyMigrati
 	const report = emptyReport();
 	const legacyRoot = options.legacyRoot ?? join(agentDir, "pi-persona-mind");
 	const destinationRoot = options.destinationRoot ?? join(agentDir, "persona-mind");
+	const memoryLock = memoryMutationLockPath({ shared: join(destinationRoot, "memory", "ltm", `${SHARED_SCOPE}.json`) });
 	const maxFiles = options.maxFiles ?? DEFAULT_MAX_FILES;
 	const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
 	const manifest = new JsonStore<LegacySourceStamp>(
@@ -675,7 +680,7 @@ export async function migrateLegacyRoot(agentDir: string, options: LegacyMigrati
 						continue;
 					}
 					report.filesScanned++;
-					if (await importFile(source, destination, directory.kind, report, options.now, maxFileBytes)) {
+					if (await importFile(source, destination, directory.kind, report, options.now, maxFileBytes, memoryLock)) {
 						const committedStamp = stamp ?? (await sourceStamp(source, destination, directory.kind));
 						if (committedStamp) processed.push(committedStamp);
 					}

@@ -6,6 +6,7 @@ import { after, before, test } from "node:test";
 
 import { mindPaths, type Scope } from "../src/core/scope.ts";
 import { MindService } from "../src/core/service.ts";
+import { JsonStore } from "../src/core/store.ts";
 import { contentId, legacyContentId } from "../src/core/ids.ts";
 import { makeMemory } from "../src/core/memory.ts";
 import { MAX_MEMORY_DERIVED_IDS, MAX_MEMORY_ID_CHARS, MAX_MEMORY_SOURCE_CHARS, MAX_MEMORY_TAGS, MAX_MEMORY_TEXT_CHARS } from "../src/core/memory.ts";
@@ -31,6 +32,31 @@ function scopeFor(ns: string, persona: string): Scope {
 function svc(ns: string, persona: string, now: number): MindService {
 	return new MindService(scopeFor(ns, persona), { now: () => now });
 }
+
+test("expiry sweep preserves backlog appended after its initial read", async () => {
+	const ns = "sweep-concurrent-add";
+	const start = 1_000_000;
+	assert.ok((await svc(ns, "elite", start).backlogAdd({ text: "expired old lead", ttlHours: 1 })).ok);
+	const sweeper = svc(ns, "elite", start + 2 * H);
+	const concurrent = svc(ns, "elite", start + 2 * H);
+	const originalLoad = JsonStore.prototype.load;
+	let interposed = false;
+	JsonStore.prototype.load = async function () {
+		const snapshot = await originalLoad.call(this);
+		if (this.filePath === scopeFor(ns, "elite").paths.backlog && !interposed) {
+			interposed = true;
+			assert.ok((await concurrent.backlogAdd({ text: "fresh concurrent lead" })).ok);
+		}
+		return snapshot;
+	};
+	try {
+		await sweeper.sweepExpired();
+	} finally {
+		JsonStore.prototype.load = originalLoad;
+	}
+	assert.equal(interposed, true);
+	assert.deepEqual((await concurrent.backlogList()).map((entry) => entry.text), ["fresh concurrent lead"]);
+});
 
 test("remember(long) then recall finds it", async () => {
 	const s = svc("recall", "elite", 1_000_000);
@@ -314,7 +340,7 @@ test("promote tells the caller when the supersedes it carried over retired nothi
 	const commaTagged = makeMemory({ term: "long", kind: "gotcha", text: "release checklist", tags: ["a,b"] }, 1_000_000);
 	const splitTagged = makeMemory({ term: "long", kind: "gotcha", text: "release checklist", tags: ["a", "b"] }, 1_000_000);
 	const legacy = legacyContentId("gotcha", "release checklist", ["a,b"]);
-	const graduating = makeMemory({ term: "short", kind: "note", text: "graduating fact", supersedes: legacy }, 1_000_000);
+	const graduating = makeMemory({ term: "short", kind: "note", text: "graduating fact", supersedes: legacy, persona: "elite" }, 1_000_000);
 	const envelope = (entries: unknown[]): string => `${JSON.stringify({ version: 1, updatedAt: new Date(1_000_000).toISOString(), sequence: 1, entries })}\n`;
 	await mkdir(join(scope.paths.ltm, ".."), { recursive: true });
 	await mkdir(join(scope.paths.stm, ".."), { recursive: true });
@@ -322,7 +348,7 @@ test("promote tells the caller when the supersedes it carried over retired nothi
 	await writeFile(scope.paths.stm, envelope([graduating]));
 
 	const mind = new MindService(scope, { now: () => 2_000_000 });
-	const promoted = await mind.promote(graduating.id);
+	const promoted = await mind.promote(graduating.id, "persona");
 	assert.equal(promoted.ok, true, "the graduation itself still succeeds");
 	assert.equal(promoted.ok ? promoted.ambiguousSupersedes : undefined, legacy, "the skipped retirement is not silent");
 	assert.equal((await mind.recall("release checklist", "long", 10)).total, 2, "and indeed nothing was retired");
@@ -330,7 +356,7 @@ test("promote tells the caller when the supersedes it carried over retired nothi
 
 test("shared long-term memory is visible to every persona; private memory is not", async () => {
 	const now = 1_000_000;
-	await svc("shared", "elite", now).remember({ term: "long", kind: "convention", text: "user is on Windows", toShared: true });
+	await svc("shared", "elite", now).remember({ term: "long", kind: "convention", text: "user is on Windows", scope: "shared" });
 	await svc("shared", "elite", now).remember({ term: "long", kind: "note", text: "elite-only tactic" });
 
 	const eliteSees = (await svc("shared", "elite", now).recall("", "both", 20)).hits.map((e) => e.text);
@@ -524,7 +550,7 @@ test("summary counts live long-term, non-expired short-term, and open backlog", 
 	await s.remember({ term: "long", kind: "note", text: "durable" });
 	await s.remember({ term: "short", kind: "note", text: "ephemeral", ttlHours: 24 });
 	await s.backlogAdd({ text: "a lead" });
-	assert.deepEqual(await s.summary(), { ltm: 1, stm: 1, backlogOpen: 1 });
+	assert.deepEqual(await s.summary(), { ltm: 1, projectLtm: 0, stm: 1, backlogOpen: 1 });
 });
 
 test("dueBacklog returns open items whose wake time has passed", async () => {
@@ -625,7 +651,7 @@ test("buildInjection lean mode = north-star + identity only (a delegated worker 
 test("resetWorkspace clears this project's STM and backlog and leaves long-term identity alone", async () => {
 	const s = svc("reset-ws", "elite", 5_000_000);
 	await s.remember({ term: "long", kind: "preference", text: "prefers verbose recon" });
-	await s.remember({ term: "long", kind: "convention", text: "shared OS note", toShared: true });
+	await s.remember({ term: "long", kind: "convention", text: "shared OS note", scope: "shared" });
 	await s.remember({ term: "short", kind: "note", text: "prod db is read-only right now" });
 	await s.remember({ term: "short", kind: "note", text: "vpn is down" });
 	const queued = await s.backlogAdd({ text: "revisit the SMB share" });
@@ -640,7 +666,7 @@ test("resetWorkspace clears this project's STM and backlog and leaves long-term 
 	assert.equal(r.backlogRemoved, 2);
 	assert.equal(r.ltmKept, 2, "persona + shared long-term both survive");
 
-	assert.deepEqual(await s.summary(), { ltm: 2, stm: 0, backlogOpen: 0 });
+	assert.deepEqual(await s.summary(), { ltm: 2, projectLtm: 0, stm: 0, backlogOpen: 0 });
 	const { hits: shortHits } = await s.recall("", "short", 50);
 	assert.equal(shortHits.length, 0);
 	const { hits: longHits } = await s.recall("", "long", 50);

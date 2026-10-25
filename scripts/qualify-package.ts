@@ -5,12 +5,14 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { runtimeHarness } from "../test/setup/pi-runtime.ts";
+// @ts-expect-error The shared qualification runner is a standalone Node script.
+import { qualifyMemory } from "./qualify-memory.mjs";
 
-if (!process.argv[2]) throw new Error("Usage: node --import tsx scripts/qualify-package.ts <extracted-package>/src/index.ts");
+if (!process.argv[2] || !process.argv[3]) throw new Error("Usage: node --import tsx scripts/qualify-package.ts <extracted-package>/src/index.ts <pi-persona-extension>");
 const root = await mkdtemp(join(tmpdir(), "mind-packed-qualification-"));
 let h: Awaited<ReturnType<typeof runtimeHarness>> | undefined;
 try {
-  h = await runtimeHarness(root, resolve(process.argv[2]));
+  h = await runtimeHarness(root, resolve(process.argv[2]), [], { companion: false, additionalExtensionPaths: [resolve(process.argv[3])] });
   await h.bind();
   h.session.setActiveToolsByName(["memory", "backlog"]);
   h.faux.setResponses([
@@ -31,7 +33,9 @@ try {
   assert.equal(wakes.length, 1, "the packed extension delivers the newly overdue alarm through Pi's real tool-result hook");
   assert.match(JSON.stringify(wakes[0]), /Review the qualified package/);
   assert.equal(h.faux.state.callCount, 4, "the reminder itself adds no model call");
-  console.log("PASS: extracted Mind package loaded in Pi 1.0; memory saved/recalled and newly due wake displayed once without a model turn.");
+  await qualifyMemory(h.session);
+  assert.equal(h.faux.state.callCount, 4, "explicit local memory operations add no model call");
+  console.log("PASS: extracted Mind package loaded in Pi 1.4; session notes, full read, staged optimization, stale-plan refusal and one display-only wake qualified.");
 } finally {
   try { await h?.dispose(); }
   finally { await rm(root, { recursive: true, force: true }); }

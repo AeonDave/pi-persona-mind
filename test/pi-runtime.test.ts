@@ -11,7 +11,7 @@ import { runtimeHarness } from "./setup/pi-runtime.ts";
 
 const entry = fileURLToPath(new URL("../src/index.ts", import.meta.url));
 
-test("real Pi 1.0: a newly overdue backlog alarm is displayed once without another model turn", { timeout: 30_000 }, async () => {
+test("real Pi 1.4: a newly overdue backlog alarm is displayed once without another model turn", { timeout: 30_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "mind-native-live-wake-"));
   let h: Awaited<ReturnType<typeof runtimeHarness>> | undefined;
   try {
@@ -42,7 +42,7 @@ test("real Pi 1.0: a newly overdue backlog alarm is displayed once without anoth
   }
 });
 
-test("real Pi 1.0 codemode: only relayed blocked output nudges the supervisor", { timeout: 30_000 }, async () => {
+test("real Pi 1.4 codemode: only relayed blocked output nudges the supervisor", { timeout: 30_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "mind-native-codemode-"));
   let h: Awaited<ReturnType<typeof runtimeHarness>> | undefined;
   const nested: string[] = [];
@@ -78,7 +78,7 @@ test("real Pi 1.0 codemode: only relayed blocked output nudges the supervisor", 
   }
 });
 
-test("real Pi 1.0: user capture persists before the model and reloads into a fresh session", { timeout: 30_000 }, async () => {
+test("real Pi 1.4: user capture persists before the model and reloads into a fresh session", { timeout: 30_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "mind-pi-runtime-"));
   let h: Awaited<ReturnType<typeof runtimeHarness>> | undefined;
   try {
@@ -113,7 +113,7 @@ test("real Pi 1.0: user capture persists before the model and reloads into a fre
   }
 });
 
-test("real Pi 1.0: memory tools execute through the agent loop and workers remain read-only", { timeout: 30_000 }, async () => {
+test("real Pi 1.4: memory tools execute through the agent loop and workers remain read-only", { timeout: 30_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "mind-pi-worker-"));
   const previousLeg = process.env.PI_PERSONA_LEG;
   let h: Awaited<ReturnType<typeof runtimeHarness>> | undefined;

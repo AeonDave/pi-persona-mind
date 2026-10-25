@@ -10,6 +10,7 @@
  */
 
 import { compatibleContentIds, contentId } from "./ids.ts";
+import { rankMemoryEntries } from "./retrieval.ts";
 
 export const MEMORY_KINDS = ["objective", "invariant", "preference", "convention", "gotcha", "rationale", "note"] as const;
 export type MemoryKind = (typeof MEMORY_KINDS)[number];
@@ -195,8 +196,9 @@ export function supersedeTargets(entries: readonly MemoryEntry[], id: string): S
  * Insert `entry`, deduping by content id (an update-in-place that preserves the original
  * `recordedAt` and bumps `lastSeenAt`) and retiring the entry named by `entry.supersedes` — unless
  * that id is ambiguous, in which case it retires nothing (see {@link supersedeTargets}).
+ * A caller that detected cross-store ambiguity can disable retirement while preserving lineage.
  */
-export function upsertMemory(entries: readonly MemoryEntry[], entry: MemoryEntry): MemoryEntry[] {
+export function upsertMemory(entries: readonly MemoryEntry[], entry: MemoryEntry, retireSupersedes = true): MemoryEntry[] {
 	const key = memoryContentKey(entry);
 	const existing = entries.find((e) => memoryContentKey(e) === key);
 	const merged: MemoryEntry = existing
@@ -205,7 +207,7 @@ export function upsertMemory(entries: readonly MemoryEntry[], entry: MemoryEntry
 	// Retire the previous copy under the SAME semantic key it was found by, never by its id: an id
 	// carried over from a migrated store can be shared with an unrelated fact, and dropping every
 	// entry holding it would erase that fact too.
-	const retired = new Set(entry.supersedes ? supersedeTargets(entries, entry.supersedes).targets : []);
+	const retired = new Set(retireSupersedes && entry.supersedes ? supersedeTargets(entries, entry.supersedes).targets : []);
 	return [...entries.filter((e) => memoryContentKey(e) !== key && !retired.has(e)), merged];
 }
 
@@ -213,33 +215,16 @@ export interface RecallOptions {
 	max: number;
 }
 
-function queryTerms(query: string): string[] {
-	return query.toLowerCase().match(/[\p{L}\p{N}\p{M}]+/gu) ?? [];
-}
-
-function haystack(e: MemoryEntry): string {
-	return `${e.text} ${e.tags.join(" ")}`.toLowerCase();
-}
-
 /**
- * Keyword + recency recall (pure). With a query, returns only entries matching ≥1 term, ranked by
- * match count then recency. Without a query, returns the most-recent entries. Always budget-limited.
+ * Explainable lexical/path recall, shared with injection. A query only returns positive matches;
+ * empty discovery remains recency-ordered. Ranking never changes stored age or expiry.
  */
 export function recall(entries: readonly MemoryEntry[], query: string, _now: number, opts: RecallOptions): MemoryEntry[] {
-	const terms = queryTerms(query);
 	const byRecency = (a: MemoryEntry, b: MemoryEntry): number => Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt);
-	if (terms.length === 0) {
+	if (!query.trim()) {
 		return [...entries].sort(byRecency).slice(0, opts.max);
 	}
-	const scored = entries
-		.map((e) => {
-			const hay = haystack(e);
-			const score = terms.reduce((s, t) => s + (hay.includes(t) ? 1 : 0), 0);
-			return { e, score };
-		})
-		.filter((x) => x.score > 0);
-	scored.sort((a, b) => b.score - a.score || byRecency(a.e, b.e));
-	return scored.slice(0, opts.max).map((x) => x.e);
+	return rankMemoryEntries(entries, query).filter((match) => match.score > 0).slice(0, opts.max).map((match) => match.entry);
 }
 
 /**

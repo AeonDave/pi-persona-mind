@@ -1,6 +1,38 @@
 # Changelog
 
-## Unreleased
+## [0.8.4](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.8.4) - 2026-10-25
+
+- Add durable project memory and scope-preserving promotion; expose project/persona/shared scope
+  consistently in tools, snapshots and diagnostics. Replace the shared-write boolean with scope.
+- Rank injected context and recall by task words, tags and repository paths; apply a combined
+  token estimate across archive and session context, retaining explicit omissions and full reads.
+- Rotate bounded automatic reviews over older records and retain durable consolidation receipts.
+  Add history and guarded undo that preserves unrelated writes and refuses stale affected facts.
+- Add deterministic retrieval evaluation with an explicit baseline and no semantic-quality claim.
+
+- Add automatic semantic consolidation through a visible asynchronous Mind worker on the current
+  session model. The first new-memory burst queues an idle review; subsequent attempts require new
+  memories and 1M main-session input tokens, excluding output/cache/worker usage. Rapid saves coalesce;
+  new input cancels the worker. Parent validation and fingerprint checks protect application; shared
+  memory is excluded.
+  `/mind optimize auto [status|on|off]` controls this session, doctor reports its state, and
+  `PI_PERSONA_MIND_OPTIMIZE=off` changes the initial default.
+- Require the loaded pi-persona companion protocol; without it Mind remains inactive, including
+  direct programmatic calls. Local optimization appears as a Mind activity row in Persona's tree/F9.
+- Use the actual live persona for memory ownership even with selection persistence disabled;
+  delegated workers keep their launching persona on both engines. Remove the obsolete selection mirror.
+- Target Pi 1.4.0 exclusively; align development packages and native event contracts, and remove
+  the retired companion state-marker fallback. Existing memory-data imports remain available.
+- Add active-branch session notes, honest persistent/in-memory receipts, and full ID-based memory
+  reads. Session notes preserve their origin across forks and never enter delegated worker context.
+- Add explicit, bounded memory consolidation: inspect candidates, stage exact replacements, then
+  apply a fingerprint-checked plan. Preserve source lineage and STM expiry; refuse stale plans.
+- Paginate inspection to reach older facts, and distinguish slow background imports from persistent
+  failures instead of leaving a successful import marked with a warning.
+- Add `/persona-mind` with `/mind` as the same-handler alias, strict command parsing, session and
+  optimization commands, and consistent expandable command cards.
+- Include inline flow reports in the blocked-work hint and preserve concurrent backlog additions
+  during expiry cleanup. Qualify package and companion integration on the current host.
 
 ## [0.8.3](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.8.3) - 2026-10-20
 

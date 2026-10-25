@@ -5,9 +5,9 @@
  * block into the system prompt every turn (so memory survives compaction + restart), re-arms
  * durable backlog wake timers on session start AND surfaces any that came due while offline as a
  * collapsed, display-only transcript card (never a follow-up that starts a turn), and
- * offers `/mind` (snapshot, doctor, workspace reset). All heavy lifting lives in the pure core; this factory is thin.
- * The only coupling to pi-persona is a best-effort read of its live CLI selector / active-persona
- * marker (see core/scope.ts); absent both, everything runs under a `_default` scope.
+ * offers `/persona-mind` (`/mind` alias) for snapshots, session notes, diagnostics, and reviewed
+ * optimization. All heavy lifting lives in the pure core.
+ * A compatible loaded pi-persona supplies the live memory owner; no selected persona uses `_default`.
  */
 
 import { closeSync, existsSync, fstatSync, lstatSync, openSync, readSync, unlinkSync, writeSync } from "node:fs";
@@ -20,13 +20,23 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { detectBlockedLeg } from "./core/blocked.ts";
 import { detectCaptureCues, type CaptureCue } from "./core/capture.ts";
 import { EMPTY_HINT_PREFIX } from "./core/inject.ts";
+import { isSupportedPiVersion, MIN_PI_VERSION } from "./core/host-compat.ts";
 import { compactMemoryText } from "./core/memory.ts";
-import { inspectStoreFile, migrateCurrentScopeAliases, migrateLegacyRoot, type MigrationReport, type StoreDiagnostic } from "./core/migrate.ts";
-import { personaFromCliArgs, preferredAgentDir, rawActivePersona, resetPersonaMarkerLatch, resolveMindSettings, resolvePersonaStartupSelectors, resolveScope } from "./core/scope.ts";
+import { migrateCurrentScopeAliases, migrateLegacyRoot, type MigrationReport } from "./core/migrate.ts";
+import { preferredAgentDir, resolveScope } from "./core/scope.ts";
+import { resetMindSettings, resolveMindSettings } from "./core/mind-settings.ts";
 import { MindService } from "./core/service.ts";
 import { registerBacklogTool } from "./tools/backlog.ts";
 import { registerMemoryTool } from "./tools/memory.ts";
 import { renderExpandableCard } from "./ui/presentation.ts";
+import { createSessionMemory } from "./session-memory.ts";
+import { registerSessionNoteRenderer } from "./ui/session-note-card.ts";
+import type { MemoryOptimizer } from "./core/optimize-service.ts";
+import { registerMindCommands } from "./extension/mind-command.ts";
+import { MIND_RESULT_ENTRY_TYPE, registerMindResultRenderer } from "./ui/mind-result-card.ts";
+import { parsePersonaMemoryOwner, PERSONA_MEMORY_OWNER_CHANGED, personaGuardedTools, queryPersonaDependency, queryPersonaMemoryOwner } from "./extension/persona-dependency.ts";
+import { createMindActivityRunner } from "./extension/activity.ts";
+import { installAutoOptimize } from "./extension/auto-optimize-session.ts";
 
 const STATUS_KEY = "pi-persona-mind";
 /** Display-only transcript card for a due backlog wake. Never sent to the model; never starts a turn. */
@@ -38,24 +48,12 @@ const MAX_TIMER_DELAY_MS = 2_147_000_000;
 const MAX_WAKE_REMINDERS = 20;
 const MAX_WAKE_TEXT_CHARS = 200;
 const MAX_WAKE_OWNER_BYTES = 1024;
-const MIN_PI_VERSION = [1, 0, 0] as const;
 type WakeState = Awaited<ReturnType<MindService["backlogList"]>>;
 // Unique per extension instance (not just per process): two instances in one process must not both
 // believe they own the wake lock. Date/random are fine in the real runtime (unlike workflow scripts).
 let ownerInstanceSeq = 0;
 
-/** Pure semver floor check, kept local so the extension can fail closed before using newer Pi APIs. */
-export function isSupportedPiVersion(version: string): boolean {
-	const parsed = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(version);
-	if (!parsed) return false;
-	const parts = parsed.slice(1, 4).map((part) => Number(part));
-	if (parts.some((part) => !Number.isSafeInteger(part))) return false;
-	const [major, minor, patch] = parts as [number, number, number];
-	if (major !== MIN_PI_VERSION[0]) return major > MIN_PI_VERSION[0];
-	if (minor !== MIN_PI_VERSION[1]) return minor > MIN_PI_VERSION[1];
-	if (patch !== MIN_PI_VERSION[2]) return patch > MIN_PI_VERSION[2];
-	return parsed[4] === undefined;
-}
+export { isSupportedPiVersion } from "./core/host-compat.ts";
 
 export interface ExtensionOptions {
 	/** Override the agent dir (tests). Defaults to Pi's getAgentDir(). */
@@ -66,8 +64,6 @@ export interface ExtensionOptions {
 	wakeTimerMaxDelayMs?: number;
 	/** Narrow lifecycle seam for deterministic wake read/race tests. */
 	wakeStateReader?: (mind: MindService) => Promise<WakeState>;
-	/** Raw Pi CLI args seam. Defaults to process.argv.slice(2); used for the one-shot --persona selector. */
-	cliArgs?: readonly string[];
 }
 
 function isAlive(pid: number): boolean {
@@ -239,31 +235,49 @@ function withDeadline<T>(p: Promise<T>, ms: number, fallback: T, onTimeout?: () 
 /** Build the extension. Exported (separately from the default factory) so tests can inject agentDir. */
 export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): void {
 	// Do not touch the host API when loaded by a Pi release below the supported contract floor.
-	if (!isSupportedPiVersion(VERSION)) throw new Error(`pi-persona-mind requires Pi 1.0.0+ (found ${VERSION}).`);
+	if (!isSupportedPiVersion(VERSION)) throw new Error(`pi-persona-mind requires Pi ${MIN_PI_VERSION}+ (found ${VERSION}).`);
 	// Mirror pi-persona's own PI_AGENT_DIR precedence so both extensions co-locate their data (and the
-	// mind never reads a stale/missing marker under the wrong root). getAgentDir() stays lazy — only
+	// Mind reads canonical preferences from the same root). getAgentDir() stays lazy — only
 	// called when neither an explicit override (tests) nor PI_AGENT_DIR is set.
 	const agentDir = preferredAgentDir(opts.agentDir) ?? getAgentDir();
-	// Persona reads defaultPersona/persist when its extension factory activates. Keep Mind's scope
-	// selectors on that same snapshot even when the host reuses this factory for `/new` sessions.
-	const personaStartupSelectors = resolvePersonaStartupSelectors(agentDir);
-	let { mindCapture: capturePolicy, mindNudge: nudgeEnabled } = resolveMindSettings(agentDir);
-	let settingsCollectUnsubscribe: (() => void) | undefined;
-	// pi-persona's one-shot `--persona` selector deliberately does not update its persisted marker.
-	// Pi scopes getFlag() to the extension that registered a flag and rejects duplicate declarations,
-	// so a companion extension must mirror this CLI-only selector from argv. Persona names stay opaque.
-	const liveCliPersona = (): string | undefined => personaFromCliArgs(opts.cliArgs ?? process.argv.slice(2));
-	const sessionIdOf = (ctx: ExtensionContext): string | undefined => ctx.sessionManager?.getSessionId();
-	const resolveMindScope = (ctx: ExtensionContext) => {
-		const cliPersona = liveCliPersona();
-		const sessionId = sessionIdOf(ctx);
-		return resolveScope(agentDir, ctx.cwd, {
-			...(cliPersona === undefined ? {} : { cliPersona }),
-			...(sessionId === undefined ? {} : { sessionId }),
-			startupSelectors: personaStartupSelectors,
-		});
+	let capturePolicy: "auto" | "prompt" | "off" = "auto";
+	let nudgeEnabled = true;
+	let currentSessionContext: ExtensionContext | undefined;
+	const suspendedMindTools = new Set<string>();
+	let personaUnavailable = false;
+	let onPersonaUnavailable = (_ctx?: ExtensionContext): void => {};
+	const unavailableReason = (ctx = currentSessionContext): string | undefined => {
+		const dependency = queryPersonaDependency(pi);
+		if (!dependency.ok) onPersonaUnavailable(ctx);
+		if (!dependency.ok) return dependency.reason;
+		const owner = ctx ? queryPersonaMemoryOwner(pi, ctx) : undefined;
+		if (!owner?.ready) {
+			onPersonaUnavailable(ctx);
+			return owner ? "Mind is waiting for Persona's session memory owner." : "Mind is inactive: compatible pi-persona memory owner is unavailable; /reload.";
+		}
+		personaUnavailable = false;
+		return undefined;
 	};
-	const rawMindPersona = (ctx: ExtensionContext): string | null => rawActivePersona(agentDir, process.env, liveCliPersona(), sessionIdOf(ctx), personaStartupSelectors);
+	const available = (ctx = currentSessionContext): boolean => unavailableReason(ctx) === undefined;
+	let settingsCollectUnsubscribe: (() => void) | undefined;
+	const sessionIdOf = (ctx: ExtensionContext): string => ctx.sessionManager.getSessionId();
+	const rawMindPersona = (ctx: ExtensionContext): string | null => {
+		const owner = queryPersonaMemoryOwner(pi, ctx);
+		if (!owner?.ready) throw new Error("Persona's session memory owner is unavailable");
+		return owner.persona;
+	};
+	const resolveMindScope = (ctx: ExtensionContext) => resolveScope(agentDir, ctx.cwd, { persona: rawMindPersona(ctx) });
+	const captureMemoryOwner = (ctx: ExtensionContext): (() => boolean) => {
+		const generation = sessionLifecycleGeneration;
+		const manager = ctx.sessionManager;
+		const id = manager.getSessionId();
+		const file = manager.getSessionFile();
+		const scope = JSON.stringify(resolveMindScope(ctx));
+		return () => {
+			try { return generation === sessionLifecycleGeneration && ctx.sessionManager === manager && manager.getSessionId() === id && manager.getSessionFile() === file && available(ctx) && scope === JSON.stringify(resolveMindScope(ctx)); }
+			catch { return false; }
+		};
+	};
 	const migrationWaitMs = Math.max(0, opts.migrationAwaitMs ?? MIGRATION_AWAIT_MS);
 	const wakeTimerMaxDelayMs = Math.min(MAX_TIMER_DELAY_MS, Math.max(1, opts.wakeTimerMaxDelayMs ?? MAX_TIMER_DELAY_MS));
 	const ownerToken = `${hostname()}:${process.pid}:${++ownerInstanceSeq}`;
@@ -287,8 +301,40 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		}
 		setStatus(ctx, "mind warning · /mind doctor", "warning");
 	};
-	const getMind = (ctx: ExtensionContext): MindService =>
-		new MindService(resolveMindScope(ctx), { onWarn: (message) => surfaceWarning(ctx, message) });
+	const getMind = (ctx: ExtensionContext): MindService => {
+		const reason = unavailableReason(ctx);
+		if (reason) throw new Error(reason);
+		return new MindService(resolveMindScope(ctx), { onWarn: (message) => surfaceWarning(ctx, message) });
+	};
+	const sessionMemory = createSessionMemory(pi);
+	registerSessionNoteRenderer(pi);
+	registerMindResultRenderer(pi);
+	let optimizerCache: { manager: ExtensionContext["sessionManager"]; key: string; optimizer: MemoryOptimizer } | undefined;
+	const discardOptimizer = (): void => {
+		optimizerCache?.optimizer.invalidate();
+		optimizerCache = undefined;
+	};
+	const getOptimizer = (ctx: ExtensionContext): MemoryOptimizer => {
+		if (!sessionMemory.isCurrent(ctx)) throw new Error("memory optimizer session owner is unavailable");
+		const mind = getMind(ctx);
+		const scope = resolveMindScope(ctx);
+		const key = JSON.stringify([ctx.sessionManager.getSessionId(), ctx.sessionManager.getSessionFile(), scope.persona, scope.paths]);
+		if (optimizerCache?.manager === ctx.sessionManager && optimizerCache.key === key) return optimizerCache.optimizer;
+		discardOptimizer();
+		const optimizer = mind.createOptimizer();
+		optimizerCache = { manager: ctx.sessionManager, key, optimizer };
+		return optimizer;
+	};
+	const getActivity = (ctx: ExtensionContext) => {
+		const ownerCurrent = sessionMemory.captureOwner(ctx);
+		const scopeKey = JSON.stringify(resolveMindScope(ctx));
+		return createMindActivityRunner({
+			sessionId: ctx.sessionManager.getSessionId(),
+			isCurrent: () => ownerCurrent() && scopeKey === JSON.stringify(resolveMindScope(ctx)),
+			enabled: () => { const dependency = queryPersonaDependency(pi); return dependency.ok && dependency.presence.capabilities.activity === 1; },
+			emit: (channel, event) => pi.events.emit(channel, event),
+		});
+	};
 
 	pi.registerEntryRenderer<{ content: string }>(WAKE_ENTRY_TYPE, (entry, { expanded }, theme) => {
 		const body = typeof entry.data?.content === "string" ? entry.data.content : "";
@@ -313,6 +359,12 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	let rootMigration: Promise<MigrationReport> | undefined;
 	let backgroundMigration: Promise<MigrationReport> | undefined;
 	let backgroundMigrationKey: string | undefined;
+	let backgroundMigrationPending = false;
+	let backgroundMigrationWarnings = 0;
+	let backgroundMigrationFailure: string | undefined;
+	let observedMigration: Promise<MigrationReport> | undefined;
+	let observedMigrationGeneration = -1;
+	const migrationProgressNotices = new WeakSet<Promise<MigrationReport>>();
 	const aliasMigrations = new Map<string, Promise<MigrationReport>>();
 	let migrationNoticeShown = false;
 	let migrationGeneration = 0;
@@ -349,9 +401,10 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		}
 	};
 	const runMigration = async (ctx: ExtensionContext, includeAmbiguousPersonaAlias: boolean): Promise<MigrationReport> => {
-		const rootReport = await (rootMigration ??= migrateLegacyRoot(agentDir));
 		const scope = resolveMindScope(ctx);
 		const rawPersona = rawMindPersona(ctx);
+		// Scope belongs to the operation that started the import, even if a root import blocks.
+		const rootReport = await (rootMigration ??= migrateLegacyRoot(agentDir));
 		const aliasKey = JSON.stringify([rawPersona, scope.projectRoot, includeAmbiguousPersonaAlias]);
 		let aliasPromise = aliasMigrations.get(aliasKey);
 		if (!aliasPromise) {
@@ -374,72 +427,109 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			}
 		})();
 	};
+	const migrationKey = (ctx: ExtensionContext): string => JSON.stringify([rawMindPersona(ctx), resolveMindScope(ctx).projectRoot]);
+	const migrationStatus = (): string => backgroundMigrationPending
+		? "running in background; existing stores remain available, older imported entries may appear later"
+		: backgroundMigrationFailure ? `failed: ${backgroundMigrationFailure}; /reload retries the legacy import`
+		: backgroundMigrationWarnings > 0 ? `completed with ${backgroundMigrationWarnings} warning(s); source files kept, see warnings below; /reload rechecks legacy sources`
+		: backgroundMigration ? "complete; legacy source files kept" : "not started";
+	const observeMigration = (ctx: ExtensionContext, task: Promise<MigrationReport>, key: string): void => {
+		const generation = sessionLifecycleGeneration;
+		if (observedMigration === task && observedMigrationGeneration === generation) return;
+		observedMigration = task;
+		observedMigrationGeneration = generation;
+		const current = (): boolean => generation === sessionLifecycleGeneration && available(ctx) && migrationKey(ctx) === key;
+		void task.then((report) => {
+			if (!current()) return;
+			reportMigration(ctx, report);
+			rearmAfterMigration(ctx);
+		}, (err: unknown) => {
+			if (current()) surfaceWarning(ctx, `legacy memory import failed; /reload retries it: ${err instanceof Error ? err.message : String(err)}`);
+		}).catch((err: unknown) => {
+			if (current()) surfaceWarning(ctx, `legacy memory import finished but its status could not refresh: ${err instanceof Error ? err.message : String(err)}`);
+		});
+	};
 	const startBackgroundMigration = (ctx: ExtensionContext): Promise<MigrationReport> => {
-		const scope = resolveMindScope(ctx);
-		const key = JSON.stringify([rawMindPersona(ctx), scope.projectRoot]);
-		if (backgroundMigration && backgroundMigrationKey === key) return backgroundMigration;
+		const key = migrationKey(ctx);
+		if (backgroundMigration && backgroundMigrationKey === key) {
+			observeMigration(ctx, backgroundMigration, key);
+			return backgroundMigration;
+		}
 		const task = runMigration(ctx, false);
 		backgroundMigration = task;
 		backgroundMigrationKey = key;
+		backgroundMigrationPending = true;
+		backgroundMigrationWarnings = 0;
+		backgroundMigrationFailure = undefined;
 		void task.then(
 			(report) => {
-				reportMigration(ctx, report);
+				if (backgroundMigration !== task) return;
+				backgroundMigrationPending = false;
+				backgroundMigrationWarnings = report.warnings.length;
 				migrationGeneration++;
-				rearmAfterMigration(ctx);
 			},
 			(err: unknown) => {
+				if (backgroundMigration !== task) return;
+				backgroundMigrationPending = false;
+				backgroundMigrationFailure = err instanceof Error ? err.message : String(err);
 				backgroundMigration = undefined;
 				backgroundMigrationKey = undefined;
 				rootMigration = undefined;
 				aliasMigrations.clear();
-				surfaceWarning(ctx, `legacy memory migration failed; continuing and will retry: ${err instanceof Error ? err.message : String(err)}`);
 			},
-		).catch((err: unknown) => {
-			backgroundMigration = undefined;
-			backgroundMigrationKey = undefined;
-			surfaceWarning(ctx, `legacy memory migration completion failed; continuing and will retry: ${err instanceof Error ? err.message : String(err)}`);
-		});
+		);
+		observeMigration(ctx, task, key);
 		return task;
 	};
 	const ensureLegacyMigrated = async (ctx: ExtensionContext, includeAmbiguousPersonaAlias = false, awaitCompletion = false): Promise<void> => {
-		if (isDelegatedLeg) return;
+		if (isDelegatedLeg || !available(ctx)) return;
+		const generation = sessionLifecycleGeneration;
+		const key = migrationKey(ctx);
+		const current = (): boolean => generation === sessionLifecycleGeneration && available(ctx) && migrationKey(ctx) === key;
 		const task = includeAmbiguousPersonaAlias ? runMigration(ctx, true) : startBackgroundMigration(ctx);
 		try {
 			if (includeAmbiguousPersonaAlias || awaitCompletion) {
 				const report = await task;
-				if (includeAmbiguousPersonaAlias || awaitCompletion) reportMigration(ctx, report);
+				if (current()) reportMigration(ctx, report);
 				return;
 			}
-			await withDeadline(task, migrationWaitMs, undefined, () =>
-				surfaceWarning(ctx, `legacy memory migration is still running; continuing this turn and will retry in the background`),
-			);
+			await withDeadline(task, migrationWaitMs, undefined, () => {
+				if (!current() || !backgroundMigrationPending) return;
+				if (!migrationProgressNotices.has(task)) {
+					migrationProgressNotices.add(task);
+					try { ctx.ui.notify("[pi-persona-mind] Legacy memory import continues in the background. This turn can proceed; older entries may appear after import finishes. /persona-mind doctor shows its status.", "info"); }
+					catch { /* Progress cannot interrupt the turn. */ }
+				}
+				if (!warningStatusActive) setStatus(ctx, "mind importing older memory · /persona-mind doctor");
+			});
 		} catch (err) {
-			if (!includeAmbiguousPersonaAlias) {
+			if (!includeAmbiguousPersonaAlias && backgroundMigration === task) {
 				backgroundMigration = undefined;
 				backgroundMigrationKey = undefined;
 			}
-			rootMigration = undefined;
-			aliasMigrations.clear();
-			surfaceWarning(ctx, `legacy memory migration failed; continuing and will retry: ${err instanceof Error ? err.message : String(err)}`);
+			if (includeAmbiguousPersonaAlias) { rootMigration = undefined; aliasMigrations.clear(); }
+			if (current()) surfaceWarning(ctx, `legacy memory import failed; /reload retries it: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	};
 
-	// A DELEGATED worker leg? pi-persona (≥ 1.5.2) marks its sub-agent sessions with a DEDICATED marker,
+	// Persona marks actual delegated worker legs with a dedicated marker,
 	// PI_PERSONA_LEG=1 — the in-process fork-bomb guard sets it transiently around session creation, and
 	// the child engine puts it in the spawn env (a child process also carries PI_PERSONA_CHILD=1). We key
-	// on those, NOT on PI_PERSONA_DISABLE: that flag is ALSO pi-persona's user-facing kill switch, so a
-	// user who disables pi-persona interactively is a supervisor running the mind standalone — not a leg,
-	// and it must keep its memory tools. Sampled HERE at factory time (the in-process marker is popped
+	// on those, NOT on PI_PERSONA_DISABLE: a disabled supervisor is not a delegated leg. The loaded
+	// Persona's companion response separately denies its memory capability. Sampled HERE at factory time
+	// (the in-process marker is popped
 	// before the turn runs). A worker is not the persona: it inherits only the lean mind (north-star +
 	// identity — see buildInjection) and must NOT manage the supervisor's memory or fire its wakes. Absent
-	// the markers (the normal supervisor, or a user kill switch), everything runs full — behavior unchanged.
+	// the markers, only a compatible, enabled supervisor may use the full mind.
 	const isDelegatedLeg = process.env.PI_PERSONA_LEG === "1" || process.env.PI_PERSONA_CHILD === "1";
+	const autoOptimize = installAutoOptimize(pi, { isDelegatedLeg, available, captureOwner: captureMemoryOwner, scope: resolveMindScope, persona: rawMindPersona, mind: getMind });
 
 	// Withhold the write tools from a worker: a leg reading/writing the supervisor persona's LTM/STM/
 	// backlog is exactly the bleed we prevent. It still INHERITS the lean block below (read-only, curated).
 	if (!isDelegatedLeg) {
-		registerMemoryTool(pi, getMind);
-		registerBacklogTool(pi, getMind);
+		const guardedTools = personaGuardedTools(pi, unavailableReason);
+		registerMemoryTool(guardedTools, getMind, sessionMemory, getOptimizer, getActivity);
+		registerBacklogTool(guardedTools, getMind);
 	}
 
 	// Backlog wake timers — only the elected owner session arms/fires them, so concurrent sessions
@@ -472,7 +562,28 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		}
 		ownerPath = undefined;
 	};
+	onPersonaUnavailable = (ctx): void => {
+		// A stale context can be refused without revoking a different currently active native owner.
+		if (ctx && currentSessionContext && ctx.sessionManager !== currentSessionContext.sessionManager) return;
+		if (personaUnavailable) return;
+		personaUnavailable = true;
+		autoOptimize.revoke();
+		discardOptimizer();
+		sessionMemory.deactivate();
+		sessionActive = false;
+		sessionStarting = false;
+		wakeGeneration++;
+		clearTimers();
+		releaseWakeOwner();
+		settingsCollectUnsubscribe?.();
+		settingsCollectUnsubscribe = undefined;
+		const active = pi.getActiveTools();
+		for (const name of active) if (name === "memory" || name === "backlog") suspendedMindTools.add(name);
+		pi.setActiveTools(active.filter((name) => name !== "memory" && name !== "backlog"));
+	};
+	const wakeCurrent = (generation: number, path: string): boolean => available() && sessionActive && wakeGeneration === generation && ownerPath === path;
 	const armWakes = async (ctx: ExtensionContext, deliverPastDue = true, newlyQueuedId?: string): Promise<void> => {
+		if (!available(ctx)) return;
 		const generation = ++wakeGeneration;
 		if (newlyQueuedId) pendingWakeIds.add(newlyQueuedId);
 		clearTimers(true);
@@ -496,14 +607,14 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		try {
 			all = await readWakeState(mind);
 		} catch (err) {
-			if (sessionActive && wakeGeneration === generation && ownerPath === nextOwnerPath) {
+			if (wakeCurrent(generation, nextOwnerPath)) {
 				surfaceWarning(ctx, `could not load backlog wake state: ${err instanceof Error ? err.message : String(err)}`);
 			}
 			if (wakeGeneration === generation && ownerPath === nextOwnerPath) releaseWakeOwner();
 			return;
 		}
 		const now = Date.now();
-		if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) {
+		if (!wakeCurrent(generation, nextOwnerPath)) {
 			if (wakeGeneration === generation && ownerPath === nextOwnerPath) releaseWakeOwner();
 			return;
 		}
@@ -521,7 +632,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 				const list = shown.map((e) => `• ${compactMemoryText(e.text, MAX_WAKE_TEXT_CHARS)} (id ${e.id})`).join("\n");
 				const omitted = due.length - shown.length;
 				const more = omitted > 0 ? `\n… +${omitted} more due item(s); use \`backlog list\` to review them.` : "";
-				if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
+				if (!wakeCurrent(generation, nextOwnerPath)) return;
 				for (const item of due) {
 					pendingWakeIds.delete(item.id);
 					if (item.dueAtEpochMs !== undefined) displayedWakeDeadlines.set(item.id, item.dueAtEpochMs);
@@ -538,19 +649,19 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		}
 		// Schedule the future ones.
 		const scheduleWake = (item: (typeof all)[number], remainingMs: number): void => {
-			if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
+			if (!wakeCurrent(generation, nextOwnerPath)) return;
 			pendingWakeIds.add(item.id);
 			const delay = Math.min(Math.max(1, remainingMs), wakeTimerMaxDelayMs);
 			const t = setTimeout(() => {
-				if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
+				if (!wakeCurrent(generation, nextOwnerPath)) return;
 				timers.delete(item.id);
 				// Re-check at every chunk. This avoids Node's ~24.8-day timer overflow and also notices
 				// a completed/dropped item before re-arming the next chunk.
 				void (async () => {
 					try {
-						if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
+						if (!wakeCurrent(generation, nextOwnerPath)) return;
 						const live = (await mind.backlogList({ all: true })).find((entry) => entry.id === item.id);
-						if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
+						if (!wakeCurrent(generation, nextOwnerPath)) return;
 						if (!live || (live.state !== "open" && live.state !== "taken") || live.dueAtEpochMs === undefined) {
 							pendingWakeIds.delete(item.id);
 							return;
@@ -564,7 +675,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 							scheduleWake(live, left);
 							return;
 						}
-						if (!sessionActive || wakeGeneration !== generation || ownerPath !== nextOwnerPath) return;
+						if (!wakeCurrent(generation, nextOwnerPath)) return;
 						pendingWakeIds.delete(item.id);
 						displayedWakeDeadlines.set(live.id, live.dueAtEpochMs);
 						deliverWake(
@@ -573,7 +684,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 						);
 						await mind.acknowledgeDue([live.id]);
 					} catch (err) {
-						if (sessionActive && wakeGeneration === generation && ownerPath === nextOwnerPath) surfaceWarning(ctx, `could not re-check due backlog item ${item.id}: ${err instanceof Error ? err.message : String(err)}`);
+						if (wakeCurrent(generation, nextOwnerPath)) surfaceWarning(ctx, `could not re-check due backlog item ${item.id}: ${err instanceof Error ? err.message : String(err)}`);
 					}
 				})();
 			}, delay);
@@ -598,6 +709,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			return;
 		}
 		if (activeScopeKey === nextKey) return;
+		discardOptimizer();
 		clearTimers();
 		releaseWakeOwner();
 		activeScopeKey = nextKey;
@@ -616,7 +728,8 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 				setStatus(ctx, "mind warning · /mind doctor", "warning");
 				return;
 			}
-			const label = `mind ${s.ltm}L·${s.stm}S · backlog ${s.backlogOpen}`;
+			if (backgroundMigrationPending) { setStatus(ctx, "mind importing older memory · /persona-mind doctor"); return; }
+		const label = `mind ${s.ltm}L·${s.projectLtm}P·${s.stm}S · backlog ${s.backlogOpen}`;
 			setStatus(ctx, label);
 		} catch (err) {
 			surfaceWarning(ctx, `could not refresh memory status: ${err instanceof Error ? err.message : String(err)}`);
@@ -625,7 +738,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 
 	// A delegated leg came back BLOCKED — surface it as a backlog candidate (deterministic, nudge-only,
 	// never auto-writes). Reached on BOTH delivery paths: the sync delegate/council tool_result, and the
-	// v1.5.0 background-default path where the report arrives as a follow-up user message (before_agent_start).
+	// background completion path where the report arrives as an attributed custom message.
 	const nudgeBlocked = (ctx: ExtensionContext, snippet: string): void => {
 		try {
 			const hint = `⚠️ a delegated leg reported ${snippet} — \`backlog add\` so the thread isn't lost`;
@@ -711,7 +824,8 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		if (cues.length === 0) return undefined;
 		const explicit = capturePolicy === "auto" ? cues.filter((cue) => cue.strong) : [];
 		const mind = explicit.length > 0 ? getMind(ctx) : undefined;
-		const isCurrent = (): boolean => lifecycleGeneration === sessionLifecycleGeneration && inputGeneration === captureInputGeneration;
+		const ownerCurrent = captureMemoryOwner(ctx);
+		const isCurrent = (): boolean => lifecycleGeneration === sessionLifecycleGeneration && inputGeneration === captureInputGeneration && ownerCurrent();
 		if (explicit.length > 0) {
 			await ensureLegacyMigrated(ctx);
 			if (isCurrent()) await reconcileScope(ctx, lifecycleGeneration);
@@ -728,7 +842,10 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 					tags: ["auto-captured"],
 					source: "direct user persistence cue",
 				});
-				if (result.ok) stored.push(result.entry.id);
+				if (result.ok) {
+					stored.push(result.entry.id);
+					if (isCurrent()) autoOptimize.memoryAdded(ctx, cue.term === "long" ? "persona" : "project");
+				}
 				else failures.push(result.reason);
 			}
 		}
@@ -773,6 +890,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	// explicit persist-intent is safe to commit deterministically before the model runs. Everything
 	// softer remains a model-visible candidate governed by the standing tool guideline.
 	pi.on("input", async (event, ctx) => {
+		if (!available(ctx)) return;
 		const lifecycleGeneration = sessionLifecycleGeneration;
 		const inputGeneration = ++captureInputGeneration;
 		pendingInputProvenance = { source: event.source };
@@ -800,10 +918,11 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			.join("\n");
 	};
 
-	// Custom messages bypass `input`. Pi 1.2 custom-triggered starts are handled in before_agent_start;
+	// Custom messages bypass `input`. Idle custom-triggered starts are handled in before_agent_start;
 	// messages appended inside an existing run still arrive only here. A deferred input is replayed
 	// user text and may be auto-captured; async child/exocom reports remain foreign.
 	pi.on("message_start", async (event, ctx) => {
+		if (!available(ctx)) return;
 		const message = event.message;
 		if (message.role !== "custom") return;
 		if (customMessagesHandledBeforeStart.has(message)) {
@@ -841,27 +960,23 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	// how memory survives compaction: it re-injects from disk. Fail-open: a stalled read (slow disk,
 	// lock contention) degrades to no injection rather than hanging the turn.
 	pi.on("before_agent_start", async (event, ctx) => {
+		if (!available(ctx)) return;
 		const lifecycleGeneration = sessionLifecycleGeneration;
+		const ownerCurrent = captureMemoryOwner(ctx);
 		await ensureLegacyMigrated(ctx);
-		if (lifecycleGeneration !== sessionLifecycleGeneration) return;
+		if (!ownerCurrent()) return;
 		await reconcileScope(ctx, lifecycleGeneration);
-		if (lifecycleGeneration !== sessionLifecycleGeneration) return;
+		if (!ownerCurrent()) return;
 		let provenance = pendingInputProvenance?.source;
 		pendingInputProvenance = undefined;
-		// Pi 1.2 can start a run from an idle custom message. Its BeforeAgentStartEvent has
-		// messageType="custom" + message and deliberately has no prompt; Pi 1.0 only exposes prompt.
-		const currentEvent = event as typeof event & {
-			messageType?: unknown;
-			message?: { customType?: unknown; content?: unknown };
-		};
-		const customMessage = currentEvent.messageType === "custom" ? currentEvent.message : undefined;
+		const customMessage = event.messageType === "custom" ? event.message : undefined;
 		if (customMessage) {
 			customMessagesHandledBeforeStart.add(customMessage);
 			provenance = customMessage.customType === "pi-persona-deferred-input" ? "interactive" : "extension";
 			const deferredWasAlreadyProcessed = customMessage.customType === "pi-persona-deferred-input" && deferredInputsProcessed.has(customMessage);
 			if (!deferredWasAlreadyProcessed) pendingCaptureNotice = undefined;
 		}
-		const userPrompt = currentEvent.messageType === "custom" ? undefined : event.prompt;
+		const userPrompt = event.messageType === "user" ? event.prompt : undefined;
 		// Only the attributed deferred-input convention represents direct user text in a custom event.
 		// Other custom messages remain extension-authored, even if their bodies resemble user intent.
 		const directInputPrompt = customMessage
@@ -887,8 +1002,8 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		}
 		let cueHint = "";
 		if (!isDelegatedLeg) {
-			// A delegated leg that came back BLOCKED arrives HERE on the v1.5.0 async/background-default
-			// path: pi-persona delivers the completion report as a follow-up user message; on Pi 1.2 an
+			// A delegated leg that came back BLOCKED arrives HERE on the async/background
+			// path: pi-persona delivers the completion report as a follow-up user message; an
 			// idle `sendMessage(..., { triggerTurn: true })` instead arrives in the custom-message variant.
 			// In both cases, provenance and the host's event discriminator keep foreign reports out of capture.
 			const blocked = customMessage?.customType === "pi-persona"
@@ -905,7 +1020,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 				if (notice && directInputPrompt !== undefined && (provenance === "interactive" || provenance === "rpc") && !promptBelongsToAnOlderDirectInput) {
 					cueHint = notice.hint;
 				} else if (nudgeEnabled && provenance !== "extension") {
-					// Compatibility fallback for host paths that do not emit `input`: nudge only. Never auto-write
+					// A current programmatic path may lack direct-input provenance: nudge only. Never auto-write
 					// here because an extension-authored follow-up is indistinguishable from direct user input.
 					const cue: CaptureCue | undefined = directInputPrompt === undefined ? undefined : detectCaptureCues(directInputPrompt)[0];
 					if (cue && !cueHinted.has(cue.snippet)) {
@@ -923,15 +1038,17 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			}
 		}
 		let block = "";
+		const query = directInputPrompt ?? latestDirectInputPrompt ?? "";
+		const sessionBlock = isDelegatedLeg ? "" : sessionMemory.injection(ctx, { query, maxTokens: 600 });
 		try {
 			// A worker inherits the LEAN mind (north-star + identity only); the supervisor gets it all.
-			block = await withDeadline(getMind(ctx).buildInjection({ lean: isDelegatedLeg }), INJECT_DEADLINE_MS, "", () => {
-				if (lifecycleGeneration === sessionLifecycleGeneration) surfaceWarning(ctx, `memory injection exceeded ${INJECT_DEADLINE_MS}ms and was skipped for this turn`);
+			block = await withDeadline(getMind(ctx).buildInjection({ lean: isDelegatedLeg, cleanup: !backgroundMigrationPending, query, fixedBlocks: [sessionBlock, cueHint].filter(Boolean).map((text) => `${text}\n\n`) }), INJECT_DEADLINE_MS, "", () => {
+				if (ownerCurrent()) surfaceWarning(ctx, `memory injection exceeded ${INJECT_DEADLINE_MS}ms and was skipped for this turn`);
 			});
 		} catch (err) {
-			if (lifecycleGeneration === sessionLifecycleGeneration) surfaceWarning(ctx, `memory injection failed: ${err instanceof Error ? err.message : String(err)}`);
+			if (ownerCurrent()) surfaceWarning(ctx, `memory injection failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
-		if (lifecycleGeneration !== sessionLifecycleGeneration) return;
+		if (!ownerCurrent()) return;
 		// The empty-mind hint announces the faculty ONCE per session, then goes quiet even if the mind
 		// stays empty — a state indicator, not a per-turn nag. Matched by PREFIX: a content block starts
 		// with `<persona-mind …` and a memory's text sits inside the fence, so this only ever recognises
@@ -940,7 +1057,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			if (emptyAnnounced) block = "";
 			else emptyAnnounced = true;
 		}
-		const injected = [block, cueHint].filter(Boolean).join("\n\n");
+		const injected = [block, sessionBlock, cueHint].filter(Boolean).join("\n\n");
 		if (injected) return { systemPrompt: `${event.systemPrompt}\n\n${injected}` };
 		return;
 	});
@@ -948,8 +1065,9 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	// The SYNC delegation path: a `delegate`/`council` tool_result whose report carries a BLOCKED/UNKNOWN
 	// marker (the async/background default lands in before_agent_start above). No result mutation — just a
 	// status-line nudge — so it composes cleanly alongside pi-persona's own tool_result hook.
-	const REPORT_TOOLS = new Set(["delegate", "council"]);
+	const REPORT_TOOLS = new Set(["delegate", "council", "flow"]);
 	pi.on("tool_result", async (event, ctx) => {
+		if (!available(ctx)) return;
 		const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : "";
 		const relaysNestedBlocked = toolCallId ? nestedBlockedRelays.delete(toolCallId) : false;
 		if (isDelegatedLeg) return undefined;
@@ -980,20 +1098,43 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		return undefined;
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
+	const startSession = async (_event: unknown, ctx: ExtensionContext): Promise<void> => {
+		autoOptimize.revoke();
+		currentSessionContext = ctx;
+		discardOptimizer();
+		sessionMemory.deactivate();
+		const reason = unavailableReason(ctx);
+		if (!isDelegatedLeg && !reason) sessionMemory.activate(ctx);
 		const lifecycleGeneration = resetSessionTransientState();
 		const sessionId = sessionIdOf(ctx);
 		settingsCollectUnsubscribe?.();
 		settingsCollectUnsubscribe = undefined;
-		// A reused Pi process must not inherit the previous session's persona-switch latch.
-		resetPersonaMarkerLatch(sessionId);
+		if (reason) {
+			sessionActive = false;
+			sessionStarting = false;
+			wakeGeneration++;
+			clearTimers();
+			releaseWakeOwner();
+			pi.setActiveTools(pi.getActiveTools().filter((name) => name !== "memory" && name !== "backlog"));
+			setStatus(ctx, "Mind inactive · requires pi-persona");
+			const pendingOwner = queryPersonaMemoryOwner(pi, ctx);
+			if (pendingOwner && !pendingOwner.ready) { setStatus(ctx, "Mind waiting for Persona session"); return; }
+			try { ctx.ui.notify(reason, "info"); } catch { /* Availability is also enforced at every tool call. */ }
+			return;
+		}
+		if (suspendedMindTools.size > 0) {
+			pi.setActiveTools([...new Set([...pi.getActiveTools(), ...suspendedMindTools])]);
+			suspendedMindTools.clear();
+		}
+		// Mind preferences are session snapshots, independent from Persona's live owner.
+		resetMindSettings(sessionId);
 		const mindSettings = resolveMindSettings(agentDir, process.env, sessionId);
 		capturePolicy = mindSettings.mindCapture;
 		nudgeEnabled = mindSettings.mindNudge;
+		autoOptimize.activate(ctx, true);
 		// A worker never arms/fires the supervisor's backlog wakes (nor shows a status line).
 		if (isDelegatedLeg) return;
-		if (pi.events && typeof pi.events.on === "function") {
-			settingsCollectUnsubscribe = pi.events.on("pi-persona:settings:collect:v1", (payload) => {
+		settingsCollectUnsubscribe = pi.events.on("pi-persona:settings:collect:v1", (payload) => {
 				if (!payload || typeof payload !== "object") return;
 				const add = (payload as { add?: unknown }).add;
 				if (typeof add !== "function") return;
@@ -1002,8 +1143,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 				} catch {
 					/* an optional settings consumer must not interrupt a Pi lifecycle event */
 				}
-			});
-		}
+		});
 		sessionActive = true;
 		sessionStarting = true;
 		try {
@@ -1015,7 +1155,9 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			if (lifecycleGeneration !== sessionLifecycleGeneration) return;
 			lastArmedMigrationGeneration = migrationGeneration;
 			try {
-				await getMind(ctx).sweepExpired();
+				// Import selection/commit shares the profile mutex with expiry cleanup. Its bounded
+				// startup wait must not be rejoined through hygiene while the import is still pending.
+				if (!backgroundMigrationPending) await getMind(ctx).sweepExpired();
 			} catch {
 				/* expired STM/backlog must not block session start */
 			}
@@ -1027,108 +1169,59 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 				rearmAfterMigration(ctx);
 			}
 		}
+	};
+	pi.on("session_start", startSession);
+	pi.events.on(PERSONA_MEMORY_OWNER_CHANGED, (value: unknown) => {
+		const ctx = currentSessionContext;
+		if (!ctx) return;
+		const changed = parsePersonaMemoryOwner(value, sessionIdOf(ctx));
+		if (!changed) return;
+		if (!changed.ready) { onPersonaUnavailable(); return; }
+		if (!available(ctx)) return;
+		autoOptimize.activate(ctx);
+		const generation = sessionLifecycleGeneration;
+		void (async () => {
+			if (!sessionActive && !sessionStarting) { await startSession({}, ctx); return; }
+			await reconcileScope(ctx, generation);
+			if (generation !== sessionLifecycleGeneration || !available(ctx)) return;
+			await ensureLegacyMigrated(ctx);
+			if (generation === sessionLifecycleGeneration && available(ctx)) await refreshStatus(ctx);
+		})().catch((error: unknown) => { if (generation === sessionLifecycleGeneration && available(ctx)) surfaceWarning(ctx, `could not activate Persona memory owner: ${error instanceof Error ? error.message : String(error)}`); });
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
+		currentSessionContext = undefined;
+		discardOptimizer();
+		sessionMemory.deactivate();
 		resetSessionTransientState();
 		sessionActive = false;
 		sessionStarting = false;
 		settingsCollectUnsubscribe?.();
 		settingsCollectUnsubscribe = undefined;
-		resetPersonaMarkerLatch(sessionIdOf(ctx));
+		resetMindSettings(sessionIdOf(ctx));
 		wakeGeneration++;
 		clearTimers();
 		releaseWakeOwner();
 	});
 
-	// Human view of what is currently in the mind (and injected each turn), plus workspace reset.
-	pi.registerCommand("mind", {
-		description: "Show this persona's mind. /mind doctor for diagnostics. /mind reset clears this project's working memory and backlog.",
-		handler: async (args, ctx) => {
-			const command = args.trim().toLowerCase();
-			const [verb, qualifier] = command.split(/\s+/);
-			if (command && verb !== "doctor" && verb !== "reset" && command !== "migrate-persona") {
-				ctx.ui.notify("usage: /mind | /mind doctor | /mind reset | /mind migrate-persona", "warning");
-				return;
-			}
-			if (command === "migrate-persona") {
-				const rawPersona = rawMindPersona(ctx);
-				await ensureLegacyMigrated(ctx, true, true);
-				surfaceWarning(
-					ctx,
-					rawPersona === null
-						? "AMBIGUOUS persona migration requested, but no active persona is selected; only project aliases were reconciled."
-						: `AMBIGUOUS persona migration imported the historical alias for '${rawPersona}'. Review the result; source files were left untouched.`,
-				);
-				return;
-			}
-			await ensureLegacyMigrated(ctx, false, command === "doctor");
-			const scope = resolveMindScope(ctx);
-			if (command === "doctor") {
-				const diagnostics: Array<[string, StoreDiagnostic]> = await Promise.all([
-					inspectStoreFile(scope.paths.ltm, "ltm").then((d): [string, StoreDiagnostic] => ["long-term", d]),
-					inspectStoreFile(scope.paths.shared, "ltm").then((d): [string, StoreDiagnostic] => ["shared", d]),
-					inspectStoreFile(scope.paths.stm, "stm").then((d): [string, StoreDiagnostic] => ["short-term", d]),
-					inspectStoreFile(scope.paths.backlog, "backlog").then((d): [string, StoreDiagnostic] => ["backlog", d]),
-				]);
-				const pathLine = ([label, diagnostic]: [string, StoreDiagnostic]): string => {
-					const suffix = diagnostic.status === "missing" ? "not created" : diagnostic.status === "ok" ? `ok (${diagnostic.validEntries} entries)` : `${diagnostic.status} (${diagnostic.message ?? `${diagnostic.invalidEntries} invalid entries`})`;
-					return `${label}: ${diagnostic.path} (${suffix})`;
-				};
-				const diagnosticWarnings = diagnostics.filter(([, diagnostic]) => diagnostic.status !== "missing" && diagnostic.status !== "ok").map(([label, diagnostic]) => `${label}: ${diagnostic.status} — ${diagnostic.message ?? "invalid store"}`);
-				const allWarnings = [...warnings, ...diagnosticWarnings];
-				const lines = [
-					"pi-persona-mind doctor",
-					`persona: ${scope.persona}`,
-					`cwd: ${ctx.cwd}`,
-					`project root: ${scope.projectRoot}${scope.homeWorkspace ? " (home — STM/backlog not injected, wakes off)" : ""}`,
-					`project slug: ${scope.slug}`,
-					`capture: ${capturePolicy} (PI_PERSONA_MIND_CAPTURE)`,
-					pathLine(diagnostics[0]!),
-					pathLine(diagnostics[1]!),
-					pathLine(diagnostics[2]!),
-					pathLine(diagnostics[3]!),
-					`legacy root: ${join(agentDir, "pi-persona-mind")} (${existsSync(join(agentDir, "pi-persona-mind")) ? "detected; imported non-destructively" : "absent"})`,
-					`warnings: ${allWarnings.length === 0 ? "none" : allWarnings.join(" | ")}`,
-				];
-				warnings.clear();
-				warningStatusActive = false;
-				setStatus(ctx, allWarnings.length === 0 ? "mind doctor · healthy" : `mind doctor · ${allWarnings.length} warning(s) acknowledged`, allWarnings.length === 0 ? "dim" : "warning");
-				ctx.ui.notify(lines.join("\n"), allWarnings.length === 0 ? "info" : "warning");
-				return;
-			}
-			if (verb === "reset") {
-				if (isDelegatedLeg) {
-					ctx.ui.notify("a delegated worker cannot reset the supervisor's workspace mind", "warning");
-					return;
-				}
-				if (qualifier && qualifier !== "workspace") {
-					ctx.ui.notify(
-						"/mind reset clears THIS PROJECT's short-term memory and backlog only. Long-term persona identity is not workspace-scoped — forget individual facts with `memory forget <id>`.",
-						"warning",
-					);
-					return;
-				}
-				const mind = getMind(ctx);
-				const result = await mind.resetWorkspace();
-				if (!result.ok) {
-					ctx.ui.notify(`mind reset failed: ${result.reason}`, "error");
-					return;
-				}
-				if (sessionActive) {
-					await armWakes(ctx, false);
-					await refreshStatus(ctx);
-				}
-				ctx.ui.notify(
-					`Cleared this workspace (${scope.projectRoot}): ${result.stmRemoved} short-term · ${result.backlogRemoved} backlog. Long-term identity (${result.ltmKept}) left intact.`,
-					"info",
-				);
-				return;
-			}
-			const mind = getMind(ctx);
-			const [summary, block] = await Promise.all([mind.summary(), mind.buildInjection()]);
-			const header = `pi-persona-mind (${scope.persona}) — ${summary.ltm} long-term · ${summary.stm} short-term · ${summary.backlogOpen} open backlog`;
-			ctx.ui.notify(block ? `${header}\n\n${block}` : `${header}\n\n(empty)`, "info");
+	registerMindCommands(pi, {
+		agentDir, resolveScope: resolveMindScope, rawPersona: rawMindPersona, getMind,
+		getSessionMemory: () => sessionMemory, getOptimizer, ensureLegacyMigrated, surfaceWarning,
+		migrationStatus,
+		unavailableReason,
+		activity: getActivity,
+		autoOptimize,
+		pendingWarnings: () => [...warnings],
+		acknowledgeWarnings: (ctx, count) => {
+			warnings.clear(); warningStatusActive = false;
+			setStatus(ctx, count === 0 ? "mind doctor · healthy" : `mind doctor · ${count} warning(s) acknowledged`, count === 0 ? "dim" : "warning");
+		},
+		capturePolicy: () => capturePolicy, isDelegatedLeg, sessionActive: () => sessionActive,
+		isCurrent: (ctx) => sessionMemory.isCurrent(ctx),
+		afterWorkspaceReset: async (ctx) => { discardOptimizer(); await armWakes(ctx, false); await refreshStatus(ctx); },
+		appendResult: (ctx, title, body) => {
+			if (!sessionMemory.isCurrent(ctx)) throw new Error("mind result owner is unavailable");
+			pi.appendEntry(MIND_RESULT_ENTRY_TYPE, { title, content: body });
 		},
 	});
 }

@@ -19,7 +19,7 @@
  */
 
 import { constants as fsConstants } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { copyFile, link, lstat, mkdir, open, rename, rmdir, unlink } from "node:fs/promises";
 import { hostname } from "node:os";
 import { performance } from "node:perf_hooks";
@@ -32,6 +32,16 @@ export interface StoreFile<E> {
 	/** Monotonic write counter: orders writes and lets an external reader detect change. */
 	sequence: number;
 	entries: E[];
+}
+
+export interface StoreSnapshot<E> {
+	store: StoreFile<E>;
+	/** Binds the exact live bytes and store path, including same-sequence replacements. */
+	fingerprint: string;
+}
+
+export class StoreConflictError extends Error {
+	constructor() { super("memory store changed since preview; inspect and preview again"); this.name = "StoreConflictError"; }
 }
 
 /** Defensive defaults for out-of-band/corrupt stores. Normal stores are far smaller than these. */
@@ -863,24 +873,65 @@ export class JsonStore<E> {
 		return { version: store.version, updatedAt: store.updatedAt, sequence: store.sequence, entries: [...store.entries] };
 	}
 
+	/** Read without recovery, quarantine, warnings or writes; invalid rows make editing unsafe. */
+	async inspectStrict(): Promise<StoreSnapshot<E>> {
+		let raw: string | undefined;
+		try {
+			raw = await readTextFileBounded(this.filePath, this.maxBytes);
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+			try {
+				await lstat(`${this.filePath}.bak`);
+				throw new Error("memory store is missing with a recoverable backup; repair before optimizing");
+			} catch (backupError) {
+				if ((backupError as NodeJS.ErrnoException).code !== "ENOENT") throw backupError;
+			}
+		}
+		const store: InternalStoreFile<E> | null = raw === undefined ? this.empty() : this.parseStore(raw);
+		if (!store || (store[PRESERVED_INVALID_ENTRIES]?.length ?? 0) > 0) {
+			throw new Error("memory store is corrupt or contains invalid entries; repair before optimizing");
+		}
+		const fingerprint = createHash("sha256").update(JSON.stringify([this.filePath, raw ?? null])).digest("hex");
+		return { store: { version: store.version, updatedAt: store.updatedAt, sequence: store.sequence, entries: [...store.entries] }, fingerprint };
+	}
+
+	/** Strict one-file CAS. A stale preview and a no-op leave live bytes and backups untouched. */
+	async compareAndUpdate(fingerprint: string, mutate: (entries: E[]) => E[]): Promise<StoreFile<E>> {
+		return withFileLock(`${this.filePath}.lock`, async (token) => {
+			const current = await this.inspectStrict();
+			if (current.fingerprint !== fingerprint) throw new StoreConflictError();
+			const previousEntries = JSON.stringify(current.store.entries);
+			const entries = mutate(current.store.entries);
+			if (JSON.stringify(entries) === previousEntries) return current.store;
+			if (!Number.isSafeInteger(current.store.sequence + 1)) throw new Error("memory store sequence exhausted");
+			const next = { ...current.store, entries, sequence: current.store.sequence + 1, updatedAt: new Date(this.now()).toISOString() };
+			const serialized = this.serializeStore(next);
+			const validated = this.parseStore(serialized);
+			if (!validated || (validated[PRESERVED_INVALID_ENTRIES]?.length ?? 0) > 0) throw new Error("invalid memory store update");
+			if ((await readLockToken(`${this.filePath}.lock`)) !== token) throw new StoreConflictError();
+			await atomicWriteFile(this.filePath, serialized, { backupIf: () => true, maxBackupBytes: this.maxBytes });
+			return next;
+		});
+	}
+
+	private serializeStore(next: InternalStoreFile<E>): string {
+		const invalidEntries = next[PRESERVED_INVALID_ENTRIES] ?? [];
+		const count = next.entries.length + invalidEntries.length;
+		if (count > this.maxEntries) throw new StoreCapacityError("entries", count, this.maxEntries);
+		const persisted = invalidEntries.length > 0 ? { ...next, entries: [...next.entries, ...invalidEntries] } : next;
+		const serialized = `${JSON.stringify(persisted, null, 2)}\n`;
+		const bytes = Buffer.byteLength(serialized, "utf8");
+		if (bytes > this.maxBytes) throw new StoreCapacityError("bytes", bytes, this.maxBytes);
+		return serialized;
+	}
+
 	/** Atomically apply `mutate` to the current entries and persist. Returns the committed store. */
 	async update(mutate: (entries: E[]) => E[]): Promise<StoreFile<E>> {
 		const next = await casUpdate<InternalStoreFile<E>>({
 			storePath: this.filePath,
 			load: (token) => this.loadInternal(token),
 			mutate: (current) => ({ ...current, updatedAt: new Date(this.now()).toISOString(), entries: mutate(current.entries) }),
-			serialize: (next) => {
-				const invalidEntries = next[PRESERVED_INVALID_ENTRIES] ?? [];
-				const persistedEntryCount = next.entries.length + invalidEntries.length;
-				if (persistedEntryCount > this.maxEntries) {
-					throw new StoreCapacityError("entries", persistedEntryCount, this.maxEntries);
-				}
-				const persisted = invalidEntries.length > 0 ? { ...next, entries: [...next.entries, ...invalidEntries] } : next;
-				const serialized = `${JSON.stringify(persisted, null, 2)}\n`;
-				const byteLength = Buffer.byteLength(serialized, "utf8");
-				if (byteLength > this.maxBytes) throw new StoreCapacityError("bytes", byteLength, this.maxBytes);
-				return serialized;
-			},
+			serialize: (next) => this.serializeStore(next),
 			// Only refresh the .bak from a live file that still parses — never let a torn file we just
 			// recovered from .bak overwrite that good backup.
 			backupIf: (raw) => {

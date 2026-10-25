@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { makeBacklog } from "../src/core/backlog.ts";
+import { estimateTokens } from "../src/core/context-budget.ts";
 import { renderMind } from "../src/core/inject.ts";
 import { makeMemory } from "../src/core/memory.ts";
 
@@ -139,4 +140,57 @@ test("multi-line / tag-bracket text is flattened to a single safe line", () => {
 	const body = block.split("\n").slice(1, -1).join("\n");
 	assert.ok(!body.includes("</persona-mind>"), "closing tag inside content is neutralized");
 	assert.ok(!/line one\nline two/.test(body), "no raw newline inside an entry line");
+});
+
+test("project durable memory is rendered in its own section and task-relevant facts outrank recent noise", () => {
+	const oldRelevant = makeMemory({ term: "long", kind: "convention", text: "Use src/core/inject.ts for bounded prompt rendering" }, T0 - 30 * H);
+	const recentNoise = makeMemory({ term: "long", kind: "note", text: "The release screenshot uses a dark theme" }, T0);
+	const block = renderMind({
+		persona: "elite", ltm: [], projectLtm: [recentNoise, oldRelevant], stm: [], backlog: [], now: T0,
+		query: "src/core/inject.ts bounded prompt rendering",
+		budget: { ltm: 8, projectLtm: 2, stm: 5, backlog: 6 },
+	});
+	assert.match(block, /## Durable project context/);
+	assert.ok(block.indexOf("bounded prompt rendering") < block.indexOf("dark theme"));
+});
+
+test("project durable memory never leaks into a lean delegated worker block", () => {
+	const projectFact = makeMemory({ term: "long", kind: "invariant", text: "The repo uses SQLite" }, T0);
+	const block = renderMind({ persona: "elite", ltm: [], projectLtm: [projectFact], stm: [], backlog: [], now: T0, lean: true });
+	assert.equal(block, "");
+});
+
+test("a task query does not move actionable due backlog behind an ordinary lexical match", () => {
+	const due = makeBacklog({ text: "audit the release checklist", dueInSeconds: 0 }, T0);
+	const matching = makeBacklog({ text: "patch auth retry routing" }, T0);
+	const block = renderMind({ persona: "p", ltm: [], stm: [], backlog: [due, matching], now: T0, query: "patch auth retry routing" });
+	assert.ok(block.indexOf("audit the release checklist") < block.indexOf("patch auth retry routing"));
+});
+
+test("the small objective/invariant core is prioritized, and extreme budgets never overflow", () => {
+	const objective = makeMemory({ term: "long", kind: "objective", text: "Keep the migration reversible" }, T0);
+	const invariant = makeMemory({ term: "long", kind: "invariant", text: "Never delete the source before the replacement commits" }, T0);
+	const note = makeMemory({ term: "long", kind: "note", text: "A low-priority detail" }, T0);
+	const block = renderMind({
+		persona: "p", ltm: [note, invariant, objective], stm: [], backlog: [], now: T0,
+		budget: { ltm: 8, stm: 5, backlog: 6, tokens: 1 },
+	});
+	assert.doesNotMatch(block, /Keep the migration reversible/);
+	assert.doesNotMatch(block, /Never delete the source/);
+	assert.equal(block, "", "even the bounded omission note must fit the hard cap");
+});
+
+test("session fixed blocks share the total limit with the complete memory fence", () => {
+	const memories = Array.from({ length: 12 }, (_, index) => makeMemory({
+		term: "long",
+		kind: "note",
+		text: `Project detail ${index}: preserve the complete file boundary and disclose omitted entries.`,
+	}, T0 - index * H));
+	const fixedBlocks = ["<session-notes>keep the active branch and latest session summary</session-notes>", "Current task: update the memory reader"];
+	const block = renderMind({
+		persona: "p", ltm: memories, stm: [], backlog: [], now: T0, fixedBlocks,
+		budget: { ltm: 8, stm: 5, backlog: 6, tokens: 240 },
+	});
+	assert.ok(estimateTokens([...fixedBlocks, block]) <= 240);
+	if (block.startsWith("<persona-mind")) assert.match(block, /<\/persona-mind>$/);
 });

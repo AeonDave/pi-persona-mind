@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * Offline qualification against an explicitly installed Pi 1.3 host.
+ * Offline qualification against an explicitly installed Pi 1.4 host.
  * All profiles, sessions, fixtures, and writes are isolated under a fresh OS-temp root.
  *
  * Usage:
- *   node --import tsx scripts/qualify-host.mjs "C:\\...\\node_modules\\@earendil-works\\pi-coding-agent" ["D:\\...\\pi-persona\\src\\extension.ts"]
+ *   node --import tsx scripts/qualify-host.mjs <installed-pi-root> <pi-persona-extension> [<packed-mind-extension>]
  */
 
 import assert from "node:assert/strict";
@@ -14,6 +14,7 @@ import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { qualifyMemory } from "./qualify-memory.mjs";
 
 const PACKAGE_NAMES = ["pi-coding-agent", "pi-ai", "pi-agent-core", "pi-tui", "pi-codemode", "pi-mcp"];
 const hostArg = process.argv[2];
@@ -23,10 +24,13 @@ if (!hostArg || !isAbsolute(hostArg)) {
 const hostRoot = resolve(hostArg);
 const hostPackage = JSON.parse(await readFile(join(hostRoot, "package.json"), "utf8"));
 assert.equal(hostPackage.name, "@earendil-works/pi-coding-agent");
-assert.equal(hostPackage.version, "1.3.0", `Expected Pi 1.3.0, found ${hostPackage.version}`);
+assert.equal(hostPackage.version, "1.4.0", `Expected Pi 1.4.0, found ${hostPackage.version}`);
 
-const mindEntry = resolve(fileURLToPath(new URL("../src/index.ts", import.meta.url)));
+const mindEntry = process.argv[4] ? resolve(process.argv[4]) : resolve(fileURLToPath(new URL("../src/index.ts", import.meta.url)));
+if (process.argv[4] && !isAbsolute(process.argv[4])) throw new Error("Optional Mind extension path must be absolute.");
+if (!existsSync(mindEntry)) throw new Error(`Mind extension path does not exist: ${mindEntry}`);
 const parentEntry = process.argv[3] ? resolve(process.argv[3]) : undefined;
+if (!parentEntry) throw new Error("Mind requires a compatible loaded pi-persona; pass its absolute extension entry as argument 2.");
 if (parentEntry) {
 	if (!isAbsolute(process.argv[3])) throw new Error("Optional parent extension path must be absolute.");
 	if (!existsSync(parentEntry)) throw new Error(`Parent extension path does not exist: ${parentEntry}`);
@@ -46,7 +50,7 @@ const personaDir = join(agentDir, "persona", "agents");
 const projectDir = join(workspace, ".pi");
 const projectAgentsDir = join(projectDir, "agents");
 const extensionPaths = [mindEntry, ...(parentEntry ? [parentEntry] : [])];
-const hostProbeEntry = join(tempRoot, "pi13-host-identity-probe.ts");
+const hostProbeEntry = join(tempRoot, "pi14-host-identity-probe.ts");
 const loaderExtensionPaths = [...extensionPaths, hostProbeEntry];
 let session;
 let fetchBefore;
@@ -136,12 +140,16 @@ async function scaffold() {
 	// The supervisor loader receives additionalExtensionPaths directly. Pi-persona's real in-process
 	// child creates its own DefaultResourceLoader, so mirror those paths in this private profile.
 	await writeFile(join(agentDir, "settings.json"), JSON.stringify({ extensions: extensionPaths }, null, 2), "utf8");
+	// Selection persistence is deliberately disabled: Mind must follow the live controller,
+	// including worker inheritance, rather than reading the last globally remembered persona.
+	await writeFile(join(agentDir, "persona", "settings.json"), JSON.stringify({ version: 1,
+		preferences: { persist: false }, personas: {}, lastPersona: null, selectionRevision: 0 }), "utf8");
 	// This probe is loaded by the exact same installed host loader. Its package import must resolve
 	// through Pi's own extension loader alias, not this script's Node resolver hook.
 	await writeFile(hostProbeEntry, `import { VERSION, getAgentDir } from "@earendil-works/pi-coding-agent";\nexport default function (pi) {\n  pi.on("session_start", () => {\n    pi.appendEntry("mind-host-identity-probe", { version: VERSION, agentDir: getAgentDir() });\n  });\n}\n`, "utf8");
 }
 
-const providerId = "mind-pi13-qualification";
+const providerId = "mind-pi14-qualification";
 const modelId = "local";
 const mainRef = `${providerId}/${modelId}`;
 
@@ -177,7 +185,7 @@ try {
 
 	const host = await import(pathToFileURL(join(hostRoot, "dist", "index.js")).href);
 	const faux = await import(pathToFileURL(join(hostRoot, "node_modules", "@earendil-works", "pi-ai", "dist", "providers", "faux.js")).href);
-	assert.equal(host.VERSION, "1.3.0");
+	assert.equal(host.VERSION, "1.4.0");
 
 	const settingsManager = host.SettingsManager.inMemory({ retry: { enabled: false }, compaction: { enabled: false } });
 	const resourceLoader = new host.DefaultResourceLoader({
@@ -235,12 +243,12 @@ try {
 	const identityProbe = sessionManager.getEntries().find((entry) => entry.type === "custom" && entry.customType === "mind-host-identity-probe");
 	assert.ok(identityProbe, "The installed host loader did not execute the identity probe extension");
 	const identityProbeJson = JSON.stringify(identityProbe).replaceAll("\\\\", "/");
-	mustContain(identityProbeJson, '"version":"1.3.0"', "installed-host extension import probe");
+	mustContain(identityProbeJson, '"version":"1.4.0"', "installed-host extension import probe");
 	mustContain(identityProbeJson, agentDir.replaceAll("\\", "/"), "installed-host extension profile probe");
 
 	const hasParent = Boolean(parentEntry);
 	const activeTools = ["memory", "backlog", ...(hasParent ? ["delegate"] : [])];
-	assert.ok(activeTools.every((name) => session.getAllTools().some((tool) => tool.name === name)), "Expected Mind/parent tools did not register in Pi 1.3");
+	assert.ok(activeTools.every((name) => session.getAllTools().some((tool) => tool.name === name)), "Expected Mind/parent tools did not register in Pi 1.4");
 	session.setActiveToolsByName(activeTools);
 
 	// Activate alpha through the real parent command so Mind follows the actual marker contract.
@@ -293,7 +301,7 @@ try {
 	const shortTerm = "Alpha STM marker: workspace review is in progress.";
 	const backlogText = "Alpha backlog marker: inspect the qualification fixture once.";
 	await runTool("memory", { action: "remember", term: "long", kind: "convention", text: alphaPrivate });
-	await runTool("memory", { action: "remember", term: "long", kind: "convention", text: sharedLtm, shared: true });
+	await runTool("memory", { action: "remember", term: "long", kind: "convention", text: sharedLtm, scope: "shared" });
 	await runTool("memory", { action: "remember", term: "short", kind: "note", text: shortTerm });
 	await runTool("backlog", { action: "add", text: backlogText, dueInSeconds: 0.01 });
 
@@ -311,6 +319,8 @@ try {
 	wakeEntries = sessionManager.getEntries().filter((entry) => entry.type === "custom" && entry.customType === "pi-persona-mind-wake");
 	assert.equal(wakeEntries.length, 1, "The overdue backlog card must be displayed once, not duplicated");
 	assert.equal(fauxModel.state.callCount, callsBeforeWake, "A backlog display card must not trigger another model request");
+	const memoryChecks = await qualifyMemory(session);
+	assert.equal(fauxModel.state.callCount, callsBeforeWake, "Session notes and optimization add no model requests");
 
 	if (hasParent) {
 		const personaSettingsPath = join(agentDir, "persona", "settings.json");
@@ -325,6 +335,7 @@ try {
 		assert.equal(selectCalls.length, 3, `Expected 3 RPC selections for the MAGI cores; got ${selectCalls.length}`);
 		assert.ok(selectCalls.every(({ options }) => options.includes(mainRef)), "The local faux model was not offered in every picker");
 		const settingsAfterPicker = JSON.parse(await readFile(personaSettingsPath, "utf8"));
+		assert.equal(settingsAfterPicker.lastPersona, null, "Memory scope must not require persisting a live selection");
 		assert.deepEqual({
 			lastPersona: settingsAfterPicker.lastPersona,
 			selectionRevision: settingsAfterPicker.selectionRevision ?? 0,
@@ -357,11 +368,32 @@ try {
 		// Switch back to alpha for the in-process child. The actual child loader reads the same
 		// isolated settings.json, and the dedicated leg marker should make Mind inject only LTM.
 		await session.prompt("/persona alpha");
+		// Interactive delegation is always background in current pi-persona. Qualify the joined
+		// headless contract in a fresh native session, rather than passing a removed sync flag or
+		// pretending an RPC session loses its UI when rebound to print mode.
+		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+		await session.abort();
+		await session.agent.waitForIdle();
+		session.dispose();
+		session = undefined;
+		const headlessLoader = new host.DefaultResourceLoader({
+			cwd: workspace, agentDir, settingsManager, additionalExtensionPaths: loaderExtensionPaths,
+			noContextFiles: true, noSkills: true, noPromptTemplates: true, noThemes: true,
+		});
+		await headlessLoader.reload();
+		assert.deepEqual(headlessLoader.getExtensions().errors, []);
+		const headless = await host.createAgentSession({ cwd: workspace, agentDir, resourceLoader: headlessLoader,
+			settingsManager, modelRuntime: runtime, model: runtime.getModel(providerId, modelId),
+			sessionManager: host.SessionManager.inMemory(workspace) });
+		session = headless.session;
+		await session.bindExtensions({ mode: "print" });
+		await session.prompt("/persona alpha");
+		session.setActiveToolsByName(activeTools);
 		const workerContext = [];
 		const beforeDelegation = fauxModel.state.callCount;
 		fauxModel.setResponses([
 			faux.fauxAssistantMessage(faux.fauxToolCall("delegate", {
-				agent: "mind-worker", task: "Return one concise observation from the local fixture.", sync: true,
+				tasks: [{ agent: "mind-worker", task: "Return one concise observation from the local fixture.", thinking: "low" }],
 			}, { id: "mind-host-qualification-delegate" }), { stopReason: "toolUse" }),
 			(context) => {
 				const snapshot = { text: contextText(context), tools: systemToolNames(context) };
@@ -381,7 +413,7 @@ try {
 		assert.ok(!worker.tools.includes("memory") && !worker.tools.includes("backlog"), "Delegated worker received Mind write tools");
 		assert.ok(worker.tools.includes("read"), "Positive control: delegated agent's default read tool was not present in native host context");
 		assert.equal(fauxModel.state.callCount, beforeDelegation + 3, "Expected supervisor, worker, and final supervisor faux requests only");
-		const delegateResult = sessionManager.getBranch()
+		const delegateResult = session.sessionManager.getBranch()
 			.map((entry) => entry.type === "message" ? entry.message : undefined)
 			.find((message) => message?.role === "toolResult" && message.toolName === "delegate");
 		assert.ok(delegateResult, "The supervisor transcript did not contain the delegated worker result");
@@ -391,8 +423,8 @@ try {
 	assert.equal(fetchRequests, 0, "Outbound fetch tripwire fired");
 	report.status = "PASS";
 	report.checks = {
-		installedPi13Loader: true,
-		installedExtensionApiVersion: "1.3.0",
+		installedPi14Loader: true,
+		installedExtensionApiVersion: "1.4.0",
 		directHumanMemoryInjected: true,
 		customReportNoContamination: true,
 		blockedHintOccurrences: blockedHints.length,
@@ -400,11 +432,13 @@ try {
 		mainNativeMemoryAndBacklogTools: true,
 		dueBacklogEntries: wakeEntries.length,
 		backlogWakeExtraRequests: 0,
+		...memoryChecks,
 		...(hasParent ? {
 			magiPickerSelections: selectCalls.length,
 			magiScopeUnchanged: true,
 			mindSettingsContributor: true,
 			alphaBetaIsolationAndSharedLtm: true,
+			liveOwnerWithPersistenceOff: true,
 			delegatedLeanMind: true,
 			workerMindWriteTools: false,
 		} : {}),

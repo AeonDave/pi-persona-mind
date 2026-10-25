@@ -4,8 +4,8 @@
  * high-level operations the Pi tools and hooks call. It has NO Pi imports, so it is fully
  * unit-testable over real temp files without a running agent.
  *
- * Four JSON stores back one scope: long-term memory for the active persona, long-term memory shared
- * across personas, short-term (48h, auto-deleted) memory for the project, and the project backlog
+ * Five JSON stores back one scope: persona/shared durable memory, durable repository knowledge,
+ * short-term (48h, auto-deleted) memory for the project, and the project backlog
  * (same default life; a later wake extends it).
  */
 
@@ -14,10 +14,13 @@ import { clampBacklogMax, compactTerminal, makeBacklog, openItems, orderBacklog,
 import { contentId } from "./ids.ts";
 import type { MindBudget } from "./inject.ts";
 import { renderMind } from "./inject.ts";
+import { readMemory, memoryTargets, type MemoryReadResult, type MemoryReadScope } from "./memory-read.ts";
+import { MemoryOptimizer } from "./optimize-service.ts";
+import { samePersistedMemory } from "./optimize.ts";
 import type { MemoryEntry, MemoryInput, MemoryKind, MemoryTerm } from "./memory.ts";
 import { clampRecallMax, isExpired, isMemoryId, makeMemory, memoryContentKey, memoryIdMatches, promoteToLong, pruneExpired, recall, sameMemoryContent, supersedeTargets, upsertMemory, validateLongMemory, validateShortMemory, MAX_MEMORY_DERIVED_IDS, MAX_MEMORY_ID_CHARS, MAX_MEMORY_SOURCE_CHARS, MAX_MEMORY_TAGS, MAX_MEMORY_TAG_CHARS, MAX_MEMORY_TEXT_CHARS } from "./memory.ts";
 import { scanContent } from "./scanner.ts";
-import type { Scope } from "./scope.ts";
+import { memoryMutationLockPath, type Scope } from "./scope.ts";
 import { JsonStore, type JsonStoreOptions, withFileLock } from "./store.ts";
 
 const STORE_VERSION = 1;
@@ -38,8 +41,8 @@ export interface RememberInput {
 	tags?: string[];
 	ttlHours?: number;
 	supersedes?: string;
-	/** Long-term only: write to the cross-persona shared tier instead of the active persona's. */
-	toShared?: boolean;
+	/** Durable repository knowledge stays in this project; persona is the default for long facts. */
+	scope?: "project" | "persona" | "shared";
 	source?: string;
 	derivedFrom?: string[];
 }
@@ -64,7 +67,7 @@ export interface BacklogListPage {
 	withheld: number;
 }
 
-export type Recallable = "long" | "short" | "both";
+export type Recallable = MemoryReadScope;
 
 /** One of the distinct facts a shared historical handle addresses, named by an id of its own. */
 export interface AmbiguousMemory {
@@ -104,7 +107,7 @@ function ambiguityCandidates(pool: readonly MemoryEntry[], id: string): Ambiguou
 		.map((entry) => {
 			const handle = contentId(entry.kind, entry.text, entry.tags);
 			const reached = new Set(pool.filter((e) => memoryIdMatches(e, handle)).map((e) => memoryContentKey(e)));
-			return { id: handle, kind: entry.kind, text: entry.text, resolves: reached.size === 1 };
+			return { id: handle, kind: entry.kind, text: safePersistedText(entry.text).text, resolves: reached.size === 1 };
 		})
 		.sort((a, b) => Number(b.resolves) - Number(a.resolves));
 }
@@ -150,6 +153,7 @@ export class MindService {
 	private readonly budget: MindBudget | undefined;
 	private readonly ltm: JsonStore<MemoryEntry>;
 	private readonly shared: JsonStore<MemoryEntry>;
+	private readonly projectLtm: JsonStore<MemoryEntry>;
 	private readonly stm: JsonStore<MemoryEntry>;
 	private readonly backlog: JsonStore<BacklogEntry>;
 	private readonly memoryMutationLock: string;
@@ -173,9 +177,12 @@ export class MindService {
 		}
 		this.ltm = new JsonStore<MemoryEntry>(scope.paths.ltm, longOpts);
 		this.shared = new JsonStore<MemoryEntry>(scope.paths.shared, longOpts);
+		this.projectLtm = new JsonStore<MemoryEntry>(scope.paths.projectLtm, longOpts);
 		this.stm = new JsonStore<MemoryEntry>(scope.paths.stm, shortOpts);
 		this.backlog = new JsonStore<BacklogEntry>(scope.paths.backlog, backlogOpts);
-		this.memoryMutationLock = `${scope.paths.stm}.memory-transaction.lock`;
+		// Persona/shared facts span workspaces. All multi-store memory decisions must serialize
+		// within the agent profile, including ambiguity checks before promote/forget/supersede.
+		this.memoryMutationLock = memoryMutationLockPath(scope.paths);
 	}
 
 	private safeMemories(entries: readonly MemoryEntry[], tier: string): MemoryEntry[] {
@@ -209,8 +216,24 @@ export class MindService {
 
 	// ── memory ────────────────────────────────────────────────────────────────
 
+	private memoryStores() {
+		return { project: this.stm, "project-long": this.projectLtm, persona: this.ltm, shared: this.shared };
+	}
+
+	/** One plan cache per native session owner. Lifecycle adapters must invalidate/discard it. */
+	createOptimizer(): MemoryOptimizer {
+		return new MemoryOptimizer({ stores: this.memoryStores(), persona: this.scope.persona, now: this.now, mutationLock: this.memoryMutationLock });
+	}
+
+	/** Explicit full retrieval; reads never refresh age/expiry or repair malformed stores. */
+	readMemory(id: string, scope: MemoryReadScope = "both"): Promise<MemoryReadResult> {
+		return readMemory(this.memoryStores(), id, scope, this.now());
+	}
+
 	/** Store a memory (long or short term). Scanned + non-empty-checked before it is persisted. */
 	async remember(input: RememberInput): Promise<RememberResult> {
+		if (input.scope !== undefined && !["project", "persona", "shared"].includes(input.scope)) return { ok: false, reason: "unknown memory scope" };
+		if (input.term === "short" && input.scope !== undefined && input.scope !== "project") return { ok: false, reason: "short-term memory belongs to the project" };
 		const now = this.now();
 		const text = input.text.trim();
 		if (!text) return { ok: false, reason: "memory text is empty" };
@@ -246,10 +269,10 @@ export class MindService {
 		if (input.supersedes) makeInput.supersedes = input.supersedes;
 		if (input.source) makeInput.source = input.source;
 		if (input.derivedFrom && input.derivedFrom.length > 0) makeInput.derivedFrom = input.derivedFrom;
-		if (term === "short") makeInput.persona = this.scope.persona;
+		if (term === "short" || input.scope === "project") makeInput.persona = this.scope.persona;
 
 		const entry = makeMemory(makeInput, now);
-		const store = term === "short" ? this.stm : input.toShared ? this.shared : this.ltm;
+		const store = term === "short" ? this.stm : input.scope === "project" ? this.projectLtm : input.scope === "shared" ? this.shared : this.ltm;
 		try {
 			let committed: MemoryEntry | undefined;
 			let ambiguous: { id: string; candidates: AmbiguousMemory[] } | undefined;
@@ -262,8 +285,8 @@ export class MindService {
 					// being written: a v1 comma-joined id can name a durable fact in `shared` and another in
 					// `ltm`, and a per-store check would still let the write destroy whichever copy sits in the
 					// target tier while the delete path refuses the identical handle.
-					const [ltm, shared, stm] = await Promise.all([this.ltm.load(), this.shared.load(), this.stm.load()]);
-					const visible = [...ltm.entries, ...shared.entries, ...pruneExpired(stm.entries, this.now())];
+					const loaded = await Promise.all(Object.values(this.memoryStores()).map((memoryStore) => memoryStore.load()));
+					const visible = loaded.flatMap((snapshot) => pruneExpired(snapshot.entries, this.now()));
 					if (supersedeTargets(visible, entry.supersedes).ambiguous) {
 						ambiguous = { id: entry.supersedes, candidates: ambiguityCandidates(visible, entry.supersedes) };
 						return;
@@ -281,26 +304,37 @@ export class MindService {
 		}
 	}
 
-	/** Graduate a short-term entry into the persona's long-term store (model-free consolidation). */
-	async promote(id: string): Promise<{ ok: true; entry: MemoryEntry; ambiguousSupersedes?: string } | { ok: false; reason?: string }> {
+	/** Preserve repository scope unless the caller explicitly selects a broader durable tier. */
+	async promote(id: string, target: "project" | "persona" | "shared" = "project"): Promise<{ ok: true; entry: MemoryEntry; ambiguousSupersedes?: string } | { ok: false; reason?: string }> {
+		if (!["project", "persona", "shared"].includes(target)) return { ok: false, reason: "unknown promotion scope" };
 		try {
 			return await withFileLock(this.memoryMutationLock, async () => {
 				const stm = await this.stm.load();
-				const found = stm.entries.find((e) => memoryIdMatches(e, id));
-				if (!found || isExpired(found, this.now())) return { ok: false } as const;
+				const matches = stm.entries.filter((e) => memoryIdMatches(e, id));
+				if (matches.length !== 1) return { ok: false, reason: "source missing or ambiguous" } as const;
+				const found = matches[0]!;
+				if (isExpired(found, this.now()) || found.persona !== this.scope.persona) return { ok: false, reason: "source expired or belongs to another persona" } as const;
 				const promoted = promoteToLong(found, this.now());
+				if (target === "project") promoted.persona = this.scope.persona;
+				const destination = target === "project" ? this.projectLtm : target === "shared" ? this.shared : this.ltm;
 				// Write the durable tier FIRST, then remove from short-term: a crash between the two leaves a
 				// harmless duplicate (collapsed by id on recall/inject) rather than losing the entry entirely.
+				let globallyAmbiguous = false;
+				if (promoted.supersedes !== undefined) {
+					const loaded = await Promise.all(Object.values(this.memoryStores()).map((store) => store.load()));
+					const visible = loaded.flatMap((snapshot) => pruneExpired(snapshot.entries, this.now()));
+					globallyAmbiguous = supersedeTargets(visible, promoted.supersedes).ambiguous;
+				}
 				let unretired: string | undefined;
-				const updated = await this.ltm.update((es) => {
+				const updated = await destination.update((es) => {
 					// The lineage handle rides along from the short-term entry, so it can be one of the shared v1
 					// ids `upsertMemory` refuses to act on. The graduation still stands, but a caller told only
 					// "promoted" would believe the retirement happened. Re-derived per attempt: the store may
 					// replay this mutator after lock recovery, and only the committed attempt counts.
-					unretired = promoted.supersedes !== undefined && supersedeTargets(es, promoted.supersedes).ambiguous ? promoted.supersedes : undefined;
-					return upsertMemory(es, promoted);
+					unretired = promoted.supersedes !== undefined && (globallyAmbiguous || supersedeTargets(es, promoted.supersedes).ambiguous) ? promoted.supersedes : undefined;
+					return upsertMemory(es, promoted, unretired === undefined);
 				});
-				await this.stm.update((es) => es.filter((e) => !sameMemoryContent(e, found)));
+				await this.stm.update((es) => es.filter((e) => !samePersistedMemory(e, found)));
 				const entry = updated.entries.find((e) => sameMemoryContent(e, promoted)) ?? promoted;
 				return unretired === undefined ? ({ ok: true, entry } as const) : ({ ok: true, entry, ambiguousSupersedes: unretired } as const);
 			});
@@ -319,13 +353,13 @@ export class MindService {
 		return [...merged.values()];
 	}
 
-	/** Keyword + recency recall across the requested tier(s). Returns the top `max` plus the TOTAL
+	/** Lexical/path recall across the requested tier(s). Returns the top `max` plus the TOTAL
 	 *  number of matches, so the caller can tell the model what it withheld. Short-term is pruned first. */
 	async recall(query: string, term: Recallable, max: number): Promise<{ hits: MemoryEntry[]; total: number; withheldUnsafe: number }> {
 		const limit = clampRecallMax(max);
-		const pool: MemoryEntry[] = [];
-		if (term === "long" || term === "both") pool.push(...(await this.longMemories()));
-		if (term === "short" || term === "both") pool.push(...pruneExpired((await this.stm.load()).entries, this.now()));
+		const stores = this.memoryStores();
+		const loaded = await Promise.all(memoryTargets(term).map((target) => stores[target].load()));
+		const pool = loaded.flatMap((snapshot) => pruneExpired(snapshot.entries, this.now()));
 		// A fact can live in both tiers under different historical IDs (e.g. after migration) — collapse
 		// by semantic content (keep the most-recently-seen) so it is neither returned twice nor counted.
 		const deduped = new Map<string, MemoryEntry>();
@@ -345,9 +379,10 @@ export class MindService {
 	}
 
 	/** Remove a memory by id from every memory tier it appears in. Returns how many were removed. */
-	async forget(id: string): Promise<ForgetResult> {
+	async forget(id: string, scope: MemoryReadScope = "both"): Promise<ForgetResult> {
 		return withFileLock(this.memoryMutationLock, async () => {
-			const stores = [this.ltm, this.shared, this.stm];
+			const allStores = this.memoryStores();
+			const stores = memoryTargets(scope).map((target) => allStores[target]);
 			const loaded = await Promise.all(stores.map((store) => store.load()));
 			const matches = loaded.flatMap((result) => result.entries.filter((entry) => memoryIdMatches(entry, id)));
 			const representatives = new Set(matches.map((entry) => memoryContentKey(entry)));
@@ -359,9 +394,18 @@ export class MindService {
 			}
 			let removed = 0;
 			for (let i = 0; i < stores.length; i++) {
-				if (!loaded[i]?.entries.some((entry) => memoryIdMatches(entry, id))) continue;
-				const after = await stores[i]!.update((es) => es.filter((entry) => !memoryIdMatches(entry, id)));
-				removed += loaded[i]!.entries.length - after.entries.length;
+				const selected = loaded[i]!.entries.filter((entry) => memoryIdMatches(entry, id));
+				if (!selected.length) continue;
+				let removedHere = 0;
+				await stores[i]!.update((entries) => {
+					// Imports and normal sessions share the profile lock. Still preserve out-of-band
+					// edits made through the lower-level store: an alias never selects future facts.
+					if (selected.some((source) => !entries.some((entry) => samePersistedMemory(entry, source)) && entries.some((entry) => entry.id === source.id))) throw new Error("selected memory changed since lookup; read again before forgetting");
+					const kept = entries.filter((entry) => !selected.some((source) => samePersistedMemory(entry, source)));
+					removedHere = entries.length - kept.length;
+					return kept;
+				});
+				removed += removedHere;
 			}
 			return { removed };
 		});
@@ -494,8 +538,15 @@ export class MindService {
 			});
 			const backlog = await this.backlog.load();
 			const keptB = pruneExpiredBacklog(backlog.entries, now);
-			backlogRemoved = backlog.entries.length - keptB.length;
-			if (backlogRemoved > 0) await this.backlog.update(() => keptB);
+			if (keptB.length < backlog.entries.length) {
+				// Another supervisor may append or settle work after the unlocked read. Prune the
+				// current locked state instead of replacing it with that earlier snapshot.
+				await this.backlog.update((entries) => {
+					const kept = pruneExpiredBacklog(entries, now);
+					backlogRemoved = entries.length - kept.length;
+					return kept;
+				});
+			}
 		} catch {
 			/* hygiene must not take the session down */
 		}
@@ -543,7 +594,7 @@ export class MindService {
 			const backlogBefore = await this.backlog.load();
 			backlogRemoved = backlogBefore.entries.length;
 			if (backlogRemoved > 0) await this.backlog.update(() => []);
-			const ltmKept = (await this.longMemories()).length;
+			const ltmKept = (await this.longMemories()).length + (await this.projectLtm.load()).entries.length;
 			return { ok: true, stmRemoved, backlogRemoved, ltmKept };
 		} catch (err) {
 			return { ok: false, reason: storageFailure(err) };
@@ -551,10 +602,10 @@ export class MindService {
 	}
 
 	/** Cheap counts for the status line and `/mind` header (expired STM and closed backlog excluded). */
-	async summary(): Promise<{ ltm: number; stm: number; backlogOpen: number }> {
+	async summary(): Promise<{ ltm: number; projectLtm: number; stm: number; backlogOpen: number }> {
 		const now = this.now();
 		const [ltm, stm, backlog] = await Promise.all([this.longMemories(), this.stm.load(), this.backlog.load()]);
-		return { ltm: ltm.length, stm: pruneExpired(stm.entries, now).length, backlogOpen: openItems(viewFor(backlog.entries, this.scope.persona, false)).length };
+		return { ltm: ltm.length, projectLtm: (await this.projectLtm.load()).entries.length, stm: pruneExpired(stm.entries, now).length, backlogOpen: openItems(viewFor(backlog.entries, this.scope.persona, false)).length };
 	}
 
 	/**
@@ -564,21 +615,26 @@ export class MindService {
 	 * persona, so it inherits who the persona IS but not the supervisor's project state or deferred
 	 * intent. (The caller also withholds the write tools + wakes from a leg — see index.ts.)
 	 */
-	async buildInjection(opts: { lean?: boolean } = {}): Promise<string> {
+	async buildInjection(opts: { lean?: boolean; query?: string; fixedBlocks?: readonly string[]; cleanup?: boolean } = {}): Promise<string> {
 		// Workers inherit a read-only lean block; they must not mutate the supervisor's stores.
-		if (!opts.lean) await this.sweepExpired();
+		// A background import may own the profile lock while awaiting another store writer. Reads
+		// already filter expiry; defer disk hygiene until a later turn rather than joining that import.
+		if (!opts.lean && opts.cleanup !== false) await this.sweepExpired();
 		const now = this.now();
+		const context = { ...(opts.query === undefined ? {} : { query: opts.query }), ...(opts.fixedBlocks === undefined ? {} : { fixedBlocks: opts.fixedBlocks }) };
 		if (opts.lean || this.scope.homeWorkspace) {
 			const ltm = this.safeMemories(await this.longMemories(), "long-term");
 			if (opts.lean) {
-				return renderMind({ persona: this.scope.persona, ltm, stm: [], backlog: [], now, lean: true, ...(this.budget ? { budget: this.budget } : {}) });
+				return renderMind({ persona: this.scope.persona, ltm, stm: [], backlog: [], now, lean: true, ...context, ...(this.budget ? { budget: this.budget } : {}) });
 			}
-			return renderMind({ persona: this.scope.persona, ltm, stm: [], backlog: [], now, ...(this.budget ? { budget: this.budget } : {}) });
+			return renderMind({ persona: this.scope.persona, ltm, stm: [], backlog: [], now, ...context, ...(this.budget ? { budget: this.budget } : {}) });
 		}
-		const [ltm, stmRaw, backlogRaw] = await Promise.all([this.longMemories(), this.stm.load(), this.backlog.load()]);
+		const [ltm, projectRaw, stmRaw, backlogRaw] = await Promise.all([this.longMemories(), this.projectLtm.load(), this.stm.load(), this.backlog.load()]);
 		return renderMind({
 			persona: this.scope.persona,
 			ltm: this.safeMemories(ltm, "long-term"),
+			projectLtm: this.safeMemories(projectRaw.entries, "project long-term"),
+			...context,
 			stm: this.safeMemories(pruneExpired(stmRaw.entries, now), "short-term"),
 			backlog: this.safeBacklog(orderBacklog(openItems(viewFor(backlogRaw.entries, this.scope.persona, false)), now)),
 			now,

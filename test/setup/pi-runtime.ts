@@ -8,8 +8,25 @@ import {
   SessionManager, SettingsManager, VERSION, type AgentSession, type ExtensionFactory, type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 
-export async function runtimeHarness(root: string, extensionPath: string, factories: ExtensionFactory[] = []) {
-  assert.equal(VERSION, "1.0.0", "run against the actual minimum supported host");
+/** Protocol fixture only. The installed-host qualifier loads the actual companion separately. */
+const companionFixture: ExtensionFactory = (pi) => {
+  const leg = process.env.PI_PERSONA_LEG === "1" || process.env.PI_PERSONA_CHILD === "1";
+  pi.events.on("pi-persona:companion:v1", (request: unknown) => {
+    const query = request as { version?: unknown; respond?: unknown };
+    if (query?.version === 1 && typeof query.respond === "function") query.respond({
+      version: 1, provider: "pi-persona", role: leg ? "leg" : "supervisor", capabilities: { memory: 1, activity: leg ? false : 1 },
+    });
+  });
+  pi.events.on("pi-persona:memory-owner:v1", (request: unknown) => {
+    const query = request as { version?: unknown; sessionId?: unknown; respond?: unknown };
+    if (query?.version === 1 && typeof query.sessionId === "string" && typeof query.respond === "function") query.respond({
+      version: 1, provider: "pi-persona", sessionId: query.sessionId, ready: true, persona: null,
+    });
+  });
+};
+
+export async function runtimeHarness(root: string, extensionPath: string, factories: ExtensionFactory[] = [], options: { companion?: boolean; additionalExtensionPaths?: string[] } = {}) {
+  assert.equal(VERSION, "1.4.0", "run against the supported current host");
   const cwd = join(root, "workspace");
   const agentDir = join(root, "agent");
   await mkdir(cwd, { recursive: true });
@@ -24,14 +41,16 @@ export async function runtimeHarness(root: string, extensionPath: string, factor
   try {
     const settings = SettingsManager.inMemory({ retry: { enabled: false }, compaction: { enabled: false } });
     const eventBus = createEventBus();
+    const extensionFactories = [...factories, ...(options.companion === false ? [] : [companionFixture])];
+    const additionalExtensionPaths = [extensionPath, ...(options.additionalExtensionPaths ?? [])];
     const loader = new DefaultResourceLoader({
       cwd, agentDir, settingsManager: settings, eventBus,
-      additionalExtensionPaths: [extensionPath], extensionFactories: factories,
+      additionalExtensionPaths, extensionFactories,
       noContextFiles: true, noSkills: true, noPromptTemplates: true, noThemes: true,
     });
     await loader.reload();
     assert.deepEqual(loader.getExtensions().errors, [], "the public host loader accepts the extension");
-    assert.equal(loader.getExtensions().extensions.length, 1 + factories.length, "the host actually loads the requested extension");
+    assert.equal(loader.getExtensions().extensions.length, additionalExtensionPaths.length + extensionFactories.length, "the host actually loads the requested extension");
     const runtime = await ModelRuntime.create({
       authPath: join(agentDir, "offline-auth.json"), modelsPath: null,
       modelsStorePath: join(agentDir, "offline-models.json"),
