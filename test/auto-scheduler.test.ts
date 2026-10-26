@@ -19,6 +19,9 @@ function fixture(options: {
 	previewGate?: Promise<void>;
 	wrongInspectTarget?: boolean;
 	applyWarning?: string;
+	previewThrows?: boolean;
+	applyThrows?: boolean;
+	latestSnapshotMismatch?: boolean;
 	allowedTargets?: readonly AutoOptimizeTarget[];
 	entriesByTarget?: Partial<Record<AutoOptimizeTarget, MemoryEntry[]>>;
 	recordAttempt?: (attempt: AutoAttempt) => void;
@@ -66,11 +69,13 @@ function fixture(options: {
 			inspectCalls.push({ target, offset, max });
 			const entries = [...all].sort((a, b) => Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt) || a.id.localeCompare(b.id)).slice(offset, offset + max);
 			const nextOffset = offset + entries.length;
-			return { ok: true, target: actualTarget, fingerprint: `snapshot:${actualTarget}`, entries, total: all.length, withheld: 0, candidates: [], offset, matched: all.length, ...(nextOffset < all.length ? { nextOffset } : {}) };
+			const fingerprint = options.latestSnapshotMismatch && offset === 0 && inspectCalls.length > 1 ? `changed:${actualTarget}` : `snapshot:${actualTarget}`;
+			return { ok: true, target: actualTarget, fingerprint, entries, total: all.length, withheld: 0, candidates: [], offset, matched: all.length, ...(nextOffset < all.length ? { nextOffset } : {}) };
 		},
 		preview: async ({ target, operations }: { target?: OptimizeTarget; fingerprint: string; operations: Array<{ sourceIds: string[]; kind: MemoryEntry["kind"]; text: string }> }) => {
 			events.push("preview");
 			if (options.previewGate) await options.previewGate;
+			if (options.previewThrows) throw new Error("preview rejected");
 			assert.ok(target === "project" || target === "project-long" || target === "persona");
 			const before = entriesByTarget[target].filter((entry) => operations[0]!.sourceIds.includes(entry.id));
 			const after = makeMemory({ term: target === "project" ? "short" : "long", kind: operations[0]!.kind, text: operations[0]!.text, tags: before.flatMap((entry) => entry.tags), persona: "dev" }, now + 2);
@@ -82,6 +87,7 @@ function fixture(options: {
 		},
 		apply: async () => {
 			events.push("apply"); applied++;
+			if (options.applyThrows) throw new Error("apply rejected after possible commit");
 			return { ok: true as const, planId: "plan", target: plan?.target ?? "persona", changed: 1, beforeCount: 2, afterCount: 1, receiptId: "auto-receipt", ...(options.applyWarning ? { warning: options.applyWarning } : {}) };
 		},
 		invalidate: () => { events.push("invalidate"); },
@@ -106,7 +112,7 @@ function fixture(options: {
 	return {
 		scheduler, owner, entries: entriesByTarget.persona, entriesByTarget, events, reports, attempts, inspected, inspectCalls, tasks,
 		setIdle: (v: boolean) => { idle = v; }, revoke: () => { current = false; }, advance: (ms = AUTO_COOLDOWN_MS + 1) => { now += ms; },
-		launches: () => launches, applied: () => applied, delays: () => timers.map((timer) => timer.delay),
+		launches: () => launches, applied: () => applied, delays: () => timers.map((timer) => timer.delay), takeTimerWork: () => timers[0]?.work,
 		fire: async () => { timers.shift()?.work(); for (let i = 0; i < 12; i++) await Promise.resolve(); },
 		finish: (output: string | MindWorkerResult) => finish?.(typeof output === "string" ? { ok: true, output, status: "done" } : output), pending: () => timers.length,
 	};
@@ -123,12 +129,116 @@ test("memory scope selects STM, durable project LTM, persona LTM, and excludes s
 	assert.equal(autoOptimizeTarget({ action: "promote", scope: "shared" }), undefined);
 });
 
+test("explicit review bypasses automatic off, token and cooldown gates but requires an idle owner", async () => {
+	const f = fixture();
+	f.scheduler.setEnabled(false); f.setIdle(false);
+	assert.equal(f.scheduler.startExplicit("persona"), false, "manual review must not start while the session is busy");
+	f.setIdle(true);
+	assert.equal(f.scheduler.startExplicit("persona"), true);
+	assert.equal(f.scheduler.startExplicit("project"), false, "the instance never overlaps workers");
+	for (let index = 0; index < 8; index++) await Promise.resolve();
+	assert.equal(f.launches(), 1);
+	f.finish(JSON.stringify({ operations: [{ sourceIds: f.entries.map((entry) => entry.id), kind: "convention", text: "Persona keeps concise explicit memory." }] }));
+	await f.scheduler.join();
+	assert.equal(f.applied(), 1, "valid worker output follows the existing preview/apply pipeline even while auto is off");
+	assert.equal(f.attempts.length, 0, "manual work does not create automatic retry receipts");
+	assert.match(f.reports.find((report) => report.title === "Mind optimization result")?.body ?? "", /Undo: \/mind optimize undo auto-receipt persona/, "the ordinary result preserves the durable undo receipt reference");
+	assert.match(f.reports.at(-1)?.body ?? "", /Bounded coverage: one selected record window/);
+	assert.match(f.reports.find((report) => report.title === "Mind optimization proposal")?.body ?? "", /Staged proposed change/);
+	assert.doesNotMatch(f.reports.find((report) => report.title === "Mind optimization proposal")?.body ?? "", /Staged automatic/);
+	assert.ok(f.events.indexOf("report:Mind optimization proposal") < f.events.indexOf("apply"));
+});
+
+test("explicit work cancels queued auto timers and join retains the active worker promise", async () => {
+	const f = fixture();
+	f.scheduler.memoryAdded("project"); f.scheduler.settled();
+	const queued = f.takeTimerWork();
+	assert.equal(f.scheduler.startExplicit("persona"), true);
+	queued?.(); // Simulate a timer callback already queued when cancellation ran.
+	for (let index = 0; index < 8; index++) await Promise.resolve();
+	let joined = false;
+	const join = f.scheduler.join().then(() => { joined = true; });
+	await Promise.resolve();
+	assert.equal(joined, false, "a stale timer callback must not overwrite the active work promise");
+	assert.equal(f.launches(), 1, "the stale callback must not admit a competing auto pass");
+	f.finish('{"operations":[]}'); await join;
+	assert.equal(joined, true);
+	assert.equal(f.pending(), 1, "accepted explicit work preserves independently pending automatic work");
+	assert.deepEqual(f.delays(), [2_000], "the preserved automatic pass is rescheduled through its normal idle delay");
+});
+
+test("explicit unexpected preview/apply failures append cautious owner-current terminal reports", async () => {
+	for (const failure of ["previewThrows", "applyThrows"] as const) {
+		const f = fixture({ [failure]: true });
+		assert.equal(f.scheduler.startExplicit("persona"), true);
+		for (let index = 0; index < 8; index++) await Promise.resolve();
+		f.finish(JSON.stringify({ operations: [{ sourceIds: f.entries.map((entry) => entry.id), kind: "convention", text: "A validated replacement proposal." }] }));
+		await f.scheduler.join();
+		const terminal = f.reports.at(-1)?.body ?? "";
+		assert.match(terminal, /failed unexpectedly/);
+		assert.match(terminal, /inspect current memory before retrying/);
+		assert.doesNotMatch(terminal, /memory unchanged/i, "a thrown apply may have committed before rejecting");
+	}
+});
+
+test("explicit older-page snapshot mismatch reports a terminal result", async () => {
+	const entries = Array.from({ length: 100 }, (_, index) => makeMemory({ term: "long", kind: "note", text: `Foreign row ${index}`, persona: "other" }, 2_000_000 - index));
+	entries.push(makeMemory({ term: "long", kind: "note", text: "Owned row on older page", persona: "dev" }, 1_000_000));
+	const f = fixture({ allowedTargets: ["persona"], entriesByTarget: { persona: entries }, latestSnapshotMismatch: true });
+	f.scheduler.startExplicit("persona"); await f.scheduler.join();
+	f.scheduler.startExplicit("persona"); await f.scheduler.join();
+	assert.match(f.reports.at(-1)?.body ?? "", /store changed during bounded inspection/);
+	assert.doesNotMatch(f.reports.at(-1)?.body ?? "", /waiting for the next settled event/);
+});
+
+test("explicit cancellation or owner change suppresses late apply and report without automatic retry", async () => {
+	const f = fixture({ cancelCompletes: false });
+	assert.equal(f.scheduler.startExplicit("persona"), true);
+	for (let index = 0; index < 8; index++) await Promise.resolve();
+	f.scheduler.interrupt();
+	f.finish(JSON.stringify({ operations: [{ sourceIds: f.entries.map((entry) => entry.id), kind: "convention", text: "Late proposal must not apply." }] }));
+	await f.scheduler.join();
+	assert.equal(f.applied(), 0);
+	assert.deepEqual(f.reports, []);
+	assert.equal(f.attempts.length, 0);
+
+	const stale = fixture();
+	assert.equal(stale.scheduler.startExplicit("persona"), true);
+	for (let index = 0; index < 8; index++) await Promise.resolve();
+	stale.revoke();
+	stale.finish('{"operations":[]}');
+	await stale.scheduler.join();
+	assert.equal(stale.applied(), 0);
+	assert.deepEqual(stale.reports, []);
+});
+
 test("twenty rapid memory writes coalesce into one first review; a settled digest is not reprocessed", async () => {
 	const f = fixture(); for (let index = 0; index < 20; index++) f.scheduler.memoryAdded("persona");
 	assert.equal(f.pending(), 0); f.scheduler.settled(); f.scheduler.settled(); assert.equal(f.pending(), 1);
 	await f.fire(); assert.equal(f.launches(), 1); f.finish('{"operations":[]}'); await f.scheduler.join();
 	f.advance(); f.scheduler.memoryAdded("persona"); f.scheduler.tokensUsed(AUTO_INPUT_TOKEN_THRESHOLD); f.scheduler.settled(); await f.fire(); await f.scheduler.join();
 	assert.equal(f.launches(), 1); assert.equal(f.applied(), 0);
+});
+
+test("successive explicit no-op reviews rotate windows, while cancellation does not advance", async () => {
+	const entries = Array.from({ length: 235 }, (_, index) => makeMemory({ term: "long", kind: "note", text: `Owned record ${index} has enough distinct content for bounded review.`, persona: "dev" }, 2_000_000 - index));
+	const f = fixture({ allowedTargets: ["persona"], entriesByTarget: { persona: entries } });
+	f.scheduler.startExplicit("persona");
+	for (let i = 0; i < 8; i++) await Promise.resolve();
+	f.finish('{"operations":[]}'); await f.scheduler.join();
+	assert.equal(f.inspectCalls[0]?.offset, 0);
+	const firstWindow = JSON.parse(f.tasks[0]!.split("\n").at(-1)!) as { entries: MemoryEntry[] };
+	f.scheduler.startExplicit("persona");
+	for (let i = 0; i < 8; i++) await Promise.resolve();
+	assert.equal(f.inspectCalls.at(-1)?.offset, 0);
+	const secondWindow = JSON.parse(f.tasks.at(-1)!.split("\n").at(-1)!) as { entries: MemoryEntry[] };
+	assert.notDeepEqual(secondWindow.entries.map((entry) => entry.id), firstWindow.entries.map((entry) => entry.id), "a completed explicit review advances to another bounded window");
+	f.scheduler.interrupt(); f.finish('{"operations":[]}'); await f.scheduler.join();
+	f.scheduler.startExplicit("persona");
+	for (let i = 0; i < 8; i++) await Promise.resolve();
+	const afterCancel = JSON.parse(f.tasks.at(-1)!.split("\n").at(-1)!) as { entries: MemoryEntry[] };
+	assert.deepEqual(afterCancel.entries.map((entry) => entry.id), secondWindow.entries.map((entry) => entry.id), "cancelled explicit work leaves its cursor unchanged");
+	f.scheduler.interrupt(); f.finish('{"operations":[]}'); await f.scheduler.join();
 });
 
 test("no-work pages advance to older records, then activation resets coverage for the new scope", async () => {

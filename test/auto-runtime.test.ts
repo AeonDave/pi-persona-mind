@@ -91,6 +91,54 @@ test("native automatic optimization coalesces saves, preserves history and appli
 	} finally { await h?.dispose(); await rm(root, { recursive: true, force: true }); }
 });
 
+test("/mind optimize persona runs through Pi, applies and retains a receipt without activity or main-model wake", { timeout: 20_000 }, async () => {
+	const root = await mkdtemp(join(tmpdir(), "mind-explicit-runtime-"));
+	let h: Harness | undefined;
+	const worker = workerFixture();
+	const activity: unknown[] = [];
+	const observe: ExtensionFactory = (pi) => {
+		pi.events.on("pi-persona:activity:v1", (event: unknown) => activity.push(event));
+	};
+	try {
+		h = await runtimeHarness(root, entry, [worker.factory, observe]);
+		await h.bind();
+		const scope = await seed(h);
+		await h.session.prompt("/mind optimize inspect persona");
+		assert.equal(worker.requests.length, 0, "inspection is read-only and never starts a worker");
+		const beforeInspect = await readFile(scope.paths.ltm, "utf8");
+		await h.session.prompt("/mind optimize inspect shared");
+		assert.equal(await readFile(scope.paths.ltm, "utf8"), beforeInspect);
+		await h.session.prompt("/mind optimize shared");
+		assert.match(h.notifications.join("\n"), /excluded from LLM optimization.*inspect shared/i);
+		assert.equal(worker.requests.length, 0, "shared LLM optimization is refused");
+		await h.session.prompt("/mind optimize auto off");
+		assert.match(JSON.stringify(cards(h)), /Automatic memory optimization/);
+		assert.equal(worker.requests.length, 0);
+		const activityBeforeExplicit = activity.length;
+		await h.session.prompt("/mind optimize persona");
+		assert.match(h.notifications.join("\n"), /persona review (?:started|requested|preparing)/i);
+		await until(() => worker.requests.length === 1, "explicit command reaches worker bridge despite auto off");
+		assert.match(worker.requests[0]!.task, /read-only memory-consolidation reviewer/);
+		const payload = JSON.parse(worker.requests[0]!.task.split("\n").at(-1)!);
+		assert.equal(payload.entries.length, 2);
+		const beforeProposal = await readFile(scope.paths.ltm, "utf8");
+		worker.requests[0]!.finish({ status: "done", ok: true, output: JSON.stringify({ operations: [{ sourceIds: payload.entries.map((e: { id: string }) => e.id), kind: "convention", text: replacement }] }), resultRef: "result:explicit-offline" });
+		await until(() => JSON.stringify(cards(h!)).includes("Mind optimization result"), "command-launched worker applies and reports");
+		const after = JSON.parse(await readFile(scope.paths.ltm, "utf8"));
+		assert.equal(after.entries.length, 1);
+		assert.equal(after.entries[0].text, replacement);
+		const history = JSON.stringify(cards(h));
+		assert.match(history, /Mind optimization proposal/);
+		assert.match(history, /result:explicit-offline/);
+		assert.match(history, /Undo: \/mind optimize undo .* persona/);
+		assert.notEqual(await readFile(scope.paths.ltm, "utf8"), beforeProposal);
+		assert.deepEqual(activity.slice(activityBeforeExplicit), [], "full explicit optimization has no sticky Persona activity lifecycle");
+		await h.session.prompt("/mind optimize history persona");
+		assert.match(JSON.stringify(cards(h)), /explicit-offline|receipt/i);
+		assert.equal(h.faux.state.callCount, 0, "slash commands and worker completion never wake the main model");
+	} finally { await h?.dispose(); await rm(root, { recursive: true, force: true }); }
+});
+
 test("native optimizer requires one million main input tokens and a dirty store, then foreground input cancels its worker", { timeout: 20_000 }, async () => {
 	const root = await mkdtemp(join(tmpdir(), "mind-auto-native-tokens-"));
 	let h: Harness | undefined;

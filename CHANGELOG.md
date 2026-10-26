@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.8.5](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.8.5) - 2026-10-26
+
+- Add `/mind optimize [project|project-long|persona]` for an immediate, bounded review by a visible Persona-hosted worker using the current session model. Changes pass Mind's validation, provenance and compare-and-swap checks; successful writes retain receipts and support guarded undo.
+- Remove the worker row on completion while retaining results in the conversation. Keep reviews bounded, rotate completed windows, and handle busy sessions, cancellation, stale owners and errors safely.
+- **Usage change:** use `/mind optimize inspect [target]` to inspect; `/mind optimize [target]` now starts a review instead.
+
 ## [0.8.4](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.8.4) - 2026-10-25
 
 - Add durable project memory and scope-preserving promotion; expose project/persona/shared scope

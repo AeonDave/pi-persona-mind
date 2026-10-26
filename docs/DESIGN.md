@@ -14,7 +14,7 @@ patch an installed host.
 Mind requires a loaded compatible pi-persona through its versioned local companion handshake.
 Missing/incompatible presence leaves tools inactive and suppresses capture, storage/import,
 injection and reminders. A settings file or installed npm package is not proof of an active
-companion. Mind 0.8.4 requires Persona 1.17.5 or later for these paired contracts. Its optional npm
+companion. Mind 0.8.5 requires Persona 1.17.5 or later for these paired contracts. Its optional npm
 peer declares that requirement without auto-installing or activating another extension.
 
 The node-only core has no Pi imports. The factory wires native Pi hooks, tools, scope, scheduling
@@ -109,7 +109,9 @@ An in-memory session is not advertised as restart-durable.
 
 ## Explicit consolidation
 
-The explicit workflow is inspect → stage exact replacements → apply plan ID. An omitted replacement tag
+`/mind optimize [project|project-long|persona]` launches one real visible Persona-hosted LLM review pass using the exact session model and existing worker admission, prompt, strict JSON validation, provenance, preview, CAS apply and durable receipt pipeline. It bypasses automatic dirty/token/cooldown/auto-off gates, but honors the one-worker-per-instance and current owner checks. The command returns after scheduler acceptance, before store inspection or worker admission; the toast says the review was requested and is preparing. Completion is handled in the background and displayed as ordinary Mind result cards, without a separate activity row. A pass is bounded to one selected record window; reports state bounded coverage/no-op and never claim whole-store review. Interrupted/stale work cannot apply, emit stale reports or schedule a manual retry. Shared is explicitly refused for LLM review and points to `/mind optimize inspect shared` plus manual review. Read-only inspection is `/mind optimize inspect [target]`; default optimize target remains project.
+
+The manual workflow is inspect → stage exact replacements → apply plan ID. An omitted replacement tag
 list inherits the normalized union from selected sources; an explicit empty list clears tags. Lexical
 rules never approve semantic changes. Learned decay rates, recall counters and age-based LTM deletion
 remain outside the contract.

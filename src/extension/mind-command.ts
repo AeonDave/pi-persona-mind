@@ -21,6 +21,8 @@ export type MindCommand =
 	| { type: "reset" }
 	| { type: "migrate-persona" }
 	| { type: "session" }
+	| { type: "optimize-run"; target: Exclude<MindOptimizeTarget, "shared"> }
+	| { type: "optimize-shared-refused" }
 	| { type: "optimize-inspect"; target: MindOptimizeTarget }
 	| { type: "optimize-show"; planId: string }
 	| { type: "optimize-apply"; planId: string }
@@ -30,7 +32,7 @@ export type MindCommand =
 	| { type: "invalid"; message: string };
 
 const USAGE =
-	"usage: /persona-mind [help|doctor|session|reset [workspace]|migrate-persona|optimize [project|project-long|persona|shared]|optimize show <planId>|optimize apply <planId>|optimize history [target]|optimize undo <receiptId> [target]|optimize auto [status|on|off]]";
+	"usage: /persona-mind [help|doctor|session|reset [workspace]|migrate-persona|optimize [project|project-long|persona]|optimize inspect [project|project-long|persona|shared]|optimize show <planId>|optimize apply <planId>|optimize history [target]|optimize undo <receiptId> [target]|optimize auto [status|on|off]]";
 
 export interface MindCommandDeps {
 	agentDir: string;
@@ -40,7 +42,7 @@ export interface MindCommandDeps {
 	getSessionMemory(): SessionMemory;
 	getOptimizer(ctx: ExtensionContext): MemoryOptimizer;
 	activity?(ctx: ExtensionContext): MindActivityRunner | undefined;
-	autoOptimize?: { status(): string; setEnabled(enabled: boolean): void };
+	autoOptimize?: { status(): string; setEnabled(enabled: boolean): void; startExplicit?(target: Exclude<MindOptimizeTarget, "shared">): boolean };
 	isCurrent(ctx: ExtensionContext): boolean;
 	ensureLegacyMigrated(ctx: ExtensionContext, includeAmbiguousPersonaAlias?: boolean, awaitCompletion?: boolean): Promise<void>;
 	migrationStatus(): string;
@@ -76,14 +78,31 @@ export function registerMindCommands(pi: ExtensionAPI, deps: MindCommandDeps): v
 				"/persona-mind session — list notes on this active session branch",
 				"/persona-mind reset [workspace] — clear this project's short-term memory and backlog",
 				"/persona-mind migrate-persona — explicitly import an ambiguous historical persona alias",
-				"/persona-mind optimize [project|project-long|persona|shared] — inspect bounded candidates (read-only); project is expiring working memory, project-long is durable repository knowledge",
-				"Ask the agent to compare candidates with current evidence, read full entries, and stage a concise proposal that preserves exceptions and provenance.",
+				"/persona-mind optimize [project|project-long|persona] — request one bounded visible Persona-hosted LLM review; project is expiring working memory, project-long is durable repository knowledge",
+				"/persona-mind optimize inspect [project|project-long|persona|shared] — read-only inspection; shared changes require a manually reviewed workflow.",
 				"/persona-mind optimize show <planId> — inspect exact staged text; /persona-mind optimize apply <planId> commits that plan only",
 				"/persona-mind optimize history [target] — inspect bounded durable before/after receipts; /persona-mind optimize undo <receiptId> [target] restores unchanged affected facts (target defaults to project)",
 				"/persona-mind optimize auto [status|on|off] — inspect or switch automatic review for this session; off cancels pending work",
-				"/mind is an alias. Manual inspection makes no changes; manual apply commits only a staged plan. Automatic review uses the session model at idle and reports its changes.",
+				"/mind is an alias. Explicit review bypasses automatic gates but not worker/busy/owner safeguards; it reports bounded coverage and applies only validated CAS plans. Automatic review remains idle-gated.",
 			].join("\n");
 			publish(ctx, deps, "pi-persona-mind help", body, "Command reference is in the expandable card.");
+			return;
+		}
+		if (command.type === "optimize-shared-refused") {
+			ctx.ui.notify("Shared memory is excluded from LLM optimization. Use `/mind optimize inspect shared` and a manually reviewed workflow.", "warning");
+			return;
+		}
+		if (command.type === "optimize-run") {
+			if (deps.isDelegatedLeg || !deps.autoOptimize?.startExplicit) {
+				ctx.ui.notify("Visible Persona-hosted memory review is unavailable in this session.", "warning");
+				return;
+			}
+			if (!captureSessionOwner(deps, ctx)()) {
+				ctx.ui.notify("Memory session owner changed; optimization was not started.", "warning");
+				return;
+			}
+			if (!deps.autoOptimize.startExplicit(command.target)) ctx.ui.notify("Mind is busy, already has a review worker active, or its memory owner is unavailable; no review was accepted.", "warning");
+			else ctx.ui.notify(`Mind ${command.target} review requested; bounded inspection and worker admission are preparing in the background.`, "info");
 			return;
 		}
 		if (command.type === "optimize-auto") {
@@ -318,9 +337,12 @@ export function parseMindCommand(args: string): MindCommand {
 			if (parts.length === 3 && (parts[2] === "status" || parts[2] === "on" || parts[2] === "off")) return { type: "optimize-auto", action: parts[2] };
 			return { type: "invalid", message: USAGE };
 		}
-		if (parts.length === 1) return { type: "optimize-inspect", target: "project" };
-		if (parts.length === 2 && (parts[1] === "project" || parts[1] === "project-long" || parts[1] === "persona" || parts[1] === "shared")) {
-			return { type: "optimize-inspect", target: parts[1] };
+		if (parts[1] === "inspect" && parts.length === 2) return { type: "optimize-inspect", target: "project" };
+		if (parts[1] === "inspect" && parts.length === 3 && isOptimizeTarget(parts[2])) return { type: "optimize-inspect", target: parts[2] };
+		if (parts.length === 1) return { type: "optimize-run", target: "project" };
+		if (parts.length === 2 && parts[1] === "shared") return { type: "optimize-shared-refused" };
+		if (parts.length === 2 && (parts[1] === "project" || parts[1] === "project-long" || parts[1] === "persona")) {
+			return { type: "optimize-run", target: parts[1] };
 		}
 		if (parts.length === 3 && (parts[1] === "show" || parts[1] === "apply") && isPlanId(args.trim().split(/\s+/)[2])) {
 			const planId = args.trim().split(/\s+/)[2]!;

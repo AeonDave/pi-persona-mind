@@ -1,7 +1,7 @@
 <h1 align="center">pi-persona-mind</h1>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v0.8.4/assets/banner.png" alt="pi-persona-mind — durable memory for Pi">
+  <img src="https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v0.8.5/assets/banner.png" alt="pi-persona-mind — durable memory for Pi">
 </p>
 
 [![CI](https://github.com/AeonDave/pi-persona-mind/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/AeonDave/pi-persona-mind/actions/workflows/test.yml) [![npm version](https://img.shields.io/npm/v/@aeondave/pi-persona-mind?logo=npm)](https://www.npmjs.com/package/@aeondave/pi-persona-mind) [![License](https://img.shields.io/github/license/AeonDave/pi-persona-mind)](LICENSE)
@@ -10,7 +10,7 @@ Local memory for [Pi](https://github.com/earendil-works/pi): durable facts, sess
 unfinished work. Bounded excerpts enter each turn; the agent can retrieve full entries when needed.
 
 Requires a compatible loaded [pi-persona](https://github.com/AeonDave/pi-persona). The current
-release pair is Mind 0.8.4 with Persona 1.17.5 or later.
+release pair is Mind 0.8.5 with Persona 1.17.5 or later.
 Stores use local files and Pi's session history, without embeddings, a database or a separate service.
 Automatic consolidation uses a visible Mind worker on your current session model. Memory injection and
 worker review consume normal model tokens. A saved claim is not automatically a verified fact.
@@ -32,7 +32,7 @@ with no memory capture, writes, injection or reminders.
 | Install option | Command |
 |---|---|
 | This project only | `pi install -l npm:@aeondave/pi-persona-mind` |
-| Pin Mind 0.8.4 | `pi install npm:@aeondave/pi-persona-mind@0.8.4` |
+| Pin Mind 0.8.5 | `pi install npm:@aeondave/pi-persona-mind@0.8.5` |
 | Update the unpinned pair | `pi update npm:@aeondave/pi-persona`<br>`pi update npm:@aeondave/pi-persona-mind` |
 
 When switching either extension from a Git install to npm, remove its exact Git source first (use
@@ -80,7 +80,8 @@ source reference. A result reference is provenance, not permission to read anoth
 | `/persona-mind reset` | Clear this project's short-term facts and backlog |
 | `/persona-mind reset workspace` | Same explicit workspace reset |
 | `/persona-mind migrate-persona` | Recover an ambiguous historical persona-data alias |
-| `/persona-mind optimize [project\|project-long\|persona\|shared]` | Inspect a bounded selection; no changes |
+| `/persona-mind optimize [project\|project-long\|persona]` | Request one visible Persona-hosted LLM review; defaults to `project` |
+| `/persona-mind optimize inspect [project\|project-long\|persona\|shared]` | Read-only bounded inspection |
 | `/persona-mind optimize show <planId>` | Display an already staged plan |
 | `/persona-mind optimize apply <planId>` | Apply that exact plan if still current |
 | `/persona-mind optimize history [target]` | Review retained before/after receipts; default `project` |
@@ -117,9 +118,7 @@ The retrieval is deterministic; it does not infer arbitrary synonyms or establis
 
 ## Review and consolidate
 
-Ask the agent to inspect memories against new evidence and propose a consolidation.
-The slash command alone is a local inspection, not a hidden model request. The agent evaluates
-the evidence during its normal foreground turn.
+`/mind optimize [project|project-long|persona]` requests one bounded review in the real visible Persona worker; the command returns before inspection and worker admission. It bypasses automatic preference/token/cooldown gates, but refuses busy sessions, overlap and stale owners. It uses the session model and the validated preview/CAS/apply/undo pipeline. Use `/mind optimize inspect [target]` for explicitly read-only inspection. `shared` is excluded from LLM optimization and must be inspected and handled through a manually reviewed workflow.
 
 1. `memory {action:"optimize", mode:"inspect", target:"project"}` returns IDs and a fingerprint.
 2. Read full facts, then stage explicit replacements with that fingerprint and
@@ -147,10 +146,7 @@ Exact deduplication and expiry cleanup already run automatically. Lexical simila
 comparisons; it cannot distinguish agreement from contradiction. Age never deletes a durable fact.
 See [research and decisions](docs/MEMORY-RESEARCH.md).
 
-During inspection, staging and application, **Mind** appears in pi-persona's activity tree and F9
-view. The row distinguishes local work, a prepared proposal and a terminal result.
-It does not invent a worker model, tokens or a cancellable agent. Finished rows are bounded and
-remain visible, so a fast local operation does not disappear before it can be read.
+Local inspect/stage/apply activity uses Mind activity rows. Full `/mind optimize` runs appear as ordinary Persona worker rows; the host removes those rows on terminal completion. The full review does not create a separate sticky activity row.
 
 Automatic review is on by default. Successful saves/promotions mark project or persona memories
 for review; shared memories are excluded. The first eligible burst can run after the main agent

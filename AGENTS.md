@@ -44,7 +44,8 @@ coupled through a versioned local companion handshake to
   not a boolean. Existing persona facts are not automatically reassigned. STM/backlog auto-delete after ~48h. Explicit session notes live
   in Pi's native active branch, survive compaction/resume, and stay absent from delegated workers.
   A non-persistent host session reports in-memory storage; forget is a branch-local tombstone.
-- Optimization is inspect → stage exact replacements → apply a short-lived plan ID. Similarity
+- `/mind optimize [project|project-long|persona]` starts one bounded real Persona-hosted LLM review NOW, bypassing automatic dirty/token/cooldown and auto-off gates but not owner, busy, validation or CAS safeguards. It uses the existing worker/prompt/strict JSON/provenance/preview/apply/receipt pipeline, exact current model only, no fallback/tools, and reports bounded coverage/no-op honestly. Shared is refused with a pointer to `/mind optimize inspect shared`; it is excluded from all LLM automatic and explicit writes. `/mind optimize inspect [target]` stays read-only. Do not publish a separate persistent activity row for full optimization; let Persona's normal worker row terminate. Interrupted/stale explicit runs never apply, report across owner change, or arm an automatic retry.
+- Optimization inspect/stage exact replacements/apply a short-lived plan ID remains available through explicit inspect/show/apply commands and the memory tool. Similarity
   is advisory. Compare the original raw store fingerprint under its lock; reject stale/expired
   plans, invalid stores, ownership mixing, provenance overflow and extended STM expiry.
   Lifecycle changes invalidate plans. Automatic semantic review is user-authorized and on by default

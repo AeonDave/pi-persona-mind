@@ -24,17 +24,51 @@ test("mind command parser rejects trailing reset arguments instead of resetting 
 
 test("mind command parser scopes optimize inspection and validates explicit plan commands", () => {
 	assert.deepEqual(parseMindCommand("optimize history"), { type: "optimize-history", target: "project" });
+	assert.deepEqual(parseMindCommand("optimize inspect shared"), { type: "optimize-inspect", target: "shared" });
 	assert.deepEqual(parseMindCommand("optimize history project-long"), { type: "optimize-history", target: "project-long" });
 	assert.deepEqual(parseMindCommand("optimize undo receipt-ABC project-long"), { type: "optimize-undo", receiptId: "receipt-ABC", target: "project-long" });
 	assert.deepEqual(parseMindCommand("optimize undo receipt-ABC"), { type: "optimize-undo", receiptId: "receipt-ABC", target: "project" });
 	assert.equal(parseMindCommand("optimize history unknown").type, "invalid");
 	assert.equal(parseMindCommand("optimize undo receipt-ABC project extra").type, "invalid");
-	assert.deepEqual(parseMindCommand("optimize"), { type: "optimize-inspect", target: "project" });
-	assert.deepEqual(parseMindCommand("optimize shared"), { type: "optimize-inspect", target: "shared" });
+	assert.deepEqual(parseMindCommand("optimize"), { type: "optimize-run", target: "project" });
+	assert.deepEqual(parseMindCommand("optimize project-long"), { type: "optimize-run", target: "project-long" });
+	assert.deepEqual(parseMindCommand("optimize inspect"), { type: "optimize-inspect", target: "project" });
+	assert.deepEqual(parseMindCommand("optimize inspect shared"), { type: "optimize-inspect", target: "shared" });
+	assert.deepEqual(parseMindCommand("optimize shared"), { type: "optimize-shared-refused" });
 	assert.deepEqual(parseMindCommand("optimize show plan-abc"), { type: "optimize-show", planId: "plan-abc" });
 	assert.deepEqual(parseMindCommand("optimize apply plan-abc"), { type: "optimize-apply", planId: "plan-abc" });
 	assert.equal(parseMindCommand("optimize apply plan-abc extra").type, "invalid");
 	assert.equal(parseMindCommand("optimize unknown").type, "invalid");
+});
+
+test("explicit optimize commands start a worker while inspect remains read-only and shared refuses LLM review", async () => {
+	const commands = new Map<string, { handler: (args: string, ctx: never) => Promise<void> }>();
+	const notices: string[] = [];
+	const starts: string[] = [];
+	let inspections = 0;
+	const optimizer = { inspect: async (target: string) => { inspections++; return { ok: true, target, fingerprint: "fp", entries: [], total: 0, withheld: 0, candidates: [] }; } };
+	const pi = { registerCommand: (name: string, definition: { handler: (args: string, ctx: never) => Promise<void> }) => commands.set(name, definition) };
+	registerMindCommands(pi as never, {
+		agentDir: "unused", resolveScope: () => { throw new Error("run/inspect should use their dedicated seams"); }, rawPersona: () => "reviewer", getMind: () => ({}) as never,
+		getSessionMemory: () => ({ captureOwner: () => () => true }) as never,
+		getOptimizer: () => optimizer as never,
+		ensureLegacyMigrated: async () => {}, migrationStatus: () => "not started", unavailableReason: () => undefined,
+		surfaceWarning: () => {}, pendingWarnings: () => [], acknowledgeWarnings: () => {}, capturePolicy: () => "auto",
+		isDelegatedLeg: false, isCurrent: () => true, sessionActive: () => true, afterWorkspaceReset: async () => {}, appendResult: () => {},
+		autoOptimize: { status: () => "off", setEnabled: () => {}, startExplicit: (target) => { starts.push(target); return true; } },
+	});
+	const ctx = { ui: { notify: (message: string) => notices.push(message) } } as never;
+	const handler = commands.get("mind")!.handler;
+	await handler("optimize", ctx);
+	assert.deepEqual(starts, ["project"]);
+	assert.match(notices.at(-1) ?? "", /review requested.*preparing/i);
+	assert.doesNotMatch(notices.at(-1) ?? "", /worker.*started/i);
+	assert.equal(inspections, 0, "explicit optimization does not fall through to inspect-only behavior");
+	await handler("optimize inspect project-long", ctx);
+	assert.equal(inspections, 1);
+	await handler("optimize shared", ctx);
+	assert.deepEqual(starts, ["project"]);
+	assert.match(notices.at(-1) ?? "", /excluded.*inspect shared/i);
 });
 
 test("automatic optimization command grammar accepts only status and explicit session switches", () => {
@@ -129,7 +163,7 @@ test("mind optimize command inspects and applies only an explicitly named staged
 	});
 	const ctx = { ui: { notify: () => {} } } as never;
 	const handler = commands.get("persona-mind")!.handler;
-	await handler("optimize shared", ctx);
+	await handler("optimize inspect shared", ctx);
 	assert.equal(inspected, 1);
 	assert.equal(applied, 0);
 	assert.match(appended.at(-1)?.body ?? "", /No changes were applied/);

@@ -39,7 +39,8 @@ export class AutoOptimizeScheduler {
 	private generation = 0;
 	private disabledGeneration = 0;
 	private timer: (() => void) | undefined;
-	private running: { optimizer: Optimizer; cancel?: () => void; retryTarget?: Target } | undefined;
+	private timerGeneration = 0;
+	private running: { optimizer: Optimizer; cancel?: () => void; retryTarget?: Target; explicit?: boolean } | undefined;
 	private work: Promise<void> = Promise.resolve();
 	private last = "waiting for new memory";
 
@@ -65,8 +66,8 @@ export class AutoOptimizeScheduler {
 	}
 	stop(): void { this.interrupt(); this.owner = undefined; this.pending.clear(); this.retryTargets.clear(); this.cursors.clear(); this.inputTokens = 0; this.seen.clear(); this.lastAttempt = -Infinity; }
 	interrupt(): void {
-		this.timer?.(); this.timer = undefined; this.generation++;
-		if (this.enabled && this.running?.retryTarget) {
+		this.timer?.(); this.timer = undefined; this.timerGeneration++; this.generation++;
+		if (this.enabled && !this.running?.explicit && this.running?.retryTarget) {
 			this.pending.add(this.running.retryTarget);
 			this.retryTargets.add(this.running.retryTarget);
 		}
@@ -105,14 +106,32 @@ export class AutoOptimizeScheduler {
 		const eligiblePending = [...this.pending].some((target) => this.allows(owner, target) && (this.retryTargets.has(target) || tokenReady));
 		if (!eligiblePending) return;
 		const generation = this.generation;
+		const timerGeneration = ++this.timerGeneration;
 		this.timer = this.schedule(() => {
+			if (timerGeneration !== this.timerGeneration) return;
 			this.timer = undefined;
-			if (generation !== this.generation) return;
+			if (generation !== this.generation || this.running) return;
 			this.work = this.run().catch(() => { this.last = "inspection failed; no automatic retry"; });
 		}, Math.max(AUTO_IDLE_MS, this.lastAttempt + AUTO_COOLDOWN_MS - this.now()));
 	}
+	/** Start one user-requested bounded pass without automatic gates or preference checks. */
+	startExplicit(target: Target): boolean {
+		const owner = this.owner;
+		if (!owner || !this.safeCurrent(owner) || !this.safeIdle(owner) || !this.allows(owner, target) || this.running) return false;
+		this.timer?.(); this.timer = undefined; this.timerGeneration++;
+		const generation = this.generation;
+		this.work = this.run(target, true).catch(() => {
+			if (generation !== this.generation || !this.safeCurrent(owner)) return;
+			this.last = "explicit review failed; inspect current memory before retrying because apply may have completed";
+			try { owner.report("Mind optimization result", `Bounded review failed unexpectedly; ${this.last}.`); } catch { /* owner reporting is best-effort */ }
+		}).finally(() => {
+			if (generation === this.generation && this.safeCurrent(owner) && this.safeIdle(owner) && this.pending.size) this.settled();
+		});
+		return true;
+	}
 	join(): Promise<void> { return this.work; }
 	private safeCurrent(owner: AutoOptimizeOwner): boolean { try { return this.owner === owner && owner.current(); } catch { return false; } }
+	private safeIdle(owner: AutoOptimizeOwner): boolean { try { return owner.idle(); } catch { return false; } }
 	private allows(owner: AutoOptimizeOwner, target: Target): boolean { return owner.allowedTargets.includes(target); }
 	private remember(owner: AutoOptimizeOwner, target: Target, digest: string, state: AutoAttempt["state"], at: number): void {
 		owner.recordAttempt({ digest, target, at, state });
@@ -120,27 +139,27 @@ export class AutoOptimizeScheduler {
 			this.seen.add(digest); while (this.seen.size > 64) this.seen.delete(this.seen.values().next().value!);
 		}
 	}
-	private async run(): Promise<void> {
+	private async run(explicitTarget?: Target, explicit = false): Promise<void> {
 		const owner = this.owner;
-		if (!owner || !this.enabled || !this.safeCurrent(owner) || !owner.idle() || this.running) return;
+		if (!owner || (!explicit && !this.enabled) || !this.safeCurrent(owner) || !this.safeIdle(owner) || this.running) return;
 		const generation = this.generation;
 		const disabledGeneration = this.disabledGeneration;
-		const current = () => generation === this.generation && this.enabled && this.safeCurrent(owner) && owner.idle();
-		const mayRetry = () => this.enabled && this.disabledGeneration === disabledGeneration && this.safeCurrent(owner);
+		const current = () => generation === this.generation && (explicit || this.enabled) && this.safeIdle(owner) && this.safeCurrent(owner);
+		const mayRetry = () => !explicit && this.enabled && this.disabledGeneration === disabledGeneration && this.safeCurrent(owner);
 		const optimizer = owner.optimizer();
-		const running: NonNullable<AutoOptimizeScheduler["running"]> = { optimizer };
+		const running: NonNullable<AutoOptimizeScheduler["running"]> = { optimizer, explicit };
 		let attemptRecorded = false;
 		let unsettledTarget: Target | undefined;
 		let nextCursor: CoverageCursor | undefined;
 		let retryRequiresSettled = false;
 		this.running = running;
 		try {
-			for (const target of [...this.pending]) {
+			for (const target of explicit ? [explicitTarget!] : [...this.pending]) {
 				if (!this.allows(owner, target)) { this.pending.delete(target); this.retryTargets.delete(target); continue; }
 				const retry = this.retryTargets.has(target);
 				const tokenReady = this.lastAttempt === -Infinity || this.inputTokens >= AUTO_INPUT_TOKEN_THRESHOLD;
-				if (!retry && !tokenReady) continue;
-				this.pending.delete(target);
+				if (!explicit && !retry && !tokenReady) continue;
+				if (!explicit) this.pending.delete(target);
 				const cursor = this.cursors.get(target) ?? { offset: 0, withinPage: 0 };
 				let inspection: OptimizeInspection | OptimizeFailure;
 				let newestInspection: OptimizeInspection | undefined;
@@ -151,7 +170,8 @@ export class AutoOptimizeScheduler {
 						if (latest.ok && latest.target === target && latest.fingerprint === inspection.fingerprint) newestInspection = latest;
 						else {
 						if (mayRetry()) this.pending.add(target);
-						this.last = "store changed during bounded inspection; waiting for the next settled event";
+						this.last = explicit ? "store changed during bounded inspection; the selected window was not reviewed" : "store changed during bounded inspection; waiting for the next settled event";
+						if (explicit && current()) owner.report("Mind optimization result", `Bounded review stopped before worker admission: ${this.last}.`);
 						return;
 						}
 					}
@@ -162,6 +182,7 @@ export class AutoOptimizeScheduler {
 						return;
 					}
 					this.last = "store inspection failed; see /mind doctor";
+					if (explicit) owner.report("Mind optimization result", `Bounded review could not inspect this record window: ${this.last}.`);
 					continue;
 				}
 				if (!current()) {
@@ -170,8 +191,8 @@ export class AutoOptimizeScheduler {
 					if (mayRetry()) this.pending.add(target);
 					return;
 				}
-				if (!inspection.ok) { this.last = "store inspection refused; see /mind doctor"; continue; }
-				if (inspection.target !== target) { this.last = "store inspection returned a different tier; no worker started"; continue; }
+				if (!inspection.ok) { this.last = "store inspection refused; see /mind doctor"; if (explicit) owner.report("Mind optimization result", `Bounded review stopped before worker admission: ${this.last}.`); continue; }
+				if (inspection.target !== target) { this.last = "store inspection returned a different tier; no worker started"; if (explicit) owner.report("Mind optimization result", `Bounded review stopped before worker admission: ${this.last}.`); continue; }
 				const page = selectAutoInputPage(inspection, owner.persona, cursor.withinPage, newestInspection);
 				nextCursor = page.pageComplete
 					? { offset: inspection.nextOffset ?? 0, withinPage: 0 }
@@ -181,30 +202,39 @@ export class AutoOptimizeScheduler {
 					this.cursors.set(target, nextCursor);
 					this.retryTargets.delete(target);
 					this.last = "no eligible records in this bounded page";
+					if (explicit) owner.report("Mind optimization result", `Bounded coverage: no eligible records in the selected window; ${this.last}.`);
 					continue;
 				}
-				if (this.seen.has(input.digest)) {
+				if (!explicit && this.seen.has(input.digest)) {
 					this.cursors.set(target, nextCursor);
 					this.retryTargets.delete(target);
 					this.last = "this bounded record set was already reviewed";
 					continue;
 				}
 				const worker = owner.launch(buildAutoPrompt(input));
-				if (!worker.ok) { this.pending.add(target); this.last = worker.reason; return; }
+				if (!worker.ok) {
+					if (!explicit) this.pending.add(target);
+					this.last = worker.reason;
+					if (explicit && current()) owner.report("Mind optimization result", `Bounded review was not admitted: ${worker.reason}. No memory changed.`);
+					return;
+				}
 				const attemptAt = this.now();
 				running.cancel = worker.cancel;
 				running.retryTarget = target;
 				this.retryTargets.delete(target);
-				this.lastAttempt = attemptAt; this.inputTokens = 0; this.last = "Mind is reviewing memory";
+				if (!explicit) { this.lastAttempt = attemptAt; this.inputTokens = 0; }
+				this.last = "Mind is reviewing memory";
 				unsettledTarget = target;
 				const settle = (): void => {
-					this.remember(owner, target, input.digest, "settled", attemptAt);
+					if (!explicit) this.remember(owner, target, input.digest, "settled", attemptAt);
 					if (nextCursor) this.cursors.set(target, nextCursor);
 					unsettledTarget = undefined;
 				};
 				try {
-					this.remember(owner, target, input.digest, "started", attemptAt);
-					attemptRecorded = true;
+					if (!explicit) {
+						this.remember(owner, target, input.digest, "started", attemptAt);
+						attemptRecorded = true;
+					}
 				} catch {
 					try { running.cancel?.(); } catch { /* best-effort stop before apply */ }
 					this.last = "attempt could not be saved; worker cancelled before apply";
@@ -213,22 +243,25 @@ export class AutoOptimizeScheduler {
 				const result = await worker.completion;
 				if (!current()) return;
 				if (workerWasStopped(result)) {
-					retryRequiresSettled = true;
-					this.pending.add(target);
-					this.retryTargets.add(target);
+					if (!explicit) {
+						retryRequiresSettled = true;
+						this.pending.add(target);
+						this.retryTargets.add(target);
+					}
 					unsettledTarget = undefined;
-					this.last = "review interrupted; waiting for the next settled event";
+					this.last = explicit ? "explicit review stopped; memory unchanged" : "review interrupted; waiting for the next settled event";
+					if (explicit && current()) owner.report("Mind optimization result", this.last);
 					return;
 				}
-				if (!result.ok) { settle(); this.last = "worker failed; memory unchanged"; owner.report("Mind automatic optimization", `${this.last}${result.error ? `: ${result.error}` : ""}`); return; }
+				if (!result.ok) { settle(); this.last = "worker failed; memory unchanged"; owner.report(explicit ? "Mind optimization result" : "Mind automatic optimization", `Bounded review · ${this.last}${result.error ? `: ${result.error}` : ""}`); return; }
 				const parsed = parseAutoProposal(result.output, input);
-				if (!parsed.ok) { settle(); this.last = "proposal refused; memory unchanged"; owner.report("Mind automatic optimization", `${this.last}: ${parsed.reason}`); return; }
+				if (!parsed.ok) { settle(); this.last = "proposal refused; memory unchanged"; owner.report(explicit ? "Mind optimization result" : "Mind automatic optimization", `Bounded review · ${this.last}: ${parsed.reason}`); return; }
 				const provenance = `Worker ${worker.runId} · ${worker.model} · ${worker.thinking}${result.resultRef ? `\nTerminal report: ${result.resultRef}` : ""}`;
-				if (!parsed.operations.length) { settle(); this.last = "bounded review found no safe consolidation in this record set"; owner.report("Mind automatic optimization", `${this.last}\n${provenance}`); return; }
+				if (!parsed.operations.length) { settle(); this.last = "bounded review found no safe consolidation in this record set"; owner.report(explicit ? "Mind optimization result" : "Mind automatic optimization", `Bounded coverage: one selected record window; ${this.last}.\n${provenance}`); return; }
 				const plan = await optimizer.preview({ target: input.target, fingerprint: input.fingerprint, operations: parsed.operations });
 				if (!current()) return;
-				if (!plan.ok) { settle(); this.last = "store or proposal changed; nothing applied"; owner.report("Mind automatic optimization", `${this.last}: ${plan.reason}\n${provenance}`); return; }
-				owner.report("Mind automatic proposal", `${provenance}\n${formatAutoPlan(plan)}\nAutomatic apply pending; it proceeds only while this owner and snapshot remain current.`);
+				if (!plan.ok) { settle(); this.last = "store or proposal changed; nothing applied"; owner.report(explicit ? "Mind optimization result" : "Mind automatic optimization", `Bounded coverage: one selected record window; ${this.last}: ${plan.reason}\n${provenance}`); return; }
+				owner.report(explicit ? "Mind optimization proposal" : "Mind automatic proposal", `${provenance}\n${formatAutoPlan(plan)}\n${explicit ? "Validated apply pending" : "Automatic apply pending"}; it proceeds only while this owner and snapshot remain current.`);
 				if (!current()) { optimizer.invalidate(); return; }
 				const applied = await optimizer.apply(plan.planId);
 				if (!current()) return;
@@ -238,7 +271,7 @@ export class AutoOptimizeScheduler {
 					? applied.receiptId ? `\nUndo: /mind optimize undo ${applied.receiptId} ${applied.target}.` : "\nNo durable undo receipt was returned."
 					: "";
 				const warning = applied.ok && applied.warning ? `\nWarning: ${applied.warning}` : "";
-				owner.report("Mind automatic result", `${this.last}\n${provenance}${receipt}${warning}`);
+				owner.report(explicit ? "Mind optimization result" : "Mind automatic result", `Bounded coverage: one selected record window; ${this.last}\n${provenance}${receipt}${warning}`);
 			return; // One worker per pass; other dirty tiers wait for the input floor and cooldown.
 			}
 		} finally {
@@ -251,7 +284,7 @@ export class AutoOptimizeScheduler {
 			}
 			// One actual attempt may leave other dirty tiers pending; they need the input floor
 			// and cooldown. Only the same interrupted target bypasses the token floor.
-			if (attemptRecorded && this.pending.size > 0 && current() && !retryRequiresSettled) this.settled();
+			if (!explicit && attemptRecorded && this.pending.size > 0 && current() && !retryRequiresSettled) this.settled();
 		}
 	}
 }
@@ -261,5 +294,5 @@ function workerWasStopped(result: MindWorkerResult): boolean {
 }
 
 function formatAutoPlan(plan: OptimizePlan): string {
-	return `Staged automatic change · ${plan.beforeCount} entries → ${plan.afterCount}\n${JSON.stringify(plan.changes, null, 2)}`;
+	return `Staged proposed change · ${plan.beforeCount} entries → ${plan.afterCount}\n${JSON.stringify(plan.changes, null, 2)}`;
 }
