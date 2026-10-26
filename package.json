@@ -1,6 +1,6 @@
 {
   "name": "@aeondave/pi-persona-mind",
-  "version": "0.8.5",
+  "version": "0.8.6",
   "private": false,
   "type": "module",
   "description": "Local memory for Pi with pi-persona — durable project and persona facts, session notes, bounded retrieval, and supervised automatic consolidation.",
@@ -57,7 +57,7 @@
     }
   },
   "pi": {
-    "image": "https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v0.8.5/assets/banner.png",
+    "image": "https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v0.8.6/assets/banner.png",
     "extensions": [
       "./src/index.ts"
     ]

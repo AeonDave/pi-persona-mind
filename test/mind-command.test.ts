@@ -30,7 +30,8 @@ test("mind command parser scopes optimize inspection and validates explicit plan
 	assert.deepEqual(parseMindCommand("optimize undo receipt-ABC"), { type: "optimize-undo", receiptId: "receipt-ABC", target: "project" });
 	assert.equal(parseMindCommand("optimize history unknown").type, "invalid");
 	assert.equal(parseMindCommand("optimize undo receipt-ABC project extra").type, "invalid");
-	assert.deepEqual(parseMindCommand("optimize"), { type: "optimize-run", target: "project" });
+	assert.deepEqual(parseMindCommand("optimize"), { type: "optimize-run" });
+	assert.deepEqual(parseMindCommand("optimize all"), { type: "optimize-run" });
 	assert.deepEqual(parseMindCommand("optimize project-long"), { type: "optimize-run", target: "project-long" });
 	assert.deepEqual(parseMindCommand("optimize inspect"), { type: "optimize-inspect", target: "project" });
 	assert.deepEqual(parseMindCommand("optimize inspect shared"), { type: "optimize-inspect", target: "shared" });
@@ -44,7 +45,7 @@ test("mind command parser scopes optimize inspection and validates explicit plan
 test("explicit optimize commands start a worker while inspect remains read-only and shared refuses LLM review", async () => {
 	const commands = new Map<string, { handler: (args: string, ctx: never) => Promise<void> }>();
 	const notices: string[] = [];
-	const starts: string[] = [];
+	const starts: Array<string | undefined> = [];
 	let inspections = 0;
 	const optimizer = { inspect: async (target: string) => { inspections++; return { ok: true, target, fingerprint: "fp", entries: [], total: 0, withheld: 0, candidates: [] }; } };
 	const pi = { registerCommand: (name: string, definition: { handler: (args: string, ctx: never) => Promise<void> }) => commands.set(name, definition) };
@@ -55,19 +56,22 @@ test("explicit optimize commands start a worker while inspect remains read-only 
 		ensureLegacyMigrated: async () => {}, migrationStatus: () => "not started", unavailableReason: () => undefined,
 		surfaceWarning: () => {}, pendingWarnings: () => [], acknowledgeWarnings: () => {}, capturePolicy: () => "auto",
 		isDelegatedLeg: false, isCurrent: () => true, sessionActive: () => true, afterWorkspaceReset: async () => {}, appendResult: () => {},
-		autoOptimize: { status: () => "off", setEnabled: () => {}, startExplicit: (target) => { starts.push(target); return true; } },
+		autoOptimize: { status: () => "off", setEnabled: () => {}, targets: () => ["project", "project-long", "persona"], startExplicit: (target) => { starts.push(target); return true; } },
 	});
 	const ctx = { ui: { notify: (message: string) => notices.push(message) } } as never;
 	const handler = commands.get("mind")!.handler;
 	await handler("optimize", ctx);
-	assert.deepEqual(starts, ["project"]);
-	assert.match(notices.at(-1) ?? "", /review requested.*preparing/i);
+	assert.deepEqual(starts, [undefined]);
+	assert.match(notices.at(-1) ?? "", /project, project-long, persona.*bounded.*sequentially/i);
 	assert.doesNotMatch(notices.at(-1) ?? "", /worker.*started/i);
 	assert.equal(inspections, 0, "explicit optimization does not fall through to inspect-only behavior");
+	await handler("optimize project-long", ctx);
+	assert.deepEqual(starts, [undefined, "project-long"], "a named tier remains a single-target request");
+	assert.match(notices.at(-1) ?? "", /Mind project-long review requested/);
 	await handler("optimize inspect project-long", ctx);
 	assert.equal(inspections, 1);
 	await handler("optimize shared", ctx);
-	assert.deepEqual(starts, ["project"]);
+	assert.deepEqual(starts, [undefined, "project-long"]);
 	assert.match(notices.at(-1) ?? "", /excluded.*inspect shared/i);
 });
 

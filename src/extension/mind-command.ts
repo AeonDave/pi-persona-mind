@@ -21,7 +21,7 @@ export type MindCommand =
 	| { type: "reset" }
 	| { type: "migrate-persona" }
 	| { type: "session" }
-	| { type: "optimize-run"; target: Exclude<MindOptimizeTarget, "shared"> }
+	| { type: "optimize-run"; target?: Exclude<MindOptimizeTarget, "shared"> }
 	| { type: "optimize-shared-refused" }
 	| { type: "optimize-inspect"; target: MindOptimizeTarget }
 	| { type: "optimize-show"; planId: string }
@@ -32,7 +32,7 @@ export type MindCommand =
 	| { type: "invalid"; message: string };
 
 const USAGE =
-	"usage: /persona-mind [help|doctor|session|reset [workspace]|migrate-persona|optimize [project|project-long|persona]|optimize inspect [project|project-long|persona|shared]|optimize show <planId>|optimize apply <planId>|optimize history [target]|optimize undo <receiptId> [target]|optimize auto [status|on|off]]";
+	"usage: /persona-mind [help|doctor|session|reset [workspace]|migrate-persona|optimize [all|project|project-long|persona]|optimize inspect [project|project-long|persona|shared]|optimize show <planId>|optimize apply <planId>|optimize history [target]|optimize undo <receiptId> [target]|optimize auto [status|on|off]]";
 
 export interface MindCommandDeps {
 	agentDir: string;
@@ -42,7 +42,7 @@ export interface MindCommandDeps {
 	getSessionMemory(): SessionMemory;
 	getOptimizer(ctx: ExtensionContext): MemoryOptimizer;
 	activity?(ctx: ExtensionContext): MindActivityRunner | undefined;
-	autoOptimize?: { status(): string; setEnabled(enabled: boolean): void; startExplicit?(target: Exclude<MindOptimizeTarget, "shared">): boolean };
+	autoOptimize?: { status(): string; setEnabled(enabled: boolean): void; targets?(): readonly Exclude<MindOptimizeTarget, "shared">[]; startExplicit?(target?: Exclude<MindOptimizeTarget, "shared">): boolean };
 	isCurrent(ctx: ExtensionContext): boolean;
 	ensureLegacyMigrated(ctx: ExtensionContext, includeAmbiguousPersonaAlias?: boolean, awaitCompletion?: boolean): Promise<void>;
 	migrationStatus(): string;
@@ -78,7 +78,7 @@ export function registerMindCommands(pi: ExtensionAPI, deps: MindCommandDeps): v
 				"/persona-mind session — list notes on this active session branch",
 				"/persona-mind reset [workspace] — clear this project's short-term memory and backlog",
 				"/persona-mind migrate-persona — explicitly import an ambiguous historical persona alias",
-				"/persona-mind optimize [project|project-long|persona] — request one bounded visible Persona-hosted LLM review; project is expiring working memory, project-long is durable repository knowledge",
+				"/persona-mind optimize [all|project|project-long|persona] — bare/all reviews each allowed tier in one bounded sequential pass; a named tier stays single-target",
 				"/persona-mind optimize inspect [project|project-long|persona|shared] — read-only inspection; shared changes require a manually reviewed workflow.",
 				"/persona-mind optimize show <planId> — inspect exact staged text; /persona-mind optimize apply <planId> commits that plan only",
 				"/persona-mind optimize history [target] — inspect bounded durable before/after receipts; /persona-mind optimize undo <receiptId> [target] restores unchanged affected facts (target defaults to project)",
@@ -101,8 +101,14 @@ export function registerMindCommands(pi: ExtensionAPI, deps: MindCommandDeps): v
 				ctx.ui.notify("Memory session owner changed; optimization was not started.", "warning");
 				return;
 			}
-			if (!deps.autoOptimize.startExplicit(command.target)) ctx.ui.notify("Mind is busy, already has a review worker active, or its memory owner is unavailable; no review was accepted.", "warning");
-			else ctx.ui.notify(`Mind ${command.target} review requested; bounded inspection and worker admission are preparing in the background.`, "info");
+			const accepted = command.target === undefined ? deps.autoOptimize.startExplicit() : deps.autoOptimize.startExplicit(command.target);
+			if (!accepted) ctx.ui.notify("Mind is busy, already has a review worker active, or its memory owner is unavailable; no review was accepted.", "warning");
+			else if (command.target !== undefined) ctx.ui.notify(`Mind ${command.target} review requested; bounded inspection and worker admission are preparing in the background.`, "info");
+			else {
+				const targets = deps.autoOptimize.targets?.() ?? ["project", "project-long", "persona"];
+				const scopes = targets.length ? targets.join(", ") : "currently allowed scopes";
+				ctx.ui.notify(`Mind review requested for ${scopes} (currently allowed scopes; at most one bounded inspection window per tier, workers sequentially). Inspection and worker admission are preparing in the background.`, "info");
+			}
 			return;
 		}
 		if (command.type === "optimize-auto") {
@@ -339,7 +345,7 @@ export function parseMindCommand(args: string): MindCommand {
 		}
 		if (parts[1] === "inspect" && parts.length === 2) return { type: "optimize-inspect", target: "project" };
 		if (parts[1] === "inspect" && parts.length === 3 && isOptimizeTarget(parts[2])) return { type: "optimize-inspect", target: parts[2] };
-		if (parts.length === 1) return { type: "optimize-run", target: "project" };
+		if (parts.length === 1 || parts.length === 2 && parts[1] === "all") return { type: "optimize-run" };
 		if (parts.length === 2 && parts[1] === "shared") return { type: "optimize-shared-refused" };
 		if (parts.length === 2 && (parts[1] === "project" || parts[1] === "project-long" || parts[1] === "persona")) {
 			return { type: "optimize-run", target: parts[1] };

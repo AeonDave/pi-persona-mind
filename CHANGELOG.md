@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.8.6](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.8.6) - 2026-10-26
+
+- Allow bare `/mind optimize` and `/mind optimize all` to review one bounded window per currently
+  allowed nonshared tier sequentially; home sessions allow persona only. Named targets remain
+  single-target, and shared remains excluded from LLM review.
+- Report target-local skip reasons and visible batch outcomes. Skips and reviewed no-ops can continue;
+  cancellation, owner changes, and failed, refused, or uncertain work stop later tiers. Prevent
+  overlapping batch work; add regression coverage for these behaviors.
+
 ## [0.8.5](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.8.5) - 2026-10-26
 
 - Add `/mind optimize [project|project-long|persona]` for an immediate, bounded review by a visible Persona-hosted worker using the current session model. Changes pass Mind's validation, provenance and compare-and-swap checks; successful writes retain receipts and support guarded undo.

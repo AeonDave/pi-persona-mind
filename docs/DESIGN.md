@@ -6,6 +6,8 @@ the user workflow is in [README](../README.md). Evidence behind consolidation de
 
 ## Host and module boundaries
 
+This design contract describes release 0.8.6.
+
 Target the latest stable Pi only, currently 1.4.0, and Node >=22.19. All four development Pi packages
 are pinned together; runtime host/typebox packages remain optional wildcard peers. No second host
 runtime or historical hook-shape adapter is bundled. A development-only security override does not
@@ -14,7 +16,7 @@ patch an installed host.
 Mind requires a loaded compatible pi-persona through its versioned local companion handshake.
 Missing/incompatible presence leaves tools inactive and suppresses capture, storage/import,
 injection and reminders. A settings file or installed npm package is not proof of an active
-companion. Mind 0.8.5 requires Persona 1.17.5 or later for these paired contracts. Its optional npm
+companion. Mind 0.8.6 requires Persona 1.17.5 or later for these paired contracts. Its optional npm
 peer declares that requirement without auto-installing or activating another extension.
 
 The node-only core has no Pi imports. The factory wires native Pi hooks, tools, scope, scheduling
@@ -109,7 +111,7 @@ An in-memory session is not advertised as restart-durable.
 
 ## Explicit consolidation
 
-`/mind optimize [project|project-long|persona]` launches one real visible Persona-hosted LLM review pass using the exact session model and existing worker admission, prompt, strict JSON validation, provenance, preview, CAS apply and durable receipt pipeline. It bypasses automatic dirty/token/cooldown/auto-off gates, but honors the one-worker-per-instance and current owner checks. The command returns after scheduler acceptance, before store inspection or worker admission; the toast says the review was requested and is preparing. Completion is handled in the background and displayed as ordinary Mind result cards, without a separate activity row. A pass is bounded to one selected record window; reports state bounded coverage/no-op and never claim whole-store review. Interrupted/stale work cannot apply, emit stale reports or schedule a manual retry. Shared is explicitly refused for LLM review and points to `/mind optimize inspect shared` plus manual review. Read-only inspection is `/mind optimize inspect [target]`; default optimize target remains project.
+Bare `/mind optimize` (and `/mind optimize all`) launches one bounded real Persona-hosted LLM review for each currently allowed nonshared target, sequentially, at most three workers; home allows only persona. A named `/mind optimize project|project-long|persona` remains one target. Each worker uses the exact session model and existing worker admission, prompt, strict JSON validation, provenance, preview, CAS apply and durable receipt pipeline. Explicit requests bypass automatic dirty/token/cooldown/auto-off gates but honor current owner, idle/busy, single-flight and safety checks. The command returns after scheduler acceptance, before store inspection or worker admission; the default toast lists allowed targets and says one bounded window per tier will run sequentially. Completion is displayed as ordinary target-qualified Mind result cards, without a separate activity row. Each tier inspects only one bounded page/window; no-input results show target-local counts, page coverage and a typed reason (invalid input, empty/exhausted page, no safe/owned facts, a single short fact, or insufficient full-record budget), followed by the explicit statement that no worker started and no memory changed. An empty page is not a claim that the whole target is empty. A completed worker returning no operations is a reviewed no-op, not a skipped tier. Skipped tiers and reviewed no-ops allow the batch to continue; cancellation, owner change, failed/refused/uncertain workers or writes stop later tiers. Reports are target-qualified in batch mode. Interrupted/stale work cannot apply, emit stale reports or schedule a manual retry. Shared is explicitly refused for LLM review and points to `/mind optimize inspect shared` plus manual review. Read-only inspection is `/mind optimize inspect [target]`; inspect/history defaults are unchanged.
 
 The manual workflow is inspect → stage exact replacements → apply plan ID. An omitted replacement tag
 list inherits the normalized union from selected sources; an explicit empty list clears tags. Lexical

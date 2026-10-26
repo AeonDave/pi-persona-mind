@@ -15,12 +15,11 @@ export interface AutoOptimizeInput {
 	entries: MemoryEntry[];
 }
 
-export interface AutoInputPage {
-	input?: AutoOptimizeInput;
-	eligibleCount: number;
-	nextRotation: number;
-	pageComplete: boolean;
-}
+export type AutoInputSkipReason = "invalid-input" | "empty-page" | "no-safe-owned-facts" | "single-short-record" | "input-budget";
+
+export type AutoInputPage =
+	| { input: AutoOptimizeInput; eligibleCount: number; nextRotation: number; pageComplete: boolean }
+	| { input?: never; eligibleCount: number; nextRotation: number; pageComplete: boolean; reason: AutoInputSkipReason };
 
 export type AutoProposalResult = { ok: true; operations: OptimizeOperation[] } | { ok: false; reason: string };
 
@@ -52,11 +51,17 @@ export function selectAutoInput(inspection: OptimizeInspection, persona: string,
 
 /** Selects one bounded rotating slice and reports cursor progress even when the page has no work. */
 export function selectAutoInputPage(inspection: OptimizeInspection, persona: string, rotation = 0, newestInspection?: OptimizeInspection): AutoInputPage {
-	const empty = (eligibleCount = 0): AutoInputPage => ({ eligibleCount, nextRotation: 0, pageComplete: true });
+	const empty = (reason: AutoInputSkipReason, eligibleCount = 0): AutoInputPage => ({ eligibleCount, nextRotation: 0, pageComplete: true, reason });
 	if (!isReviewTarget(inspection?.target) || typeof persona !== "string" || persona.length < 1 || persona.length > 128 ||
-		typeof inspection.fingerprint !== "string" || inspection.fingerprint.length < 1 || inspection.fingerprint.length > 256 || !Array.isArray(inspection.entries)) return empty();
+		typeof inspection.fingerprint !== "string" || inspection.fingerprint.length < 1 || inspection.fingerprint.length > 256 || !Array.isArray(inspection.entries) ||
+		!Number.isSafeInteger(inspection.offset) || inspection.offset < 0 || !Number.isSafeInteger(inspection.total) || inspection.total < 0 ||
+		!Number.isSafeInteger(inspection.matched) || inspection.matched < 0) return empty("invalid-input");
 	const eligible = eligibleEntries(inspection, persona);
 	const pageEntries = eligible;
+	if (pageEntries.length === 0) {
+		const hasExcludedRows = inspection.entries.length > 0 || (inspection.total > 0 && inspection.matched === 0);
+		return empty(hasExcludedRows ? "no-safe-owned-facts" : "empty-page");
+	}
 	let newest: MemoryEntry | undefined;
 	if (inspection.offset === 0) newest = pageEntries[0];
 	else if (newestInspection && newestInspection.target === inspection.target && newestInspection.offset === 0 && newestInspection.fingerprint === inspection.fingerprint) {
@@ -86,8 +91,10 @@ export function selectAutoInputPage(inspection: OptimizeInspection, persona: str
 	const start = Number.isSafeInteger(rotation) && rotation > 0 ? Math.min(rotation, ordered.length) : 0;
 	const capacity = Math.max(0, AUTO_OPTIMIZE_MAX_ENTRIES - (newest ? 1 : 0));
 	const window = ordered.slice(start, start + capacity);
+	if (window.length === 0 && !newest) return empty("empty-page", pageEntries.length);
 	const selected: MemoryEntry[] = [];
 	const selectedIds = new Set<string>();
+	let budgetBlocked = false;
 	function tryAdd(entry: MemoryEntry): boolean {
 		if (selectedIds.has(entry.id) || selected.length >= AUTO_OPTIMIZE_MAX_ENTRIES) return false;
 		if (JSON.stringify([...selected, entry]).length > AUTO_OPTIMIZE_MAX_INPUT_CHARS) return false;
@@ -95,19 +102,20 @@ export function selectAutoInputPage(inspection: OptimizeInspection, persona: str
 		selected.push(entry);
 		return true;
 	}
-	if (newest) tryAdd(newest);
+	if (newest && !tryAdd(newest)) budgetBlocked = true;
 	let suppliedFromWindow = 0;
 	for (const entry of window) {
 		// Keep the rotation contiguous: when the next row will not fit alongside the pinned newest
 		// row, leave that row at the cursor for the next admitted pass. Skipping it here would make
 		// the cursor claim coverage for data the worker never received.
-		if (!tryAdd(entry)) break;
+		if (!tryAdd(entry)) { budgetBlocked = true; break; }
 		suppliedFromWindow++;
 	}
 	const admittedPosition = start + suppliedFromWindow;
 	const pageComplete = admittedPosition >= ordered.length;
 	if (selected.length === 0 || (selected.length === 1 && selected[0]!.text.length < MIN_SINGLE_ENTRY_CHARS)) {
-		return { eligibleCount: pageEntries.length, nextRotation: pageComplete ? 0 : admittedPosition, pageComplete };
+		const reason: AutoInputSkipReason = budgetBlocked ? "input-budget" : "single-short-record";
+		return { eligibleCount: pageEntries.length, nextRotation: pageComplete ? 0 : admittedPosition, pageComplete, reason };
 	}
 	const digest = semanticDigest(inspection.target, selected);
 	return { input: { target: inspection.target, fingerprint: inspection.fingerprint, digest, entries: selected }, eligibleCount: pageEntries.length, nextRotation: pageComplete ? 0 : admittedPosition, pageComplete };

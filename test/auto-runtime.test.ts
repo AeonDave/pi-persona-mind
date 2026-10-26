@@ -1,5 +1,6 @@
 /** Actual Pi lifecycle/tool pipeline; only the worker transport is an offline protocol fixture. */
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -137,6 +138,68 @@ test("/mind optimize persona runs through Pi, applies and retains a receipt with
 		assert.match(JSON.stringify(cards(h)), /explicit-offline|receipt/i);
 		assert.equal(h.faux.state.callCount, 0, "slash commands and worker completion never wake the main model");
 	} finally { await h?.dispose(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("native bare optimize skips empty project tiers, reviews seeded persona memory, and keeps undo without activity or wake", { timeout: 20_000 }, async () => {
+	const root = await mkdtemp(join(tmpdir(), "mind-explicit-all-native-"));
+	const previousOptimize = process.env.PI_PERSONA_MIND_OPTIMIZE;
+	process.env.PI_PERSONA_MIND_OPTIMIZE = "off";
+	let h: Harness | undefined;
+	const worker = workerFixture();
+	const activity: unknown[] = [];
+	const owner: ExtensionFactory = (pi) => {
+		pi.events.on("pi-persona:companion:v1", (raw: unknown) => {
+			const request = raw as { respond: (value: unknown) => void };
+			request.respond({ version: 1, provider: "pi-persona", role: "supervisor", capabilities: { memory: 1, activity: 1 } });
+		});
+		pi.events.on("pi-persona:memory-owner:v1", (raw: unknown) => {
+			const request = raw as { sessionId: string; respond: (value: unknown) => void };
+			request.respond({ version: 1, provider: "pi-persona", sessionId: request.sessionId, ready: true, persona: "dev" });
+		});
+	};
+	const observe: ExtensionFactory = (pi) => { pi.events.on("pi-persona:activity:v1", (event: unknown) => activity.push(event)); };
+	try {
+		h = await runtimeHarness(root, entry, [worker.factory, owner, observe], { companion: false });
+		await h.bind();
+		const scope = resolveScope(h.agentDir, h.cwd, { persona: "dev" });
+		const mind = new MindService(scope);
+		for (const text of notes) await mind.remember({ term: "long", kind: "convention", text });
+		assert.equal(existsSync(scope.paths.stm), false, "the empty project short-term store remains absent");
+		assert.equal(existsSync(scope.paths.projectLtm), false, "the empty project-long store remains absent");
+
+		await h.session.prompt("/mind optimize");
+		assert.match(h.notifications.join("\n"), /project, project-long, persona.*bounded.*sequentially/i);
+		await until(() => worker.requests.length === 1, "bare command reaches persona worker after empty project tiers");
+		assert.ok(h.notifications.some((message) => /Mind · Target: project — skipped: empty\/exhausted page; no worker started, no memory changed\./.test(message)), "the collapsed skip toast identifies its target, outcome, and reason");
+		assert.ok(h.notifications.some((message) => /Mind · Target: project-long — skipped: empty\/exhausted page; no worker started, no memory changed\./.test(message)), "every skipped tier has an immediately informative toast");
+		const payload = JSON.parse(worker.requests[0]!.task.split("\n").at(-1)!);
+		assert.equal(payload.target, "persona");
+		assert.equal(payload.entries.length, 2);
+		worker.requests[0]!.finish({ status: "done", ok: true, output: JSON.stringify({ operations: [{ sourceIds: payload.entries.map((entry: { id: string }) => entry.id), kind: "convention", text: replacement }] }), resultRef: "result:bare-persona" });
+		await until(() => JSON.stringify(cards(h!)).includes("Undo: /mind optimize undo"), "persona apply and receipt");
+		assert.ok(h.notifications.some((message) => /Mind · Target: persona — proposal staged; validated apply pending/.test(message)), "proposal toast includes target and the proposal state");
+		assert.ok(h.notifications.some((message) => /Mind · Target: persona — 1 replacement applied/.test(message)), "result toast includes target and the completed outcome");
+		const optimized = JSON.parse(await readFile(scope.paths.ltm, "utf8"));
+		assert.equal(optimized.entries.length, 1);
+		assert.equal(optimized.entries[0].text, replacement);
+		const historyPath = `${scope.paths.ltm}.optimize-history.json`;
+		const history = JSON.parse(await readFile(historyPath, "utf8"));
+		const receiptId = history.entries[0].receiptId as string;
+		assert.match(JSON.stringify(cards(h)), /Undo: \/mind optimize undo .* persona/);
+		assert.equal(worker.requests.length, 1, "there is at most one worker for each tier and empty project tiers start none");
+		assert.deepEqual(activity, [], "the explicit full pass creates no activity lifecycle rows");
+		assert.equal(h.faux.state.callCount, 0, "the slash command and worker result never wake the main model");
+
+		await h.session.prompt(`/mind optimize undo ${receiptId} persona`);
+		const restored = JSON.parse(await readFile(scope.paths.ltm, "utf8"));
+		assert.deepEqual(new Set(restored.entries.map((entry: { text: string }) => entry.text)), new Set(notes));
+		assert.equal(h.faux.state.callCount, 0);
+	} finally {
+		await h?.dispose();
+		if (previousOptimize === undefined) delete process.env.PI_PERSONA_MIND_OPTIMIZE;
+		else process.env.PI_PERSONA_MIND_OPTIMIZE = previousOptimize;
+		await rm(root, { recursive: true, force: true });
+	}
 });
 
 test("native optimizer requires one million main input tokens and a dirty store, then foreground input cancels its worker", { timeout: 20_000 }, async () => {

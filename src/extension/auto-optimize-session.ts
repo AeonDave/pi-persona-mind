@@ -40,7 +40,8 @@ export interface AutoOptimizeSession {
 	memoryAdded(ctx: ExtensionContext, target: AutoOptimizeTarget): void;
 	status(): string;
 	setEnabled(enabled: boolean): void;
-	startExplicit(target: AutoOptimizeTarget): boolean;
+	targets(): readonly AutoOptimizeTarget[];
+	startExplicit(target?: AutoOptimizeTarget): boolean;
 }
 
 export function installAutoOptimize(pi: ExtensionAPI, deps: Dependencies): AutoOptimizeSession {
@@ -115,6 +116,7 @@ export function installAutoOptimize(pi: ExtensionAPI, deps: Dependencies): AutoO
 	return { activate, revoke, memoryAdded,
 		status: () => boundContext ? scheduler.status() : "inactive · automatic work requires an interactive Persona session",
 		setEnabled: (enabled) => scheduler.setEnabled(enabled),
+		targets: () => scheduler.targets(),
 		startExplicit: (target) => scheduler.startExplicit(target),
 	};
 }
