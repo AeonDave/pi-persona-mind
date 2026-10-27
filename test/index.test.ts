@@ -847,9 +847,19 @@ test("a migration warning remains visible after normal status refresh", async ()
 	const notices: string[] = [];
 	const ctx = { ...ctxFor(cwd), ui: { setStatus: (_k: string, value: string) => statuses.push(value), notify: (message: string) => notices.push(message), theme: { fg: (_c: string, s: string) => s } } };
 	createExtension(m.pi, { agentDir });
-	await m.handlers.get("session_start")?.({}, ctx);
-	assert.ok(notices.some((message) => /could not parse|malformed/i.test(message)));
-	assert.match(statuses.at(-1) ?? "", /warning|doctor/i, "normal count refresh does not hide the warning");
+	try {
+		await m.handlers.get("session_start")?.({}, ctx);
+		await waitForCondition("background migration reports the malformed legacy store", () => notices.some((message) => /could not parse|malformed/i.test(message)), 5_000);
+
+		const memory = m.tools.get("memory");
+		assert.ok(memory);
+		const saved = await memory.execute("warning-status-save", { action: "remember", term: "long", kind: "note", text: "status refresh fixture" }, undefined, undefined, ctx);
+		assert.equal(saved.details.ok, true);
+		await m.handlers.get("tool_result")?.({ toolName: "memory", details: saved.details, content: saved.content }, ctx);
+		assert.equal(statuses.at(-1), "mind warning · /mind doctor", "normal count refresh does not hide the migration warning");
+	} finally {
+		await m.handlers.get("session_shutdown")?.({}, ctx);
+	}
 });
 
 test("a direct explicit Italian cue is durably auto-captured before the model runs", async () => {

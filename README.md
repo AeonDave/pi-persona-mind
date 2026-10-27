@@ -1,7 +1,7 @@
 <h1 align="center">pi-persona-mind</h1>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v0.8.6/assets/banner.png" alt="pi-persona-mind — durable memory for Pi">
+  <img src="https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v0.8.7/assets/banner.png" alt="pi-persona-mind — durable memory for Pi">
 </p>
 
 [![CI](https://github.com/AeonDave/pi-persona-mind/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/AeonDave/pi-persona-mind/actions/workflows/test.yml) [![npm version](https://img.shields.io/npm/v/@aeondave/pi-persona-mind?logo=npm)](https://www.npmjs.com/package/@aeondave/pi-persona-mind) [![License](https://img.shields.io/github/license/AeonDave/pi-persona-mind)](LICENSE)

@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+import { assertLiveAutoOutcome } from "./live-auto-outcome.ts";
 
 const [modelRef, engine, parentEntry, mode, mindOverride] = process.argv.slice(2);
 if (!modelRef?.includes("/") || !["inproc", "child"].includes(engine) || !parentEntry || (mode !== undefined && mode !== "--auto" && mode !== "--owner")) {
@@ -183,15 +184,28 @@ export default function(pi) { pi.registerProvider(createFixture().provider); }
 		const result = cards.find((card) => card.title === "Mind automatic result");
 		const noOp = cards.find((card) => card.title === "Mind automatic optimization" && /bounded review found no safe consolidation/.test(card.content));
 		assert.ok(result || noOp, `Expected applied proposal or an explicit conservative no-op: ${JSON.stringify(cards)}`);
-		if (result) assert.ok(cards.some((card) => card.title === "Mind automatic proposal" && /Staged automatic change/.test(card.content)), "before/after proposal must precede automatic application");
+		if (result) {
+			const proposalIndex = cards.findIndex((card) => card.title === "Mind automatic proposal");
+			assert.ok(proposalIndex >= 0 && proposalIndex < cards.indexOf(result), "before/after proposal must precede the application result");
+			const proposal = cards[proposalIndex];
+			assert.match(proposal.content, /Staged proposed change/);
+			assert.match(proposal.content, /"before":/);
+			assert.match(proposal.content, /"after":/);
+		}
 		const after = await ctx.executeTool("memory", { action: "optimize", mode: "inspect", target: "persona", max: 100 });
 		assert.equal(after.isError, false);
-		assert.ok(after.result?.details?.total >= 1 && after.result.details.total <= 2, "safe consolidation preserves at least one fact and cannot add unrelated records");
-		if (noOp) assert.equal(after.result?.details?.fingerprint, before.result.details.fingerprint, "a conservative no-op must leave the exact store unchanged");
+		let receipts = [];
+		if (result) {
+			const history = await ctx.executeTool("memory", { action: "optimize", mode: "history", target: "persona", max: 20 });
+			assert.equal(history.isError, false, `persona optimization history could not be inspected: ${JSON.stringify(history)}`);
+			receipts = history.result?.details?.receipts;
+			assert.ok(Array.isArray(receipts), "persona optimization history must expose its retained receipts");
+		}
+		const outcome = assertLiveAutoOutcome({ cards, before: before.result.details, after: after.result.details, receipts });
 		const diskHistory = await readFile(session.sessionManager.getSessionFile(), "utf8");
 		assert.match(diskHistory, /pi-persona-terminal-result/);
 		assert.match(diskHistory, /Mind automatic (?:result|optimization)/);
-		console.log(JSON.stringify({ status: "PASS", mode: "automatic", providerKind: offline ? "offline-scripted-fixture" : "real-provider", engine, model: report.model, thinkingRequested: report.thinkingRequested, thinkingEffective: report.thinkingEffective, nativeAgentSettled: settled, nativeWorkerView: true, terminalReport: { ref: report.ref, status: report.status, usage: report.usage, body: report.body }, outcome: result ? "applied" : "conservative-no-op", beforeCount: before.result.details.total, afterCount: after.result.details.total, cards, widget: workerWidget }));
+		console.log(JSON.stringify({ status: "PASS", mode: "automatic", providerKind: offline ? "offline-scripted-fixture" : "real-provider", engine, model: report.model, thinkingRequested: report.thinkingRequested, thinkingEffective: report.thinkingEffective, nativeAgentSettled: settled, nativeWorkerView: true, terminalReport: { ref: report.ref, status: report.status, usage: report.usage, body: report.body }, outcome, beforeCount: before.result.details.total, afterCount: after.result.details.total, cards, widget: workerWidget }));
 	} else {
 	await session.prompt("/persona beta");
 	let ctx = session.extensionRunner.createToolContext("live-memory-setup", undefined);

@@ -186,6 +186,25 @@ test("bare explicit review covers every allowed target in sequence, without over
 	assert.ok(f.reports.some((report) => /Target: persona/.test(report.body)));
 });
 
+test("batch malformed worker output names unreviewed tiers and retains safe worker provenance", async () => {
+	const f = fixture({ entriesByTarget: { project: [], "project-long": [makeMemory({ term: "long", kind: "note", text: `This project-long record is intentionally long enough to admit into the bounded optimizer input window and validate malformed JSON refusal without writing anything. ${"More verified project release context. ".repeat(40)}`, persona: "dev" }, 1_000_001)] } });
+	const before = JSON.stringify(f.entriesByTarget);
+	f.scheduler.setEnabled(false);
+	assert.equal(f.scheduler.startExplicit(), true);
+	await until(() => f.launches() === 1, "project-long worker after empty project skip");
+	f.finish({ status: "done", ok: true, output: "not-json-secret-response", resultRef: "result:malformed" });
+	await f.scheduler.join();
+	assert.deepEqual(f.inspected, ["project", "project-long"]);
+	assert.equal(f.launches(), 1, "persona worker is not launched after refusal");
+	assert.equal(f.applied(), 0);
+	assert.equal(JSON.stringify(f.entriesByTarget), before);
+	const card = f.reports.at(-1)?.body ?? "";
+	assert.match(card, /Batch stopped; not reviewed: persona/);
+	assert.match(card, /Worker run · provider\/current · high/);
+	assert.match(card, /result:malformed/);
+	assert.doesNotMatch(card, /not-json-secret-response/);
+});
+
 test("an allowed-target batch skips empty project tiers and still reviews persona while auto is off", async () => {
 	const f = fixture({ entriesByTarget: { project: [], "project-long": [] } });
 	f.scheduler.setEnabled(false);
@@ -333,6 +352,56 @@ test("explicit unexpected preview/apply failures append cautious owner-current t
 		assert.match(terminal, /inspect current memory before retrying/);
 		assert.doesNotMatch(terminal, /memory unchanged/i, "a thrown apply may have committed before rejecting");
 	}
+});
+
+test("optimizer construction failure reports every untouched target without exposing its error", async () => {
+	for (const target of [undefined, "persona"] as const) {
+		const f = fixture();
+		f.owner.optimizer = () => { throw new Error("private optimizer setup details"); };
+		assert.equal(f.scheduler.startExplicit(target), true);
+		await f.scheduler.join();
+		assert.deepEqual(f.inspected, []);
+		assert.equal(f.launches(), 0);
+		assert.equal(f.applied(), 0);
+		assert.equal(f.reports.length, 1);
+		const body = f.reports[0]!.body;
+		assert.match(body, /no worker started, no memory changed/i);
+		assert.match(body, target === undefined ? /Batch stopped; not reviewed: project, project-long, persona\./ : /not reviewed: persona\./);
+		assert.doesNotMatch(body, /private optimizer setup details|apply may have completed/i);
+	}
+});
+
+test("optimizer construction failure cannot report into a revoked owner", async () => {
+	const f = fixture();
+	f.owner.optimizer = () => { f.revoke(); throw new Error("private optimizer setup details"); };
+	assert.equal(f.scheduler.startExplicit(), true);
+	await f.scheduler.join();
+	assert.deepEqual(f.reports, []);
+	assert.deepEqual(f.inspected, []);
+	assert.equal(f.launches(), 0);
+	assert.equal(f.applied(), 0);
+});
+
+test("plan cleanup failure preserves completed batch receipts and releases the single-flight slot", async () => {
+	const f = fixture({ allowedTargets: ["project", "persona"] });
+	const optimizer = f.owner.optimizer();
+	f.owner.optimizer = () => ({ ...optimizer, invalidate: () => { throw new Error("private cleanup details"); } });
+	assert.equal(f.scheduler.startExplicit(), true);
+	await until(() => f.launches() === 1, "first batch worker before apply");
+	f.finish(JSON.stringify({ operations: [{ sourceIds: f.entriesByTarget.project.map((entry) => entry.id), kind: "convention", text: "Validated project replacement." }] }));
+	await until(() => f.launches() === 2, "second batch worker after apply");
+	f.finish('{"operations":[]}');
+	await f.scheduler.join();
+	assert.equal(f.applied(), 1);
+	assert.equal(f.reports.length, 3, "cleanup must not append a false review failure after the proposal and two results");
+	assert.match(f.reports[1]!.body, /1 replacement applied/);
+	assert.match(f.reports[1]!.body, /Undo: \/mind optimize undo auto-receipt project/);
+	assert.match(f.reports[2]!.body, /Target: persona — reviewed no-op/);
+	for (const report of f.reports) assert.doesNotMatch(report.body, /not reviewed|failed unexpectedly|private cleanup details/i);
+	assert.equal(f.scheduler.startExplicit("persona"), true, "discarded optimizer cleanup must not retain the running slot");
+	await until(() => f.launches() === 3, "next explicit worker");
+	f.finish('{"operations":[]}');
+	await f.scheduler.join();
 });
 
 test("explicit older-page snapshot mismatch reports a terminal result", async () => {

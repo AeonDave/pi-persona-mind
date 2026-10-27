@@ -152,18 +152,29 @@ export class AutoOptimizeScheduler {
 		const disabledGeneration = this.disabledGeneration;
 		const current = () => generation === this.generation && (explicit || this.enabled) && this.safeIdle(owner) && this.safeCurrent(owner);
 		const mayRetry = () => !explicit && this.enabled && this.disabledGeneration === disabledGeneration && this.safeCurrent(owner);
-		const optimizer = owner.optimizer();
+		const targets = explicit ? explicitTargets ?? [] : [...this.pending];
+		let optimizer: Optimizer;
+		try { optimizer = owner.optimizer(); } catch (error) {
+			if (!explicit) throw error;
+			if (!current()) return;
+			this.last = "optimizer setup failed; no worker started, no memory changed";
+			const body = `${qualifyTargets ? "Batch stopped; not reviewed" : "Target not reviewed"}: ${targets.join(", ")}.\nBounded review could not start: ${this.last}. See /mind doctor.`;
+			try { owner.report(qualifyTargets ? `Mind optimization result — ${targets[0]}` : "Mind optimization result", body); } catch { /* owner reporting is best-effort */ }
+			return;
+		}
 		const running: NonNullable<AutoOptimizeScheduler["running"]> = { optimizer, explicit };
 		let attemptRecorded = false;
 		let unsettledTarget: Target | undefined;
 		let nextCursor: CoverageCursor | undefined;
 		let retryRequiresSettled = false;
 		let activeTarget: Target | undefined;
-		const targets = explicit ? explicitTargets ?? [] : [...this.pending];
-		const report = (target: Target, title: string, body: string, summary?: string): boolean => {
+		const report = (target: Target, title: string, body: string, summary?: string, stopped = false): boolean => {
 			if (!current()) return false;
+			const remaining = stopped && qualifyTargets ? targets.slice(targets.indexOf(target) + 1) : [];
+			const stoppedLine = remaining.length ? `Batch stopped; not reviewed: ${remaining.join(", ")}.\n` : "";
+			const outcome = `${summary ?? body.split("\n", 1)[0] ?? "review result"}${remaining.length ? ` · not reviewed: ${remaining.join(", ")}` : ""}`;
 			const qualifiedBody = qualifyTargets && !body.startsWith("Target:")
-				? `Target: ${target} — ${summary ?? body.split("\n", 1)[0] ?? "review result"}\n${body}`
+				? `Target: ${target} — ${outcome}\n${stoppedLine}${body}`
 				: body;
 			owner.report(qualifyTargets ? `${title} — ${target}` : title, qualifiedBody);
 			return true;
@@ -189,7 +200,7 @@ export class AutoOptimizeScheduler {
 						else {
 							if (mayRetry()) this.pending.add(target);
 							this.last = explicit ? "store changed during bounded inspection; the selected window was not reviewed" : "store changed during bounded inspection; waiting for the next settled event";
-							if (explicit) report(target, "Mind optimization result", `Bounded review stopped before worker admission: ${this.last}.`, "inspection snapshot changed; no worker started");
+							if (explicit) report(target, "Mind optimization result", `Bounded review stopped before worker admission: ${this.last}.`, "inspection snapshot changed; no worker started", true);
 							return;
 						}
 					}
@@ -199,7 +210,7 @@ export class AutoOptimizeScheduler {
 						return;
 					}
 					this.last = "store inspection failed; see /mind doctor";
-					if (explicit) report(target, "Mind optimization result", `Bounded review could not inspect this record window: ${this.last}.`, "inspection failed; no worker started");
+					if (explicit) report(target, "Mind optimization result", `Bounded review could not inspect this record window: ${this.last}.`, "inspection failed; no worker started", true);
 					if (explicit) return;
 					continue;
 				}
@@ -211,13 +222,13 @@ export class AutoOptimizeScheduler {
 				}
 				if (!inspection.ok) {
 					this.last = "store inspection refused; see /mind doctor";
-					if (explicit) report(target, "Mind optimization result", `Bounded review stopped before worker admission: ${this.last}.`, "inspection refused; no worker started");
+					if (explicit) report(target, "Mind optimization result", `Bounded review stopped before worker admission: ${this.last}.`, "inspection refused; no worker started", true);
 					if (explicit) return;
 					continue;
 				}
 				if (inspection.target !== target) {
 					this.last = "store inspection returned a different tier; no worker started";
-					if (explicit) report(target, "Mind optimization result", `Bounded review stopped before worker admission: ${this.last}.`, "inspection returned the wrong target; no worker started");
+					if (explicit) report(target, "Mind optimization result", `Bounded review stopped before worker admission: ${this.last}.`, "inspection returned the wrong target; no worker started", true);
 					if (explicit) return;
 					continue;
 				}
@@ -244,7 +255,7 @@ export class AutoOptimizeScheduler {
 				if (!worker.ok) {
 					if (!explicit) this.pending.add(target);
 					this.last = worker.reason;
-					if (explicit) report(target, "Mind optimization result", `Bounded review was not admitted: ${worker.reason}. No memory changed.`, "worker admission refused; no memory changed");
+					if (explicit) report(target, "Mind optimization result", `Bounded review was not admitted: ${worker.reason}. No memory changed.`, "worker admission refused; no memory changed", true);
 					return;
 				}
 				const attemptAt = this.now();
@@ -279,21 +290,21 @@ export class AutoOptimizeScheduler {
 					}
 					unsettledTarget = undefined;
 					this.last = explicit ? "explicit review stopped; memory unchanged" : "review interrupted; waiting for the next settled event";
-					if (explicit) report(target, "Mind optimization result", this.last, "worker stopped; memory unchanged");
+					if (explicit) report(target, "Mind optimization result", this.last, "worker stopped; memory unchanged", true);
 					return;
 				}
+				const provenance = `Worker ${worker.runId} · ${worker.model} · ${worker.thinking}${result.resultRef ? `\nTerminal report: ${result.resultRef}` : ""}`;
 				if (!result.ok) {
 					settle(); this.last = "worker failed; memory unchanged";
-					report(target, explicit ? "Mind optimization result" : "Mind automatic optimization", `Bounded review · ${this.last}${result.error ? `: ${result.error}` : ""}`, "worker failed; memory unchanged");
+					report(target, explicit ? "Mind optimization result" : "Mind automatic optimization", `Bounded review · ${this.last}${result.error ? `: ${result.error}` : ""}\n${provenance}`, "worker failed; memory unchanged", explicit);
 					return;
 				}
 				const parsed = parseAutoProposal(result.output, input);
 				if (!parsed.ok) {
 					settle(); this.last = "proposal refused; memory unchanged";
-					report(target, explicit ? "Mind optimization result" : "Mind automatic optimization", `Bounded review · ${this.last}: ${parsed.reason}`, "proposal refused; memory unchanged");
+					report(target, explicit ? "Mind optimization result" : "Mind automatic optimization", `Bounded review · ${this.last}: ${parsed.reason}\n${provenance}`, "proposal refused; memory unchanged", explicit);
 					return;
 				}
-				const provenance = `Worker ${worker.runId} · ${worker.model} · ${worker.thinking}${result.resultRef ? `\nTerminal report: ${result.resultRef}` : ""}`;
 				if (!parsed.operations.length) {
 					settle(); this.last = "bounded review found no safe consolidation in this record set";
 					report(target, explicit ? "Mind optimization result" : "Mind automatic optimization", `Bounded coverage: one selected record window; ${this.last}.\n${provenance}`, "reviewed no-op; no safe consolidation in this window");
@@ -305,11 +316,11 @@ export class AutoOptimizeScheduler {
 				if (!current()) return;
 				if (!plan.ok) {
 					settle(); this.last = "store or proposal changed; nothing applied";
-					report(target, explicit ? "Mind optimization result" : "Mind automatic optimization", `Bounded coverage: one selected record window; ${this.last}: ${plan.reason}\n${provenance}`, "proposal refused or stale; nothing applied");
+					report(target, explicit ? "Mind optimization result" : "Mind automatic optimization", `Bounded coverage: one selected record window; ${this.last}: ${plan.reason}\n${provenance}`, "proposal refused or stale; nothing applied", explicit);
 					return;
 				}
 				if (!report(target, explicit ? "Mind optimization proposal" : "Mind automatic proposal", `${provenance}\n${formatAutoPlan(plan)}\n${explicit ? "Validated apply pending" : "Automatic apply pending"}; it proceeds only while this owner and snapshot remain current.`, "proposal staged; validated apply pending")) return;
-				if (!current()) { optimizer.invalidate(); return; }
+				if (!current()) return;
 				const applied = await optimizer.apply(plan.planId);
 				if (!current()) return;
 				settle();
@@ -321,15 +332,15 @@ export class AutoOptimizeScheduler {
 				const resultSummary = applied.ok
 					? `${applied.changed} replacement${applied.changed === 1 ? "" : "s"} applied${applied.warning ? "; receipt finalization warning" : ""}`
 					: `not applied: ${applied.reason}`;
-				if (!report(target, explicit ? "Mind optimization result" : "Mind automatic result", `Bounded coverage: one selected record window; ${this.last}\n${provenance}${receipt}${warning}`, resultSummary)) return;
+				if (!report(target, explicit ? "Mind optimization result" : "Mind automatic result", `Bounded coverage: one selected record window; ${this.last}\n${provenance}${receipt}${warning}`, resultSummary, explicit && (!applied.ok || Boolean(applied.warning)))) return;
 				if (!applied.ok || applied.warning || !explicit) return;
 			}
 		} catch (error) {
 			if (!explicit) throw error;
 			this.last = "explicit review failed unexpectedly; inspect current memory before retrying because apply may have completed";
-			if (activeTarget && current()) report(activeTarget, "Mind optimization result", `Bounded review failed unexpectedly; ${this.last}.`, "review failed unexpectedly; inspect current memory before retrying");
+			if (activeTarget && current()) report(activeTarget, "Mind optimization result", `Bounded review failed unexpectedly; ${this.last}.`, "review failed unexpectedly; inspect current memory before retrying", true);
 		} finally {
-			optimizer.invalidate();
+			try { optimizer.invalidate(); } catch { /* Run-local plan cleanup cannot change completed review/apply results. */ }
 			if (this.running === running) this.running = undefined;
 			if (unsettledTarget !== undefined && !current() && mayRetry()) {
 				this.pending.add(unsettledTarget);

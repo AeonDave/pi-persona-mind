@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.8.7](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.8.7) - 2026-10-27
+
+- Interrupted explicit optimization batches identify the tiers not yet reviewed. Worker failures
+  and invalid proposals retain the worker's model/effort and terminal-report reference without
+  echoing malformed model output. Invalid proposals never reach application.
+- Setup failures report that no tier was reviewed; cleanup failures cannot overwrite completed
+  results or retain the active-work slot. Migration-warning tests wait for background completion,
+  and the live smoke checks proposal order, confirmed application counts and durable undo receipts;
+  refused or uncertain writes cannot pass as successful application.
+
 ## [0.8.6](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.8.6) - 2026-10-26
 
 - Allow bare `/mind optimize` and `/mind optimize all` to review one bounded window per currently
