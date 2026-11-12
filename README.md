@@ -49,7 +49,10 @@ Backlog items are project-scoped and expire after 48 hours by default. Promotion
 durable project memory; choose `persona` or `shared` explicitly when broader scope is intended. Every
 long-term `remember` requires `scope=project|persona|shared`: project is for stable repository facts,
 persona is for intent across all projects of that persona, and shared is only for intent across personas.
-Short-term memory defaults to project; `kind: objective` never changes the requested lifetime.
+The LLM chooses lifetime and scope from meaning and context; users do not have to name API scopes,
+say a literal “global”, or approve each save. Genuinely cross-project preferences still belong in
+persona/shared memory. A model or strategy name alone never decides scope. Short-term memory defaults
+to project; `kind: objective` never changes the requested lifetime.
 
 AUTO capture of strong direct-user cues writes only native active-branch session notes, including when
 the wording says “remember” or “from now on” or asks for durable retention. It makes no external/durable
@@ -79,6 +82,16 @@ Batch review excludes `shared`. Skipped targets report why no worker started; a 
 mean the entire tier is empty. Cancellation, owner changes, or failed, refused, or uncertain work
 stop later tiers. Successful changes can be reviewed and undone with the corresponding history and
 undo commands. Optimization uses a visible Persona-hosted worker on the current session model.
+
+Automatic maintenance consolidates multiple compatible sources; it does not apply single-record
+rewrites. A real change shows one brief note with expandable details and undo provenance. Its full
+proposal audit is retained without a second large card; no-op reviews are silent. Important warnings
+stay visible, and explicit/manual operations keep their detailed reports. This is a conservative
+eligibility policy, not a guarantee that every model-generated merge is semantically correct.
+
+Already-open Pi sessions can keep the previous implementation in memory. Use `/mind optimize auto off`
+there until a native `/reload` or restart loads the updated extensions; `/persona reload` alone is not
+a code reload. Existing stored memories are not automatically rolled back or reclassified.
 
 ## Memory tools
 

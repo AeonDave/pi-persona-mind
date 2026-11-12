@@ -193,8 +193,20 @@ test("task prompt bounds the full records and states the conservative read-only 
 	assert.match(AUTO_OPTIMIZE_SYSTEM_PROMPT, /preserve.*exception/i);
 	assert.match(AUTO_OPTIMIZE_SYSTEM_PROMPT, /Return exactly one JSON object/i);
 	assert.match(AUTO_OPTIMIZE_SYSTEM_PROMPT, /You have no tools/);
-	assert.ok(prompt.startsWith(`${AUTO_OPTIMIZE_SYSTEM_PROMPT}\n\n`), "the fixed reviewer policy is included in the actual task sent to the worker");
+	assert.ok(prompt.startsWith(`${AUTO_OPTIMIZE_SYSTEM_PROMPT}\n`), "the fixed reviewer policy is included in the actual task sent to the worker");
+	assert.match(prompt, /at least two supplied source IDs/);
+	assert.match(prompt, /Leave contradictions separate/);
+	const explicit = buildAutoPrompt(input, "explicit");
+	assert.match(explicit, /correction is allowed only when supplied source content explicitly states/);
+	assert.doesNotMatch(explicit, /at least two supplied source IDs/);
 	assert.ok(prompt.includes(JSON.stringify(input.entries)), "the serialized source records are included whole");
+});
+
+test("owned STM objectives are eligible inputs and valid matching proposal kinds", () => {
+	const a = makeMemory({ term: "short", kind: "objective", text: "first goal", persona: "alpha" }, NOW);
+	const b = makeMemory({ term: "short", kind: "objective", text: "second goal", persona: "alpha" }, NOW);
+	const input = selectAutoInput(inspect("project", [a, b]), "alpha"); assert.ok(input);
+	assert.equal(parseAutoProposal(JSON.stringify({ operations: [{ sourceIds: [a.id, b.id], kind: "objective", text: "combined goals" }] }), input).ok, true);
 });
 
 test("strict proposal parser accepts an empty result and an exact bounded operation", () => {
@@ -227,7 +239,7 @@ test("strict proposal parser rejects wrappers, extra keys, unknown or mixed-kind
 		JSON.stringify({ operations: [{ sourceIds: Array.from({ length: 13 }, (_, i) => `unknown-${i}`), kind: "note", text: "too many" }] }),
 		JSON.stringify({ operations: [{ sourceIds: [a.id], kind: "note", text: "" }] }),
 		JSON.stringify({ operations: [{ sourceIds: [a.id], kind: "note", text: "x".repeat(8_193) }] }),
-		JSON.stringify({ operations: [{ sourceIds: [a.id], kind: "objective", text: "project objective is forbidden" }] }),
+		JSON.stringify({ operations: [{ sourceIds: [a.id], kind: "objective", text: "replacement kind mismatch" }] }),
 		JSON.stringify({ operations: Array.from({ length: 5 }, (_, i) => ({ sourceIds: [a.id], kind: "note", text: `rewrite ${i}` })) }),
 		`${JSON.stringify({ operations: [] })} trailing text`,
 		`${" ".repeat(48_001)}`,

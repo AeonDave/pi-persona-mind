@@ -3,7 +3,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { MindService } from "../core/service.ts";
 import type { Scope } from "../core/scope.ts";
 import type { AutoOptimizeTarget } from "../core/auto-optimize.ts";
-import { AUTO_ATTEMPT_ENTRY, AutoOptimizeScheduler, type AutoAttempt } from "./auto-optimize.ts";
+import { AUTO_ATTEMPT_ENTRY, AutoOptimizeScheduler, type AutoAttempt, type AutoOptimizeReportContext } from "./auto-optimize.ts";
 import { launchMindWorker } from "./mind-worker.ts";
 import { MIND_RESULT_ENTRY_TYPE } from "../ui/mind-result-card.ts";
 
@@ -80,9 +80,17 @@ export function installAutoOptimize(pi: ExtensionAPI, deps: Dependencies): AutoO
 			optimizer: () => deps.mind(ctx).createOptimizer(),
 			launch: (task: string) => launchMindWorker(pi, ctx.sessionManager.getSessionId(), deps.persona(ctx), task),
 			recordAttempt: (attempt: AutoAttempt) => { if (!current()) throw new Error("automatic memory owner changed"); pi.appendEntry(AUTO_ATTEMPT_ENTRY, { version: 1, owner: key, ...attempt }); },
-			report: (title: string, body: string) => {
+			report: (title: string, body: string, reportContext?: AutoOptimizeReportContext) => {
 				if (!current()) throw new Error("automatic memory owner changed");
-				pi.appendEntry(MIND_RESULT_ENTRY_TYPE, { title, content: body });
+				if (reportContext?.automatic && reportContext.phase === "proposal") {
+					pi.appendEntry("pi-persona-mind-auto-proposal", { title, content: body });
+					return;
+				}
+				pi.appendEntry(MIND_RESULT_ENTRY_TYPE, { title, content: body, ...(reportContext?.automatic ? { reportContext } : {}) });
+				if (reportContext?.automatic) {
+					if (reportContext.attention) ctx.ui.notify(`Mind · ${reportContext.target} review needs attention`, "warning");
+					return;
+				}
 				if (title !== "Mind automatic proposal") {
 					const target = / — (project(?:-long)?|persona)$/.exec(title)?.[1];
 					const kind = title.includes("proposal") ? "proposal" : "review";

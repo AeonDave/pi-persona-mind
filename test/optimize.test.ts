@@ -80,6 +80,20 @@ function fact(text: string, extra: Partial<MemoryEntry> = {}): MemoryEntry {
 	return { ...makeMemory({ term: "short", kind: "note", text, persona: "elite", source: "user request", ttlHours: 24 }, T), ...extra };
 }
 
+test("owned short objectives consolidate in STM with earliest expiry and provenance", async () => fixture(async ({ optimizer, project, persona }) => {
+	const a = makeMemory({ term: "short", kind: "objective", text: "first goal", persona: "elite", source: "first", ttlHours: 2 }, T);
+	const b = makeMemory({ term: "short", kind: "objective", text: "second goal", persona: "elite", source: "second", ttlHours: 4 }, T);
+	await project.update(() => [a, b]);
+	const snapshot = await optimizer.inspect("project"); assert.ok(snapshot.ok);
+	const plan = await optimizer.preview({ target: "project", fingerprint: snapshot.fingerprint, operations: [{ sourceIds: [a.id, b.id], kind: "objective", text: "combined goals" }] });
+	assert.ok(plan.ok); const after = plan.changes[0]!.after;
+	assert.equal(after.expiresAt, a.expiresAt); assert.equal(after.persona, "elite");
+	assert.deepEqual(new Set(after.derivedFrom), new Set([a.id, b.id])); assert.match(after.source!, /first/); assert.match(after.source!, /second/);
+	assert.ok((await optimizer.apply(plan.planId)).ok);
+	assert.equal((await project.load()).entries[0]!.expiresAt, a.expiresAt);
+	assert.equal((await persona.load()).entries.length, 0, "no LTM write");
+}));
+
 test("project-long consolidation stays durable, supports objectives and rejects foreign ownership", async () => fixture(async ({ optimizer, persona }) => {
 	const own = makeMemory({ term: "long", kind: "objective", text: "durable project objective", persona: "elite" }, T);
 	const foreign = makeMemory({ term: "long", kind: "note", text: "another owner's project knowledge", persona: "other" }, T);

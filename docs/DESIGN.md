@@ -162,7 +162,11 @@ discarded; unresolved IO failures can require manual recovery. This is consolida
 not rollback of arbitrary user edits or a claim of semantic correctness.
 
 These are authorization mechanics, not truth verification: an explicit memory tool call has the same
-mutation authority as existing remember/forget. The runtime does not silently invent operator approval.
+mutation authority as existing remember/forget. The LLM chooses the destination by meaning and context;
+users need not provide API scope names or a literal “global” keyword, and no new per-save confirmation
+loop is imposed. Truly portable preferences remain eligible for persona/shared memory. Background
+review eligibility does not restrict ordinary model-facing saves, updates or staged curation. The
+runtime does not silently invent operator approval.
 The full proposal is reviewable before application; no additional mandatory confirmation loop is added.
 
 ## Automatic semantic review
@@ -197,12 +201,26 @@ rotates bounded windows within a page and across older pages. Progress is sessio
 advances only for completed reviews or explicitly ineligible/already-reviewed sets; cancelled work
 does not count as reviewed. Byte-excluded records remain eligible on later passes. Coverage requires
 further admitted triggers, never an unbounded autonomous sweep. Its output is strict JSON with at most four replacement
-operations and at most 12 source IDs per operation, never direct storage writes. The parent rejects malformed, unsafe,
-unattributed, stale or foreign-owner changes and applies accepted replacements through the existing
-plan/CAS boundary. STM expiry cannot be extended, unrelated rows survive, and semantic deletion by age
-is not introduced. The before/after proposal is recorded in a durable operator card before applying;
-no semantic-quality guarantee or
-invented token savings follows from successful execution.
+operations and at most 12 source IDs per operation, never direct storage writes. Automatic application
+requires at least two compatible supplied source IDs in every operation. A proposal containing a
+single-record rewrite is not staged or applied automatically; the completed attempt is settled without
+an automatic retry loop. Single-record correction remains available through explicit workflows. A
+selected automatic window with no same-kind pair starts no worker and consumes no actual-attempt
+allowance. A merge count alone still does not establish semantic truth; conflicting conclusions must
+not be adjudicated by the background reviewer.
+
+The parent rejects malformed, unsafe, unattributed, stale or foreign-owner changes and applies accepted
+replacements through the existing plan/CAS boundary. Kind does not change lifetime: consolidating
+owned short-term objectives stays in project STM and preserves the earliest expiry. Unrelated rows
+survive, and semantic deletion by age is not introduced.
+
+Before apply, the complete automatic proposal is appended to an unrendered native audit entry; append
+failure still prevents application. Durable store before images and guarded undo remain unchanged.
+An actual automatic change produces one small expandable result note without a duplicate info toast.
+Automatic no-ops settle silently while retaining attempt/digest/status evidence. Failures, refusals and
+uncertain receipt finalization remain visible with an important warning. Explicit/manual reports keep
+their detailed cards. Expansion and history preserve worker/model/effort, result reference and undo
+provenance. No semantic-quality guarantee or invented token savings follows from execution.
 
 ## Durable files and recovery
 

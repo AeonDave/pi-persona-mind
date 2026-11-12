@@ -12,6 +12,13 @@ type Target = AutoOptimizeTarget;
 type Optimizer = Pick<MemoryOptimizer, "inspect" | "preview" | "apply" | "invalidate">;
 interface CoverageCursor { offset: number; withinPage: number }
 export interface AutoAttempt { digest: string; at: number; state: "started" | "settled"; target?: Target }
+export interface AutoOptimizeReportContext {
+	automatic: boolean;
+	target: Target;
+	phase: "proposal" | "result";
+	summary: string;
+	attention: boolean;
+}
 export interface AutoOptimizeOwner {
 	key: string; persona: string;
 	allowedTargets: readonly Target[];
@@ -19,7 +26,7 @@ export interface AutoOptimizeOwner {
 	optimizer(): Optimizer;
 	launch(task: string): MindWorkerAdmission;
 	/** Must persist the proposal successfully before application is allowed. */
-	report(title: string, body: string): void;
+	report(title: string, body: string, context?: AutoOptimizeReportContext): void;
 	recordAttempt(attempt: AutoAttempt): void;
 	attempts: AutoAttempt[];
 }
@@ -32,6 +39,7 @@ export class AutoOptimizeScheduler {
 	private enabled = true;
 	private pending = new Set<Target>();
 	private retryTargets = new Set<Target>();
+	private retryAttempts = new Map<Target, { digest: string; at: number }>();
 	private cursors = new Map<Target, CoverageCursor>();
 	private inputTokens = 0;
 	private seen = new Set<string>();
@@ -59,12 +67,13 @@ export class AutoOptimizeScheduler {
 				if (attempt.state === "started" && !settledDigests.has(attempt.digest) && attempt.target && owner.allowedTargets.includes(attempt.target)) {
 					this.pending.add(attempt.target);
 					this.retryTargets.add(attempt.target);
+					this.retryAttempts.set(attempt.target, { digest: attempt.digest, at: attempt.at });
 				}
 			}
 		}
 		this.last = this.retryTargets.size ? "interrupted review pending" : "waiting for new memory";
 	}
-	stop(): void { this.interrupt(); this.owner = undefined; this.pending.clear(); this.retryTargets.clear(); this.cursors.clear(); this.inputTokens = 0; this.seen.clear(); this.lastAttempt = -Infinity; }
+	stop(): void { this.interrupt(); this.owner = undefined; this.pending.clear(); this.retryTargets.clear(); this.retryAttempts.clear(); this.cursors.clear(); this.inputTokens = 0; this.seen.clear(); this.lastAttempt = -Infinity; }
 	interrupt(): void {
 		this.timer?.(); this.timer = undefined; this.timerGeneration++; this.generation++;
 		if (this.enabled && !this.running?.explicit && this.running?.retryTarget) {
@@ -81,6 +90,7 @@ export class AutoOptimizeScheduler {
 			this.interrupt();
 			this.pending.clear();
 			this.retryTargets.clear();
+			this.retryAttempts.clear();
 			this.last = "automatic review disabled";
 		}
 		else {
@@ -145,6 +155,11 @@ export class AutoOptimizeScheduler {
 			this.seen.add(digest); while (this.seen.size > 64) this.seen.delete(this.seen.values().next().value!);
 		}
 	}
+	private settleSkippedRetry(owner: AutoOptimizeOwner, target: Target): void {
+		const attempt = this.retryTargets.has(target) ? this.retryAttempts.get(target) : undefined;
+		if (attempt) this.remember(owner, target, attempt.digest, "settled", attempt.at);
+		this.retryAttempts.delete(target);
+	}
 	private async run(explicitTargets?: readonly Target[], explicit = false, qualifyTargets = false): Promise<void> {
 		const owner = this.owner;
 		if (!owner || (!explicit && !this.enabled) || !this.safeCurrent(owner) || !this.safeIdle(owner) || this.running) return;
@@ -168,7 +183,7 @@ export class AutoOptimizeScheduler {
 		let nextCursor: CoverageCursor | undefined;
 		let retryRequiresSettled = false;
 		let activeTarget: Target | undefined;
-		const report = (target: Target, title: string, body: string, summary?: string, stopped = false): boolean => {
+		const report = (target: Target, title: string, body: string, summary?: string, stopped = false, attention = stopped): boolean => {
 			if (!current()) return false;
 			const remaining = stopped && qualifyTargets ? targets.slice(targets.indexOf(target) + 1) : [];
 			const stoppedLine = remaining.length ? `Batch stopped; not reviewed: ${remaining.join(", ")}.\n` : "";
@@ -176,7 +191,9 @@ export class AutoOptimizeScheduler {
 			const qualifiedBody = qualifyTargets && !body.startsWith("Target:")
 				? `Target: ${target} — ${outcome}\n${stoppedLine}${body}`
 				: body;
-			owner.report(qualifyTargets ? `${title} — ${target}` : title, qualifiedBody);
+			owner.report(qualifyTargets ? `${title} — ${target}` : title, qualifiedBody, {
+				automatic: !explicit, target, phase: title.endsWith("proposal") ? "proposal" : "result", summary: outcome, attention,
+			});
 			return true;
 		};
 		this.running = running;
@@ -238,6 +255,7 @@ export class AutoOptimizeScheduler {
 					: { offset: cursor.offset, withinPage: page.nextRotation };
 				const input = page.input;
 				if (!input) {
+					if (!explicit) this.settleSkippedRetry(owner, target);
 					this.cursors.set(target, nextCursor);
 					this.retryTargets.delete(target);
 					this.last = "no eligible records in this bounded page";
@@ -245,13 +263,23 @@ export class AutoOptimizeScheduler {
 					continue;
 				}
 				if (!explicit && this.seen.has(input.digest)) {
+					this.settleSkippedRetry(owner, target);
 					this.cursors.set(target, nextCursor);
 					this.retryTargets.delete(target);
 					this.last = "this bounded record set was already reviewed";
 					continue;
 				}
+				if (!explicit && !input.entries.some((entry, index) => input.entries.some((other, otherIndex) => otherIndex !== index && other.kind === entry.kind && other.persona === entry.persona))) {
+					this.settleSkippedRetry(owner, target);
+					this.seen.add(input.digest);
+					while (this.seen.size > 64) this.seen.delete(this.seen.values().next().value!);
+					this.cursors.set(target, nextCursor);
+					this.retryTargets.delete(target);
+					this.last = "no eligible same-kind pair in this bounded page";
+					continue;
+				}
 				if (!current()) return;
-				const worker = owner.launch(buildAutoPrompt(input));
+				const worker = owner.launch(buildAutoPrompt(input, explicit ? "explicit" : "automatic"));
 				if (!worker.ok) {
 					if (!explicit) this.pending.add(target);
 					this.last = worker.reason;
@@ -268,11 +296,13 @@ export class AutoOptimizeScheduler {
 				const settle = (): void => {
 					if (!explicit) this.remember(owner, target, input.digest, "settled", attemptAt);
 					if (nextCursor) this.cursors.set(target, nextCursor);
+					this.retryAttempts.delete(target);
 					unsettledTarget = undefined;
 				};
 				try {
 					if (!explicit) {
 						this.remember(owner, target, input.digest, "started", attemptAt);
+						this.retryAttempts.set(target, { digest: input.digest, at: attemptAt });
 						attemptRecorded = true;
 					}
 				} catch {
@@ -296,27 +326,31 @@ export class AutoOptimizeScheduler {
 				const provenance = `Worker ${worker.runId} · ${worker.model} · ${worker.thinking}${result.resultRef ? `\nTerminal report: ${result.resultRef}` : ""}`;
 				if (!result.ok) {
 					settle(); this.last = "worker failed; memory unchanged";
-					report(target, explicit ? "Mind optimization result" : "Mind automatic optimization", `Bounded review · ${this.last}${result.error ? `: ${result.error}` : ""}\n${provenance}`, "worker failed; memory unchanged", explicit);
+					report(target, explicit ? "Mind optimization result" : "Mind automatic optimization", `Bounded review · ${this.last}${result.error ? `: ${result.error}` : ""}\n${provenance}`, "worker failed; memory unchanged", explicit, true);
 					return;
 				}
 				const parsed = parseAutoProposal(result.output, input);
 				if (!parsed.ok) {
 					settle(); this.last = "proposal refused; memory unchanged";
-					report(target, explicit ? "Mind optimization result" : "Mind automatic optimization", `Bounded review · ${this.last}: ${parsed.reason}\n${provenance}`, "proposal refused; memory unchanged", explicit);
+					report(target, explicit ? "Mind optimization result" : "Mind automatic optimization", `Bounded review · ${this.last}: ${parsed.reason}\n${provenance}`, "proposal refused; memory unchanged", explicit, true);
 					return;
 				}
 				if (!parsed.operations.length) {
 					settle(); this.last = "bounded review found no safe consolidation in this record set";
-					report(target, explicit ? "Mind optimization result" : "Mind automatic optimization", `Bounded coverage: one selected record window; ${this.last}.\n${provenance}`, "reviewed no-op; no safe consolidation in this window");
+					if (explicit) report(target, "Mind optimization result", `Bounded coverage: one selected record window; ${this.last}.\n${provenance}`, "reviewed no-op; no safe consolidation in this window");
 					if (!explicit) return;
 					continue;
+				}
+				if (!explicit && parsed.operations.some((operation) => operation.sourceIds.length < 2)) {
+					settle(); this.last = "proposal ineligible for automatic consolidation; memory unchanged";
+					return;
 				}
 				if (!current()) return;
 				const plan = await optimizer.preview({ target: input.target, fingerprint: input.fingerprint, operations: parsed.operations });
 				if (!current()) return;
 				if (!plan.ok) {
 					settle(); this.last = "store or proposal changed; nothing applied";
-					report(target, explicit ? "Mind optimization result" : "Mind automatic optimization", `Bounded coverage: one selected record window; ${this.last}: ${plan.reason}\n${provenance}`, "proposal refused or stale; nothing applied", explicit);
+					report(target, explicit ? "Mind optimization result" : "Mind automatic optimization", `Bounded coverage: one selected record window; ${this.last}: ${plan.reason}\n${provenance}`, "proposal refused or stale; nothing applied", explicit, true);
 					return;
 				}
 				if (!report(target, explicit ? "Mind optimization proposal" : "Mind automatic proposal", `${provenance}\n${formatAutoPlan(plan)}\n${explicit ? "Validated apply pending" : "Automatic apply pending"}; it proceeds only while this owner and snapshot remain current.`, "proposal staged; validated apply pending")) return;
@@ -329,14 +363,21 @@ export class AutoOptimizeScheduler {
 					? applied.receiptId ? `\nUndo: /mind optimize undo ${applied.receiptId} ${applied.target}.` : "\nNo durable undo receipt was returned."
 					: "";
 				const warning = applied.ok && applied.warning ? `\nWarning: ${applied.warning}` : "";
+				const needsAttention = !applied.ok || Boolean(applied.warning) || (applied.ok && !applied.receiptId);
 				const resultSummary = applied.ok
-					? `${applied.changed} replacement${applied.changed === 1 ? "" : "s"} applied${applied.warning ? "; receipt finalization warning" : ""}`
+					? `${applied.changed} replacement${applied.changed === 1 ? "" : "s"} applied${applied.warning ? "; receipt finalization warning" : !applied.receiptId && !explicit ? "; receipt warning" : ""}`
 					: `not applied: ${applied.reason}`;
-				if (!report(target, explicit ? "Mind optimization result" : "Mind automatic result", `Bounded coverage: one selected record window; ${this.last}\n${provenance}${receipt}${warning}`, resultSummary, explicit && (!applied.ok || Boolean(applied.warning)))) return;
+				if (!report(target, explicit ? "Mind optimization result" : "Mind automatic result", `Bounded coverage: one selected record window; ${this.last}\n${provenance}${receipt}${warning}`, resultSummary, explicit && (!applied.ok || Boolean(applied.warning)), needsAttention)) return;
 				if (!applied.ok || applied.warning || !explicit) return;
 			}
 		} catch (error) {
-			if (!explicit) throw error;
+			if (!explicit) {
+				this.last = "automatic review failed unexpectedly; inspect current memory before retrying because apply may have completed";
+				if (activeTarget && current()) {
+					try { report(activeTarget, "Mind automatic result", this.last, "review failed; inspect memory before retrying", false, true); } catch { /* reporting can itself fail */ }
+				}
+				return;
+			}
 			this.last = "explicit review failed unexpectedly; inspect current memory before retrying because apply may have completed";
 			if (activeTarget && current()) report(activeTarget, "Mind optimization result", `Bounded review failed unexpectedly; ${this.last}.`, "review failed unexpectedly; inspect current memory before retrying", true);
 		} finally {

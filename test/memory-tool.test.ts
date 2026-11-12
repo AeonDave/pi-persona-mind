@@ -71,11 +71,25 @@ test("memory guidance maps task context and durable scopes without treating scop
 	assert.match(declaration, /all projects of this persona/);
 	assert.match(declaration, /across personas/);
 	assert.match(declaration, /not authenticated consent/);
+	assert.match(declaration, /model chooses lifetime and scope from meaning and context/i);
+	assert.match(declaration, /users need not name API scopes/i);
 });
 
 async function execute(harness: ReturnType<typeof makeToolHarness>, params: Record<string, unknown>) {
 	return harness.tool.execute("call", params, undefined, undefined, harness.ctx);
 }
+
+test("model-selected global memories remain writable after local session retention without a confirmation gate", async () => {
+	const h = makeToolHarness();
+	assert.equal((await execute(h, { action: "remember", term: "session", kind: "note", text: "Use a temporary strategy only for this task." })).details.ok, true);
+	for (const scope of ["persona", "shared"]) {
+		const result = await execute(h, { action: "remember", term: "long", scope, kind: "preference", text: "The user prefers their own attribution across applicable projects." });
+		assert.equal(result.details.ok, true, scope);
+	}
+	assert.equal(h.calls.sessionRememberInputs.length, 1);
+	assert.deepEqual(h.calls.nativeRememberInputs.map((input) => (input as { scope: string }).scope), ["persona", "shared"]);
+	assert.deepEqual(h.ctx, {}, "the model-facing write path did not require a user confirmation capability");
+});
 
 test("unscoped long-term remember is refused before the MindService is called", async () => {
 	const h = makeToolHarness();

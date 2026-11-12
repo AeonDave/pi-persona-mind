@@ -84,11 +84,34 @@ test("native automatic optimization coalesces saves, preserves history and appli
 		assert.equal(after.entries.length, 1);
 		assert.equal(after.entries[0].text, replacement);
 		assert.equal(after.entries[0].derivedFrom.length, 2);
-		const history = JSON.stringify(cards(h));
-		assert.ok(history.indexOf("Mind automatic proposal") < history.indexOf("Mind automatic result"));
-		assert.ok(notes.every((text) => history.includes(text)), "full source evidence survives replacement");
-		assert.match(history, /result:offline/);
+		const entries = h.session.sessionManager.getEntries();
+		const audit = entries.filter((e) => e.type === "custom" && e.customType === "pi-persona-mind-auto-proposal");
+		assert.equal(audit.length, 1, "the complete proposal remains in a separate durable audit entry");
+		assert.equal(h.session.extensionRunner!.getEntryRenderer("pi-persona-mind-auto-proposal"), undefined, "Pi has no renderer for the audit entry");
+		assert.equal(cards(h).length, 1, "only one visible result entry is appended");
+		assert.ok(entries.indexOf(audit[0]!) < entries.indexOf(cards(h)[0]!), "proposal audit precedes result");
+		assert.ok(notes.every((text) => JSON.stringify(audit).includes(text)), "full source evidence survives replacement");
+		assert.match(JSON.stringify(cards(h)), /result:offline/);
+		assert.equal(h.notifications.length, 0, "automatic success has no toast");
 		assert.equal(h.faux.state.callCount, 2, "maintenance never wakes the main model");
+	} finally { await h?.dispose(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("automatic worker failure produces one visible attention result and warning", { timeout: 20_000 }, async () => {
+	const root = await mkdtemp(join(tmpdir(), "mind-auto-native-warning-"));
+	let h: Harness | undefined;
+	const worker = workerFixture();
+	try {
+		h = await runtimeHarness(root, entry, [worker.factory]); await h.bind();
+		h.session.setActiveToolsByName(["memory"]);
+		h.faux.setResponses([fauxAssistantMessage(notes.map((text) => fauxToolCall("memory", { action: "remember", term: "long", scope: "persona", kind: "convention", text })), { stopReason: "toolUse" }), fauxAssistantMessage("Saved.")]);
+		await h.session.prompt("Save these verified conventions.");
+		await until(() => worker.requests.length === 1, "automatic worker starts");
+		worker.requests[0]!.finish({ status: "failed", ok: false, output: "", error: "offline failure" });
+		await until(() => cards(h!).length === 1, "failure report");
+		assert.match(JSON.stringify(cards(h)), /worker failed; memory unchanged/);
+		assert.match(JSON.stringify(cards(h)), /"attention":true/);
+		assert.ok(h.notifications.some((message) => message.includes("review needs attention")));
 	} finally { await h?.dispose(); await rm(root, { recursive: true, force: true }); }
 });
 
@@ -226,7 +249,9 @@ test("native optimizer requires one million main input tokens and a dirty store,
 		await h.session.prompt("Save these verified release conventions.");
 		await until(() => worker.requests.length === 1, "the first dirty batch bypasses the token floor");
 		worker.requests[0]!.finish({ status: "done", ok: true, output: JSON.stringify({ operations: [] }), resultRef: "result:first" });
-		await until(() => JSON.stringify(cards(h!)).includes("bounded review found no safe consolidation"), "first review receipt settles");
+		await until(() => h!.session.sessionManager.getEntries().some((e) => e.type === "custom" && e.customType === "pi-persona-mind-auto-attempt" && (e.data as { state?: string }).state === "settled"), "first review receipt settles");
+		assert.equal(cards(h).length, 0, "automatic no-op produces no visible entry");
+		assert.equal(h.notifications.length, 0, "automatic no-op produces no toast");
 
 		// Move beyond the safety cooldown without waiting five minutes in real time. The later
 		// review still needs dirty memory and one million main input tokens.

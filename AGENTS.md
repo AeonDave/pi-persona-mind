@@ -74,8 +74,12 @@ coupled through a versioned local companion handshake to
   Persona-hosted Mind worker on exactly the session model, no fallback or arbitrary tools. Give it
   at most 12 full source records/24k JSON characters, a 180s deadline and at most 4 strict JSON
   replacement operations/12 source IDs each, then validate/apply through parent-owned
-  provenance/freshness/CAS checks. Shared memories and age-based deletion remain excluded. Preserve
-  durable before/after operator cards; worker completion is not proof of semantic truth.
+  provenance/freshness/CAS checks. Automatic operations must consolidate at least two compatible
+  supplied sources; single-record rewrites remain explicit-only. A window without a same-kind pair
+  cannot start an automatic model call or consume its first-attempt allowance. Shared memories and
+  age-based deletion remain excluded. Persist the full proposal audit before apply, but keep it out
+  of the automatic transcript; show one compact result note, no routine info toast, and no no-op card.
+  Manual detail and important warnings remain visible. Worker completion is not proof of semantic truth.
 - Rotate completed automatic review over older records/pages; account for actual byte admission,
   preserve newest-fact inclusion, and never mark stopped/interrupted work as completed. No unbounded
   sweeper. Optimizer receipts precede replacement and persist at most 32/2MiB per target; unresolved

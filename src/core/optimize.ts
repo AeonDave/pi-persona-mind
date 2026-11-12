@@ -94,8 +94,8 @@ export function planConsolidation(entries: readonly MemoryEntry[], operations: r
 			selected.add(entry); before.push(entry);
 		}
 		if (before.some((entry) => entry.persona !== before[0]!.persona)) return { ok: false, reason: "consolidation cannot mix persona ownership markers" };
-		if (!(MEMORY_KINDS as readonly unknown[]).includes(operation.kind) || (target === "project" && operation.kind === "objective")) {
-			return { ok: false, reason: "invalid memory kind for the selected tier (objectives are durable)" };
+		if (!(MEMORY_KINDS as readonly unknown[]).includes(operation.kind)) {
+			return { ok: false, reason: "invalid memory kind for the selected tier" };
 		}
 		if (typeof operation.text !== "string" || !operation.text.trim() || operation.text.length > MAX_MEMORY_TEXT_CHARS) return { ok: false, reason: `replacement text must contain 1..${MAX_MEMORY_TEXT_CHARS} characters` };
 		if (operation.tags !== undefined && (!Array.isArray(operation.tags) || operation.tags.length > MAX_MEMORY_TAGS || operation.tags.some((tag: unknown) => typeof tag !== "string" || tag.length > MAX_MEMORY_TAG_CHARS))) return { ok: false, reason: "replacement tags exceed memory bounds" };

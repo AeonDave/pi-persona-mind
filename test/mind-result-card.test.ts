@@ -12,7 +12,7 @@ type CardTheme = { fg: (_name: string, text: string) => string; bold: (text: str
 type Renderer = (entry: { data?: unknown }, options: { expanded: boolean; keyHint: (id: string, description: string) => string }, theme: CardTheme) => Component | undefined;
 const theme: CardTheme = { fg: (_name, text) => text, bold: (text) => text };
 
-function installRenderer() {
+function installRenderer(observe?: (state: string) => void) {
 	const events = createEventBus();
 	events.on(CARD_FRAME_EVENT, (request: unknown) => {
 		if (!request || typeof request !== "object" || !("respond" in request) || typeof request.respond !== "function") return;
@@ -20,6 +20,7 @@ function installRenderer() {
 			version: 1,
 			provider: "pi-persona",
 			createCard: ((presentation, context) => {
+				observe?.(presentation.state);
 				const preview = presentation.preview(96);
 				const content = context.expanded ? presentation.full : `${preview.text}${preview.truncated ? `\n${context.detailHint()}` : ""}`;
 				return new Text(`${presentation.title}\n${content}`, 0, 0);
@@ -55,13 +56,21 @@ test("a parent-authored bounded no-op summary is compact while the complete work
 	const collapsed = render({ data }, { expanded: false, keyHint }, theme)?.render(200).join("\n") ?? "";
 	const expanded = render({ data }, { expanded: true, keyHint }, theme)?.render(500).join("\n") ?? "";
 	assert.match(collapsed, /Mind · automatic review — persona/);
-	assert.match(collapsed, /One selected window reviewed; no consolidation proposed/);
+	assert.doesNotMatch(collapsed, /One selected window reviewed; no consolidation proposed/);
 	assert.match(collapsed, /to expand/);
 	assert.doesNotMatch(collapsed, /Bounded coverage:|provider\/model|result:opaque-ref/);
 	assert.match(expanded, /Bounded coverage: one selected record window/);
 	assert.match(expanded, /Worker run:auto-1 · provider\/model · high/);
 	assert.match(expanded, /Terminal report: result:opaque-ref/);
 	assert.deepEqual(data, { title: "Mind automatic optimization — persona", content });
+});
+
+test("manual no-op retains its existing compact summary and full expansion", () => {
+	const render = installRenderer();
+	const content = "Bounded coverage: one selected record window; bounded review found no safe consolidation in this record set.\nWorker run · model";
+	const entry = { data: { title: "Mind optimization result", content } };
+	assert.match(render(entry, { expanded: false, keyHint }, theme)?.render(200).join("\n") ?? "", /One selected window reviewed; no consolidation proposed/);
+	assert.match(render(entry, { expanded: true, keyHint }, theme)?.render(200).join("\n") ?? "", /Worker run · model/);
 });
 
 test("automatic result titles stay concise without rewriting saved title or result data", () => {
@@ -71,6 +80,33 @@ test("automatic result titles stay concise without rewriting saved title or resu
 	assert.match(output, /Mind · automatic review — persona/);
 	assert.doesNotMatch(output, /Mind automatic optimization/);
 	assert.deepEqual(data, { title: "Mind automatic optimization — persona", content: "bounded review summary and worker provenance" });
+});
+
+test("automatic result uses a title-only note with typed runtime state and complete expansion", () => {
+	const render = installRenderer();
+	const content = "Bounded coverage: one window\nWorker run · provider/model\nUndo: /mind optimize undo receipt persona";
+	const data = { title: "Mind automatic result", content, reportContext: { automatic: true, target: "persona", phase: "result", summary: "1 replacement applied", attention: false } };
+	const collapsed = render({ data }, { expanded: false, keyHint }, theme)?.render(200).join("\n") ?? "";
+	const expanded = render({ data }, { expanded: true, keyHint }, theme)?.render(200).join("\n") ?? "";
+	assert.match(collapsed, /Mind · persona · 1 replacement applied/);
+	assert.doesNotMatch(collapsed, /Bounded coverage|Worker|Undo/);
+	assert.match(expanded, /Worker run · provider\/model/);
+	assert.match(expanded, /Undo: \/mind optimize undo receipt persona/);
+});
+
+test("legacy automatic proposal stays intact in expanded history and attention follows typed metadata", () => {
+	const states: string[] = [];
+	const render = installRenderer((state) => states.push(state));
+	const content = "Worker run\nBefore: original fact\nAfter: replacement fact";
+	const legacy = { title: "Mind automatic proposal", content };
+	const collapsed = render({ data: legacy }, { expanded: false, keyHint }, theme)?.render(200).join("\n") ?? "";
+	const expanded = render({ data: legacy }, { expanded: true, keyHint }, theme)?.render(200).join("\n") ?? "";
+	assert.doesNotMatch(collapsed, /original fact|replacement fact/);
+	assert.match(expanded, /Before: original fact/);
+	assert.match(expanded, /After: replacement fact/);
+	assert.deepEqual(legacy, { title: "Mind automatic proposal", content });
+	render({ data: { title: "Mind automatic result", content, reportContext: { automatic: true, target: "persona", phase: "result", summary: "receipt warning", attention: true } } }, { expanded: false, keyHint }, theme);
+	assert.equal(states.at(-1), "attention");
 });
 
 test("mind result cards collapse command output and preserve full expansion", () => {

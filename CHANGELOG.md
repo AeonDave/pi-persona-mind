@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+- Keep automatic maintenance quiet: persist the full proposal audit without a visible proposal card,
+  show one brief expandable note for a change, omit routine info toasts and no-op cards, and preserve
+  manual detail and important warnings.
+- Limit background application to multi-source consolidation; skip model admission without a
+  compatible pair and leave single-record edits available to explicit workflows. This is an eligibility
+  guard, not a semantic-truth guarantee. Ordinary LLM-selected global memory saves remain available.
+- Preserve short-objective lifetime and earliest expiry when consolidating project working memory.
 - Require explicit project/persona/shared scope for every long-term remember at both the public tool and
   MindService boundary; short-term memory stays project-scoped by default, and objective kind no longer
   changes the caller-selected lifetime.
