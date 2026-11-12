@@ -48,6 +48,9 @@ Mind remains inactive.
 | `shared` | Explicitly shared durable facts | Until changed or forgotten |
 | `session` | Notes in the active Pi history branch | Follows that branch through compaction/resume when session history persists; not copied to a new session |
 
+`project-long` is the tier name used by optimizer commands. To save a durable project fact with
+`memory remember`, use `term: "long"` and `scope: "project"`.
+
 Backlog items are project-scoped and expire after 48 hours by default. Promotion defaults to
 durable project memory; choose `persona` or `shared` explicitly when broader scope is intended. Every
 long-term `remember` requires `scope=project|persona|shared`: project is for stable repository facts,
@@ -148,5 +151,6 @@ not change the runtime budget or ranking.
 
 - [Design and operational limits](docs/DESIGN.md)
 - [Memory design decisions and evaluation](docs/MEMORY-RESEARCH.md)
+- [Post-release source audit and verification evidence](https://github.com/AeonDave/pi-persona-mind/blob/main/docs/reviews/2026-11-12-post-release-audit.md)
 - [Release history](CHANGELOG.md)
 - [MIT license](LICENSE)

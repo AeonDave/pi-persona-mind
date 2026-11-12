@@ -350,5 +350,9 @@ offline providers, and join session_shutdown before SDK disposal. Native session
 reopen, branch/fork, in-memory behavior and owner revocation. Store tests cover lost writes, stale plans,
 invalid inputs and concurrent apply. Installed-host/package qualification complements source tests.
 
+The [post-release source audit](https://github.com/AeonDave/pi-persona-mind/blob/main/docs/reviews/2026-11-12-post-release-audit.md)
+records the qualified snapshots, large-store checks, concurrent-writer stress tests and real-provider
+smokes, with their evidence and platform limits.
+
 Passing these checks proves tested behavior, not perfect memory, semantic compression quality, external
 provider authentication or every operating system. CI provides separate Windows/Linux/macOS evidence.
