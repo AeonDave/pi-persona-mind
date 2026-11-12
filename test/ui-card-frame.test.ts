@@ -62,7 +62,7 @@ test("entry adapters query lazily on every render and observe provider load, unl
 	registerMindResultRenderer(bound.pi as never, bound.ui);
 	const renderer = rendererFor(bound.renderers, MIND_RESULT_ENTRY_TYPE);
 	const before = render(renderer, resultEntry())?.render(100).join("\n") ?? "";
-	assert.match(before, /Mind automatic review/);
+	assert.match(before, /mind automatic review/);
 	assert.match(before, /full history marker/);
 
 	const seen: string[] = [];
@@ -85,7 +85,7 @@ test("a provider loaded before Mind is discovered by the later renderer invocati
 	const bound = bind(events);
 	registerMindResultRenderer(bound.pi as never, bound.ui);
 	const output = render(rendererFor(bound.renderers, MIND_RESULT_ENTRY_TYPE), resultEntry())?.render(100).join("\n") ?? "";
-	assert.match(output, /Mind automatic review/);
+	assert.match(output, /mind automatic review/);
 	assert.deepEqual(seen, ["loaded-first"]);
 });
 
@@ -107,25 +107,25 @@ test("incompatible, ambiguous, throwing responders and throwing factories use sa
 			}
 		});
 		const output = run();
-		assert.equal(output, "Mind review\nvisible full-history");
+		assert.equal(output, "mind review\nvisible full-history");
 		dispose();
 	}
 
 	const good = addProvider(bound.events, plainFrame);
 	const duplicate = addProvider(bound.events, plainFrame);
 	const ambiguous = run();
-	assert.equal(ambiguous, "Mind review\nvisible full-history");
+	assert.equal(ambiguous, "mind review\nvisible full-history");
 	good(); duplicate();
 
 	const throwingProvider = bound.events.on(CARD_FRAME_EVENT, () => { throw new Error("provider failed"); });
-	assert.equal(run(), "Mind review\nvisible full-history");
+	assert.equal(run(), "mind review\nvisible full-history");
 	throwingProvider();
 
 	addProvider(bound.events, () => { throw new Error("factory failed"); });
-	assert.equal(run(), "Mind review\nvisible full-history");
+	assert.equal(run(), "mind review\nvisible full-history");
 
 	addProvider(bound.events, () => undefined as never);
-	assert.equal(run(), "Mind review\nvisible full-history", "a non-component factory result is rejected");
+	assert.equal(run(), "mind review\nvisible full-history", "a non-component factory result is rejected");
 });
 
 test("factory results missing the native invalidation method are rejected without hiding retained text", () => {
@@ -233,7 +233,7 @@ test("session-note renderer only registers presentation and preserves the origin
 	registerSessionNoteRenderer(pi as never, createMindCardUI(pi));
 	const source = { version: 1, op: "forget", id: "session:opaque" };
 	const output = render(rendererFor(bound.renderers, SESSION_NOTE_ENTRY_TYPE), { data: source }, true)?.render(100).join("\n") ?? "";
-	assert.match(output, /Session note retired/);
+	assert.match(output, /session note retired/);
 	assert.deepEqual(source, { version: 1, op: "forget", id: "session:opaque" });
 	assert.equal(registrations, 1);
 });

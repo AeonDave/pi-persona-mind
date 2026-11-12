@@ -22,7 +22,8 @@ function automaticContext(value: unknown): AutomaticResultContext | undefined {
 
 function cardTitle(title: string): string {
 	const automatic = /^Mind automatic (?:optimization|result|proposal)( — .+)?$/.exec(title);
-	return automatic ? `Mind · automatic review${automatic[1] ?? ""}` : title;
+	if (automatic) return `mind · automatic review${automatic[1] ?? ""}`;
+	return title.replace(/^(Mind|Memory|Automatic memory|Staged memory)\b/, (prefix) => prefix[0]!.toLowerCase() + prefix.slice(1));
 }
 
 /** Register once per factory; command output stays display-only and can be expanded without loss. */
@@ -34,8 +35,8 @@ export function registerMindResultRenderer(pi: Pick<ExtensionAPI, "registerEntry
 		const legacyAutomatic = /^Mind automatic (?:optimization|result|proposal)(?: — .+)?$/.test(data.title);
 		const manualNoOp = /^Mind optimization result(?: — .+)?$/.test(data.title) && data.content.startsWith(AUTOMATIC_NO_OP_PREFIX);
 		const presentation = report || legacyAutomatic
-			? { title: report ? `Mind · ${report.target} · ${report.summary}` : cardTitle(data.title), state: report?.attention ? "attention" as const : "neutral" as const, full: data.content, preview: () => ({ text: "", truncated: true }) }
-			: cardFramePresentation(data.title, data.content, manualNoOp ? "One selected window reviewed; no consolidation proposed" : undefined);
+			? { title: report ? `mind · ${report.target} · ${report.summary}` : cardTitle(data.title), state: report?.attention ? "attention" as const : "neutral" as const, full: data.content, preview: () => ({ text: "", truncated: true }) }
+			: cardFramePresentation(cardTitle(data.title), data.content, manualNoOp ? "One selected window reviewed; no consolidation proposed" : undefined);
 		return cardUI.renderCard(presentation, {
 			expanded,
 			theme,

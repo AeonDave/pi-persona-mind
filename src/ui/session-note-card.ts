@@ -16,7 +16,7 @@ function sessionNoteCardModel(value: unknown): SessionNoteCardModel | undefined 
 	const event = record(value);
 	if (event?.version !== 1) return undefined;
 	if (event.op === "forget" && typeof event.id === "string" && event.id.startsWith("session:")) {
-		return { title: "Session note retired", body: `${event.id}\nNo longer active on this branch.` };
+		return { title: "session note retired", body: `${event.id}\nNo longer active on this branch.` };
 	}
 	if (event.op !== "save") return undefined;
 	const note = record(event.note);
@@ -29,7 +29,7 @@ function sessionNoteCardModel(value: unknown): SessionNoteCardModel | undefined 
 		return undefined;
 	}
 	return {
-		title: `Session note · ${note.kind}`,
+		title: `session note · ${note.kind}`,
 		body: [
 			`id: ${note.id}`,
 			`recorded: ${note.recordedAt}`,

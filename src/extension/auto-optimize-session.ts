@@ -88,13 +88,13 @@ export function installAutoOptimize(pi: ExtensionAPI, deps: Dependencies): AutoO
 				}
 				pi.appendEntry(MIND_RESULT_ENTRY_TYPE, { title, content: body, ...(reportContext?.automatic ? { reportContext } : {}) });
 				if (reportContext?.automatic) {
-					if (reportContext.attention) ctx.ui.notify(`Mind · ${reportContext.target} review needs attention`, "warning");
+					if (reportContext.attention) ctx.ui.notify(`mind · ${reportContext.target} review needs attention`, "warning");
 					return;
 				}
 				if (title !== "Mind automatic proposal") {
 					const target = / — (project(?:-long)?|persona)$/.exec(title)?.[1];
 					const kind = title.includes("proposal") ? "proposal" : "review";
-					ctx.ui.notify(`Mind · ${target ? `${target} ` : ""}${kind} update`, "info");
+					ctx.ui.notify(`mind · ${target ? `${target} ` : ""}${kind} update`, "info");
 				}
 			}, attempts,
 		};

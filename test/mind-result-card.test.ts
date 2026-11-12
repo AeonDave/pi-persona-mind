@@ -55,7 +55,7 @@ test("a parent-authored bounded no-op summary is compact while the complete work
 	const data = { title: "Mind automatic optimization — persona", content };
 	const collapsed = render({ data }, { expanded: false, keyHint }, theme)?.render(200).join("\n") ?? "";
 	const expanded = render({ data }, { expanded: true, keyHint }, theme)?.render(500).join("\n") ?? "";
-	assert.match(collapsed, /Mind · automatic review — persona/);
+	assert.match(collapsed, /mind · automatic review — persona/);
 	assert.doesNotMatch(collapsed, /One selected window reviewed; no consolidation proposed/);
 	assert.match(collapsed, /to expand/);
 	assert.doesNotMatch(collapsed, /Bounded coverage:|provider\/model|result:opaque-ref/);
@@ -77,7 +77,7 @@ test("automatic result titles stay concise without rewriting saved title or resu
 	const render = installRenderer();
 	const data = { title: "Mind automatic optimization — persona", content: "bounded review summary and worker provenance" };
 	const output = render({ data }, { expanded: false, keyHint }, theme)?.render(200).join("\n") ?? "";
-	assert.match(output, /Mind · automatic review — persona/);
+	assert.match(output, /mind · automatic review — persona/);
 	assert.doesNotMatch(output, /Mind automatic optimization/);
 	assert.deepEqual(data, { title: "Mind automatic optimization — persona", content: "bounded review summary and worker provenance" });
 });
@@ -88,7 +88,7 @@ test("automatic result uses a title-only note with typed runtime state and compl
 	const data = { title: "Mind automatic result", content, reportContext: { automatic: true, target: "persona", phase: "result", summary: "1 replacement applied", attention: false } };
 	const collapsed = render({ data }, { expanded: false, keyHint }, theme)?.render(200).join("\n") ?? "";
 	const expanded = render({ data }, { expanded: true, keyHint }, theme)?.render(200).join("\n") ?? "";
-	assert.match(collapsed, /Mind · persona · 1 replacement applied/);
+	assert.match(collapsed, /mind · persona · 1 replacement applied/);
 	assert.doesNotMatch(collapsed, /Bounded coverage|Worker|Undo/);
 	assert.match(expanded, /Worker run · provider\/model/);
 	assert.match(expanded, /Undo: \/mind optimize undo receipt persona/);
@@ -115,8 +115,15 @@ test("mind result cards collapse command output and preserve full expansion", ()
 	const entry = { data: { title: "Memory doctor", content } };
 	const collapsed = render(entry, { expanded: false, keyHint }, theme)?.render(200).join("\n") ?? "";
 	const expanded = render(entry, { expanded: true, keyHint }, theme)?.render(200).join("\n") ?? "";
-	assert.match(collapsed, /Memory doctor/);
+	assert.match(collapsed, /memory doctor/);
 	assert.doesNotMatch(collapsed, /full-marker/);
 	assert.match(expanded, /full-marker/);
 	assert.equal(render({ data: { title: "x".repeat(161), content } }, { expanded: true, keyHint }, theme), undefined);
+});
+
+test("custom result titles retain proper names", () => {
+	const render = installRenderer();
+	const data = { title: "Atlas review", content: "details" };
+	assert.match(render({ data }, { expanded: false, keyHint }, theme)?.render(200).join("\n") ?? "", /Atlas review/);
+	assert.equal(data.title, "Atlas review");
 });

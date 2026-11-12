@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Use lowercase Mind card headings and review notification prefixes while preserving saved history
+  and custom titles.
 - Keep automatic maintenance quiet: persist the full proposal audit without a visible proposal card,
   show one brief expandable note for a change, omit routine info toasts and no-op cards, and preserve
   manual detail and important warnings.

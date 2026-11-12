@@ -45,7 +45,7 @@ test("session note card has a semantic title and expands to the full note with p
 	const entry = { data: { version: 1, op: "save", note: { id: "session:00000000-0000-4000-8000-000000000001", kind: "preference", text, source: "result:opaque-ref", recordedAt: "2026-10-25T00:00:00.000Z", originSessionId: "session-42" } } };
 	const collapsed = renderer(entry, { expanded: false, keyHint }, theme)?.render(200).join("\n") ?? "";
 	const expanded = renderer(entry, { expanded: true, keyHint }, theme)?.render(200).join("\n") ?? "";
-	assert.match(collapsed, /Session note · preference/);
+	assert.match(collapsed, /session note · preference/);
 	assert.doesNotMatch(collapsed, /tail-marker/);
 	assert.match(collapsed, /expand/i);
 	assert.match(expanded, /tail-marker/);
@@ -56,7 +56,7 @@ test("session note card has a semantic title and expands to the full note with p
 test("session note tombstones render as retired entries and malformed data stays harmless", () => {
 	const renderer = rendererForEntry();
 	const retired = renderer({ data: { version: 1, op: "forget", id: "session:00000000-0000-4000-8000-000000000001" } }, { expanded: false, keyHint }, theme)?.render(200).join("\n") ?? "";
-	assert.match(retired, /Session note retired/);
+	assert.match(retired, /session note retired/);
 	assert.match(retired, /session:00000000-0000-4000-8000-000000000001/);
 	assert.equal(renderer({ data: { version: 1, op: "save", note: { text: "bad" } } }, { expanded: false, keyHint }, theme), undefined);
 });
