@@ -28,6 +28,14 @@ test("session injection ranks the current task and shares a bounded token estima
 	assert.equal((block.match(/<\/session-notes>/g) ?? []).length, 1);
 });
 
+test("a session objective retains its local lifetime and kind", () => {
+	const f = fixture();
+	const saved = f.notes.remember(f.ctx, { kind: "objective", text: "For this branch, verify the host contract." });
+	assert.ok(saved.ok);
+	assert.equal(saved.entry.kind, "objective");
+	assert.equal(f.notes.snapshot(f.ctx).notes.length, 1);
+});
+
 test("session notes survive adapter reload and expose complete text without promoting project memory", () => {
 	const f = fixture();
 	const text = "verified local context ".repeat(250);
@@ -102,7 +110,7 @@ test("forget is branch-local and failed host appends cannot claim successful sav
 	assert.equal(broken.snapshot(f.ctx).notes.length, 1);
 });
 
-test("native persisted notes reopen from the same session file and distinguish a new session", () => {
+test("native notes survive compaction and resume on the same active branch but not a new session", () => {
 	const dir = mkdtempSync(join(tmpdir(), "ppm-session-"));
 	try {
 		const manager = SessionManager.create(dir, dir);
@@ -112,6 +120,10 @@ test("native persisted notes reopen from the same session file and distinguish a
 		const saved = f.notes.remember(f.ctx, { kind: "note", text: "resumable checkpoint", source: "result:opaque-user-supplied-id (locator only)" });
 		assert.ok(saved.ok);
 		assert.equal(saved.storage, "session");
+		const noteEntry = manager.getBranch().find((entry) => entry.type === "custom" && entry.customType === SESSION_NOTE_ENTRY_TYPE);
+		assert.ok(noteEntry, "native note is present in the session branch before compaction");
+		manager.appendCompaction("Earlier conversation summarized.", noteEntry.id, 1);
+		assert.equal(f.notes.snapshot(f.ctx).notes.length, 1, "compaction does not remove active-branch session note state");
 		f.notes.deactivate();
 		const file = manager.getSessionFile();
 		assert.ok(file);

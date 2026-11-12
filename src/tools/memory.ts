@@ -42,13 +42,13 @@ const MemoryParams = Type.Object({
 	}),
 	term: Type.Optional(
 		Type.Union([Type.Literal("long"), Type.Literal("short"), Type.Literal("session")], {
-			description: "remember: long = durable persona identity; short = expiring project note; session = active-branch note only, never copied into persona archives. Required for remember.",
+			description: "remember: choose the lifetime explicitly. session = active-branch only (use for task-specific or uncertain choices such as models, strategies, and task constraints); short = expiring project working context; long = durable and requires an explicit scope. Kind does not change lifetime; an objective may be session-local or short-lived.",
 		}),
 	),
 	kind: Type.Optional(
 		Type.Union(
 			MEMORY_KINDS.map((k) => Type.Literal(k)),
-			{ description: "remember: the category of the fact. Required for remember." },
+			{ description: "remember: content category only; kind never promotes a short or session lifetime. Required for remember." },
 		),
 	),
 	text: Type.Optional(
@@ -65,7 +65,7 @@ const MemoryParams = Type.Object({
 	derivedFrom: Type.Optional(Type.Array(Type.String({ maxLength: MAX_MEMORY_ID_CHARS }), { maxItems: MAX_MEMORY_DERIVED_IDS, description: "remember: optional ids of memories distilled into this fact" })),
 	query: Type.Optional(Type.String({ maxLength: MAX_RECALL_QUERY_CHARS, description: "recall: keywords (empty = most recent); optimize inspect: optional substring filter" })),
 	scope: Type.Optional(
-		Type.Union([Type.Literal("long"), Type.Literal("short"), Type.Literal("both"), Type.Literal("session"), Type.Literal("project"), Type.Literal("persona"), Type.Literal("shared")], { description: "remember/promote: project|persona|shared; long remember defaults persona, promote defaults project. recall/read/forget: project includes repository durable + working facts; long includes all durable tiers; both includes all active stores; session is branch-local." }),
+		Type.Union([Type.Literal("long"), Type.Literal("short"), Type.Literal("both"), Type.Literal("session"), Type.Literal("project"), Type.Literal("persona"), Type.Literal("shared")], { description: "remember(long): REQUIRED destination project|persona|shared; no implicit default. Use project for stable facts of this repository, persona for facts intended across all projects of this persona, and shared only when intended across personas. remember(short) defaults to project and only accepts project; remember(session) accepts no scope or redundant session. This selects API routing; it is not authenticated consent. promote defaults to project. recall/read/forget: project includes repository durable + working facts; long includes all durable tiers; both includes all active stores; session is branch-local." }),
 	),
 	max: Type.Optional(Type.Number({ description: "recall: maximum results, clamped to 1..50 (default 8); optimize inspect: entry page 1..100 (default 20)" })),
 	offset: Type.Optional(Type.Number({ minimum: 0, maximum: DEFAULT_STORE_MAX_ENTRIES, multipleOf: 1, description: `optimize inspect: zero-based page offset from 0 to ${DEFAULT_STORE_MAX_ENTRIES} (default 0)` })),
@@ -85,6 +85,14 @@ const MemoryParams = Type.Object({
 }, { additionalProperties: false });
 
 type MemoryToolParams = Type.Static<typeof MemoryParams>;
+
+const SESSION_REMEMBER_EXAMPLE = '{ action: "remember", term: "session", kind: "note", text: "Keep this branch focused." }';
+const SHORT_REMEMBER_EXAMPLE = '{ action: "remember", term: "short", kind: "note", text: "The staging environment is read-only today." }';
+const LONG_REMEMBER_EXAMPLE = '{ action: "remember", term: "long", scope: "project", kind: "invariant", text: "This repository requires strict typechecks." }';
+
+function rememberCorrection(message: string, example: string): string {
+	return `${message} Retry with a complete remember action, for example: ${example}`;
+}
 
 /** How many colliding facts an ambiguity refusal names before it summarizes the rest. */
 const MAX_AMBIGUITY_CANDIDATES_SHOWN = 5;
@@ -107,13 +115,11 @@ export function registerMemoryTool(pi: ExtensionAPI, getMind: GetMind, sessionMe
 		label: "Memory",
 		promptSnippet: "memory — persist, recall, inspect, and explicitly consolidate durable facts, project context, and active-session notes",
 		promptGuidelines: [
-			"Before the final answer, use `memory` once when this turn established a durable user preference, architectural decision/invariant, or verified lesson that is not simply re-derivable from the repository. A user who explicitly labels a fact durable/permanent is asking for capture even without the word 'remember'. Use `backlog` for unfinished intent. Skip routine transcript, guesses, and secrets.",
+			"Before the final answer, use `memory` when useful context should be retained. Choose `term=session` for task-specific or uncertain choices (including models, strategies, and task constraints); use `term=short` for expiring project working context; use `term=long` only with an explicit `scope`: `project` for stable repository facts, `persona` for facts intended across all projects of this persona, and `shared` only when truly intended across personas. An explicit scope selects the API destination; it is not authenticated consent. AUTO capture is provisional session-only and never makes a durable save; do not duplicate that session note. Broader durability requires a deliberate memory call with a scope chosen from the actual user intent. Use `backlog` for unfinished work; skip secrets and re-derivable facts.",
 			"For consolidation, inspect first, read the full selected entries, compare them with the newest primary evidence, then stage explicit rewrites/merges that preserve exceptions and provenance. Review the exact before/after plan and character counts; apply the exact staged plan within the user's authorized memory-maintenance scope. Inspect is read-only and never calls a model or applies changes by itself.",
 		],
 		description: [
-			"Your durable, persona-scoped memory. `remember` a fact so it survives context compaction and",
-			"restarts — long-term for who this persona is to the user (preferences/conventions/lessons),",
-			"long with scope=project for durable repository knowledge, short for project notes that auto-delete after ~48h, or session for active-branch notes only. Scope=shared explicitly shares durable facts across personas. Promotion preserves project scope by default. `recall` searches; `read` gets full text; `forget` retires by id with optional scope. For `optimize`, inspect candidates, read full entries, compare against current evidence, stage explicit reviewed replacements preserving exceptions and provenance, then apply only an authorized exact plan. Inspect is read-only; it does not call a model or write.",
+			"`remember` stores context for an explicitly chosen lifetime: `session` for active-branch notes only (best for task-specific or uncertain choices), `short` for expiring project working context, or `long` for durable facts with a REQUIRED explicit `scope=project|persona|shared`. Use project for stable repository facts, persona for intent across all projects of the same persona, and shared only for intent across personas. Long-term scope has no implicit default; the scope selects an API destination and does not authenticate consent. Automatic cue capture is always provisional session-only, even for explicit durability phrases; it does not make an external/durable save. Broader retention needs a deliberate scoped memory call. Promotion defaults to project. `recall` searches; `read` gets full text; `forget` retires by id with optional scope. For `optimize`, inspect candidates, read full entries, compare against current evidence, stage explicit reviewed replacements preserving exceptions and provenance, then apply an exact reviewed plan. Inspect is read-only; it does not call a model or write.",
 			"Facts are re-injected into your context automatically each turn, so remember what you would",
 			"want to know next session. Keep entries DECLARATIVE, never store secrets.",
 		].join(" "),
@@ -132,7 +138,7 @@ export function registerMemoryTool(pi: ExtensionAPI, getMind: GetMind, sessionMe
 				return say(`Memory is unavailable: ${message || "unknown persistence failure"}`, { ok: false, reason: "storage_error" });
 			}
 		},
-		renderResult(result, { expanded }, theme) {
+		renderResult(result, { expanded }, theme, context) {
 			const body = toolResultText(result);
 			const details = result.details && typeof result.details === "object" ? result.details as Record<string, unknown> : undefined;
 			// Recognize old receipts too, so reopening a session does not restore the noisy card.
@@ -142,9 +148,9 @@ export function registerMemoryTool(pi: ExtensionAPI, getMind: GetMind, sessionMe
 				const summary = typeof details?.summary === "string"
 					? details.summary
 					: savedSession ? "Session note saved" : `${savedTerm === "long" ? "Long" : "Short"}-term saved`;
-				return renderExpandableResult(summary, true, theme);
+				return renderExpandableResult(body, expanded, theme, () => context.keyHint("app.tools.expand", "to expand"), summary);
 			}
-			return renderExpandableResult(body, expanded, theme);
+			return renderExpandableResult(body, expanded, theme, () => context.keyHint("app.tools.expand", "to expand"));
 		},
 	});
 }
@@ -165,16 +171,32 @@ function validateMemoryParams(value: unknown): string | undefined {
 	if (prototype !== Object.prototype && prototype !== null) return "memory action parameters must be a plain object.";
 	const params = value as Record<string, unknown>;
 	if (typeof params.action !== "string" || !Object.hasOwn(KEYS, params.action)) return "Unknown memory action.";
-	if (Reflect.ownKeys(params).some((key) => typeof key !== "string" || !KEYS[params.action as string]!.has(key))) return `memory ${params.action} received a field that does not belong to that action.`;
 	const has = (key: string) => Object.hasOwn(params, key);
+	const unknownFields = Reflect.ownKeys(params).filter((key) => typeof key !== "string" || !KEYS[params.action as string]!.has(key)).map(String);
+	if (unknownFields.length > 0) {
+		if (params.action === "remember" && params.term === "session") return rememberCorrection(`memory remember term=session does not accept field(s): ${unknownFields.join(", ")}.`, SESSION_REMEMBER_EXAMPLE);
+		return `memory ${params.action} received unsupported field(s): ${unknownFields.join(", ")}.`;
+	}
 	const str = (key: string, min: number, max: number) => typeof params[key] === "string" && (params[key] as string).length >= min && (params[key] as string).length <= max;
 	if (params.action === "remember") {
-		if (params.term !== "long" && params.term !== "short" && params.term !== "session") return "memory remember needs term=long|short|session.";
-		if (typeof params.kind !== "string" || !(MEMORY_KINDS as readonly string[]).includes(params.kind)) return "memory remember needs a valid kind.";
-		if (!str("text", 1, MAX_MEMORY_TEXT_CHARS)) return `memory remember text must contain 1..${MAX_MEMORY_TEXT_CHARS} characters.`;
-		if (params.term === "session" && ["tags", "ttlHours", "supersedes", "scope", "derivedFrom"].some(has)) return "session notes accept only kind, text, and optional source.";
-		if (params.scope !== undefined && !["project", "persona", "shared"].includes(String(params.scope))) return "remember scope must be project, persona, or shared.";
-		if (params.term === "short" && params.scope !== undefined && params.scope !== "project") return "short-term notes belong to project scope.";
+		if (params.term !== "long" && params.term !== "short" && params.term !== "session") return rememberCorrection("memory remember is missing a valid term; choose long, short, or session.", SESSION_REMEMBER_EXAMPLE);
+		const example = params.term === "long" ? LONG_REMEMBER_EXAMPLE : params.term === "short" ? SHORT_REMEMBER_EXAMPLE : SESSION_REMEMBER_EXAMPLE;
+		if (typeof params.kind !== "string" || !(MEMORY_KINDS as readonly string[]).includes(params.kind)) return rememberCorrection("memory remember needs a valid kind.", example);
+		if (!str("text", 1, MAX_MEMORY_TEXT_CHARS)) return rememberCorrection(`memory remember text must contain 1..${MAX_MEMORY_TEXT_CHARS} characters.`, example);
+		if (params.term === "session") {
+			const unsupported = ["tags", "ttlHours", "supersedes", "derivedFrom"].filter(has);
+			const incompatibleScope = params.scope !== undefined && params.scope !== "session";
+			const fields = [...unsupported, ...(incompatibleScope ? ["scope"] : [])];
+			if (fields.length > 0) return rememberCorrection(`memory remember term=session does not support field(s): ${fields.join(", ")}; only kind, text, optional source, and optional scope=session are valid.`, SESSION_REMEMBER_EXAMPLE);
+			if (params.source !== undefined && (typeof params.source !== "string" || params.source.length > MAX_MEMORY_SOURCE_CHARS)) return rememberCorrection(`memory source must be at most ${MAX_MEMORY_SOURCE_CHARS} characters.`, example);
+			return;
+		}
+		if (params.term === "long" && params.scope === undefined) return rememberCorrection("memory remember term=long requires an explicit scope=project|persona|shared; there is no implicit long-term destination. Choose the scope that matches the user's actual intent (scope is an API destination, not authenticated consent).", LONG_REMEMBER_EXAMPLE);
+		if (params.scope !== undefined && !["project", "persona", "shared"].includes(String(params.scope))) {
+			const required = params.term === "long" ? "long-term scope must be project, persona, or shared" : "short-term scope must be project";
+			return rememberCorrection(`memory remember field scope is invalid: ${required}.`, example);
+		}
+		if (params.term === "short" && params.scope !== undefined && params.scope !== "project") return rememberCorrection("short-term notes belong to project scope.", SHORT_REMEMBER_EXAMPLE);
 		if (params.tags !== undefined && (!Array.isArray(params.tags) || params.tags.length > MAX_MEMORY_TAGS || !Array.from(params.tags).every((tag) => typeof tag === "string" && tag.length <= MAX_MEMORY_TAG_CHARS))) return "memory tags exceed their bounds.";
 		if (params.derivedFrom !== undefined && (!Array.isArray(params.derivedFrom) || params.derivedFrom.length > MAX_MEMORY_DERIVED_IDS || !Array.from(params.derivedFrom).every((id) => isMemoryId(id)))) return "memory derivedFrom ids are invalid or exceed their bound.";
 		if (params.source !== undefined && (typeof params.source !== "string" || params.source.length > MAX_MEMORY_SOURCE_CHARS)) return "memory source exceeds its bound.";
@@ -235,20 +257,22 @@ async function runMemoryAction(mind: MindService, params: MemoryToolParams, ctx:
 				? say(`Remembered session note ${result.entry.id}. It belongs to this active session only.`, { ok: true, action: "remember", storage: result.storage, id: result.entry.id, summary: `Session note saved — ${compactMemoryText(result.entry.text, 80)}` })
 				: say(`Not stored: ${result.reason}`, { ok: false, reason: result.reason });
 		}
-		const input: RememberInput = { term: params.term, kind: params.kind, text: params.text };
+		const input: RememberInput = params.term === "long"
+			? { term: "long", scope: params.scope as "project" | "persona" | "shared", kind: params.kind, text: params.text }
+			: { term: "short", ...(params.scope === "project" ? { scope: "project" as const } : {}), kind: params.kind, text: params.text };
 		if (params.tags) input.tags = params.tags;
 		if (params.ttlHours !== undefined) input.ttlHours = params.ttlHours;
 		if (params.supersedes) input.supersedes = params.supersedes;
-		if (params.scope === "project" || params.scope === "persona" || params.scope === "shared") input.scope = params.scope;
 		if (params.source) input.source = params.source;
 		if (params.derivedFrom) input.derivedFrom = params.derivedFrom;
 		const r = await mind.remember(input);
+		const destination = params.term === "long" ? params.scope as "project" | "persona" | "shared" : "project";
 		return r.ok
-			? say(`Remembered ${r.entry.id} — ${r.entry.expiresAt ? "short" : "long"}-term ${params.kind}. It will re-appear in your context.`, {
+			? say(`Remembered ${r.entry.id} — ${r.entry.expiresAt ? "short" : "long"}-term ${params.kind} in ${destination} scope. It will re-appear in your context.`, {
 				id: r.entry.id,
 				ok: true,
-				scope: params.scope ?? (r.entry.expiresAt ? "project" : "persona"),
-				summary: `${params.scope ?? (r.entry.expiresAt ? "project" : "persona")} · ${r.entry.expiresAt ? "working" : "durable"} saved — ${compactMemoryText(r.entry.text, 80)}`,
+				scope: destination,
+				summary: `${destination} · ${r.entry.expiresAt ? "working" : "durable"} saved — ${compactMemoryText(r.entry.text, 80)}`,
 			})
 			: say(`Not stored: ${r.reason}`, { ok: false, reason: r.reason });
 	}
@@ -370,6 +394,7 @@ async function runMemoryAction(mind: MindService, params: MemoryToolParams, ctx:
 	// forget
 	if (!params.id) return say("memory forget needs { id } (see recall).", { ok: false, reason: "missing id" });
 	if (params.id.startsWith("session:")) {
+		if (params.scope !== undefined && params.scope !== "session") return say("A session note id can only be forgotten with scope=session.", { ok: false, reason: "scope_mismatch" });
 		if (!sessionMemory) return say("Active-session memory is unavailable.", { ok: false, reason: "session_memory_unavailable" });
 		const result = sessionMemory.forget(ctx, params.id);
 		return result.ok

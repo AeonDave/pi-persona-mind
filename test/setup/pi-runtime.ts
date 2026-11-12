@@ -26,7 +26,7 @@ const companionFixture: ExtensionFactory = (pi) => {
 };
 
 export async function runtimeHarness(root: string, extensionPath: string, factories: ExtensionFactory[] = [], options: { companion?: boolean; additionalExtensionPaths?: string[] } = {}) {
-  assert.equal(VERSION, "1.4.0", "run against the supported current host");
+  assert.equal(VERSION, "1.5.2", "run against the supported current host");
   const cwd = join(root, "workspace");
   const agentDir = join(root, "agent");
   await mkdir(cwd, { recursive: true });

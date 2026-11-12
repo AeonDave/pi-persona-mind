@@ -61,7 +61,7 @@ test("project optimizer refuses foreign owners and forgetting can be scoped", as
 	assert.ok(inspection.ok);
 	assert.equal((await colleague.preview({ target: "project-long", fingerprint: inspection.fingerprint,
 		operations: [{ sourceIds: [saved.entry.id], kind: "note", text: "Project uses PostgreSQL for storage." }] })).ok, false);
-	assert.ok((await service("a").remember({ term: "long", kind: "note", text: "Project uses PostgreSQL." })).ok);
+	assert.ok((await service("a").remember({ term: "long", scope: "persona", kind: "note", text: "Project uses PostgreSQL." })).ok);
 	assert.equal((await service("a").forget(saved.entry.id, "project")).removed, 1);
 	assert.equal((await service("a").recall("PostgreSQL", "persona", 8)).hits.length, 1);
 }));

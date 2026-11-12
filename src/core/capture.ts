@@ -15,11 +15,11 @@ export interface CaptureCue {
 	snippet: string;
 	/** The suggested memory kind for the candidate. */
 	kind: MemoryKind;
-	/** Durable cues suggest long-term. */
-	term: "long";
+	/** Capture is always provisional in the native active session, regardless of durability wording. */
+	term: "session";
 	/** True only for a sentence-initial EXPLICIT persist-intent phrase ("from now on", "remember
 	 *  that", "for future reference") — as opposed to casual "always/never"/"I prefer" or a cue
-	 *  quoted inside a report. The caller may persist only this high-confidence class. */
+	 *  quoted inside a report. AUTO may capture only this high-confidence class, session-locally. */
 	strong: boolean;
 	/** The durable fact with the cue phrase removed when it can be done deterministically. */
 	candidate: string;
@@ -132,7 +132,7 @@ export function detectCaptureCues(userText: string): CaptureCue[] {
 			if (!cue.re.test(sentence)) continue;
 			const snippet = sentence.length > MAX_SNIPPET ? `${sentence.slice(0, MAX_SNIPPET - 1)}…` : sentence;
 			const candidate = candidateFor(sentence);
-			found.push({ snippet, kind: cue.kind, term: "long", strong: candidate.explicit, candidate: candidate.text });
+			found.push({ snippet, kind: cue.kind, term: "session", strong: candidate.explicit, candidate: candidate.text });
 			break;
 		}
 		if (found.length >= 4) break;

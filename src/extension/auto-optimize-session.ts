@@ -24,7 +24,7 @@ export function autoOptimizeTarget(input: unknown): AutoOptimizeTarget | undefin
 	if (scope !== undefined && scope !== "project" && scope !== "persona" && scope !== "shared") return undefined;
 	if (value.action === "remember") {
 		if (value.term === "short") return scope === undefined || scope === "project" ? "project" : undefined;
-		if (value.term !== "long" || scope === "shared") return undefined;
+		if (value.term !== "long" || scope === undefined || scope === "shared") return undefined;
 		return scope === "project" ? "project-long" : "persona";
 	}
 	if (value.action === "promote") {
@@ -83,7 +83,11 @@ export function installAutoOptimize(pi: ExtensionAPI, deps: Dependencies): AutoO
 			report: (title: string, body: string) => {
 				if (!current()) throw new Error("automatic memory owner changed");
 				pi.appendEntry(MIND_RESULT_ENTRY_TYPE, { title, content: body });
-				if (title !== "Mind automatic proposal") ctx.ui.notify(`Mind · ${body.split("\n", 1)[0]!.slice(0, 160)}`, "info");
+				if (title !== "Mind automatic proposal") {
+					const target = / — (project(?:-long)?|persona)$/.exec(title)?.[1];
+					const kind = title.includes("proposal") ? "proposal" : "review";
+					ctx.ui.notify(`Mind · ${target ? `${target} ` : ""}${kind} update`, "info");
+				}
 			}, attempts,
 		};
 		if (resetPreference) scheduler.activate(owner, process.env.PI_PERSONA_MIND_OPTIMIZE !== "off");

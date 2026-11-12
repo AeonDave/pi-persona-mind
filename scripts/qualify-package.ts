@@ -1,4 +1,4 @@
-/** Load a packed/extracted extension outside the checkout through the real minimum Pi SDK. */
+/** Load an extracted extension through the current Pi 1.5.2 SDK. */
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -16,7 +16,7 @@ try {
   await h.bind();
   h.session.setActiveToolsByName(["memory", "backlog"]);
   h.faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("memory", { action: "remember", term: "long", kind: "preference", text: "The user prefers reviewable changes." }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("memory", { action: "remember", term: "long", scope: "persona", kind: "preference", text: "The user prefers reviewable changes." }), { stopReason: "toolUse" }),
     fauxAssistantMessage(fauxToolCall("memory", { action: "recall", query: "reviewable" }), { stopReason: "toolUse" }),
     fauxAssistantMessage(fauxToolCall("backlog", { action: "add", text: "Review the qualified package.", dueInSeconds: 0.0001 }), { stopReason: "toolUse" }),
     fauxAssistantMessage("Qualified."),
@@ -35,7 +35,7 @@ try {
   assert.equal(h.faux.state.callCount, 4, "the reminder itself adds no model call");
   await qualifyMemory(h.session);
   assert.equal(h.faux.state.callCount, 4, "explicit local memory operations add no model call");
-  console.log("PASS: extracted Mind package loaded in Pi 1.4; session notes, full read, staged optimization, stale-plan refusal and one display-only wake qualified.");
+  console.log("PASS: extracted Mind package loaded in Pi 1.5.2; session notes, full read, staged optimization, stale-plan refusal and one display-only wake qualified.");
 } finally {
   try { await h?.dispose(); }
   finally { await rm(root, { recursive: true, force: true }); }

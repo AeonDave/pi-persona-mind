@@ -139,7 +139,7 @@ export default function(pi) { pi.registerProvider(createFixture().provider); }
 		assert.equal(ctx.hasUI, true, "automatic review must be qualified with a live native UI adapter");
 		assert.equal(ctx.mode, "rpc");
 		const remember = async (text) => {
-			const result = await ctx.executeTool("memory", { action: "remember", term: "long", kind: "note", text });
+			const result = await ctx.executeTool("memory", { action: "remember", term: "long", scope: "persona", kind: "note", text });
 			assert.equal(result.isError, false, JSON.stringify(result));
 			assert.equal(result.result?.details?.ok, true);
 		};
@@ -210,7 +210,7 @@ export default function(pi) { pi.registerProvider(createFixture().provider); }
 	await session.prompt("/persona beta");
 	let ctx = session.extensionRunner.createToolContext("live-memory-setup", undefined);
 	const remember = async (text) => {
-		const result = await ctx.executeTool("memory", { action: "remember", term: "long", kind: "note", text });
+		const result = await ctx.executeTool("memory", { action: "remember", term: "long", scope: "persona", kind: "note", text });
 		assert.equal(result.isError, false, `Memory fixture write failed: ${JSON.stringify(result.result?.content ?? result.error ?? result)}`);
 		assert.equal(result.result?.details?.ok, true);
 	};

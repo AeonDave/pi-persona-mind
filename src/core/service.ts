@@ -17,7 +17,7 @@ import { renderMind } from "./inject.ts";
 import { readMemory, memoryTargets, type MemoryReadResult, type MemoryReadScope } from "./memory-read.ts";
 import { MemoryOptimizer } from "./optimize-service.ts";
 import { samePersistedMemory } from "./optimize.ts";
-import type { MemoryEntry, MemoryInput, MemoryKind, MemoryTerm } from "./memory.ts";
+import type { MemoryEntry, MemoryInput, MemoryKind } from "./memory.ts";
 import { clampRecallMax, isExpired, isMemoryId, makeMemory, memoryContentKey, memoryIdMatches, promoteToLong, pruneExpired, recall, sameMemoryContent, supersedeTargets, upsertMemory, validateLongMemory, validateShortMemory, MAX_MEMORY_DERIVED_IDS, MAX_MEMORY_ID_CHARS, MAX_MEMORY_SOURCE_CHARS, MAX_MEMORY_TAGS, MAX_MEMORY_TAG_CHARS, MAX_MEMORY_TEXT_CHARS } from "./memory.ts";
 import { scanContent } from "./scanner.ts";
 import { memoryMutationLockPath, type Scope } from "./scope.ts";
@@ -34,18 +34,20 @@ export interface MindServiceOptions {
 	budget?: MindBudget;
 }
 
-export interface RememberInput {
-	term: MemoryTerm;
+interface RememberInputBase {
 	kind: MemoryKind;
 	text: string;
 	tags?: string[];
 	ttlHours?: number;
 	supersedes?: string;
-	/** Durable repository knowledge stays in this project; persona is the default for long facts. */
-	scope?: "project" | "persona" | "shared";
 	source?: string;
 	derivedFrom?: string[];
 }
+
+/** Long writes name their destination; short working memory is project-scoped by default. */
+export type RememberInput =
+	| (RememberInputBase & { term: "long"; scope: "project" | "persona" | "shared" })
+	| (RememberInputBase & { term: "short"; scope?: "project" });
 
 export interface BacklogAddInput {
 	text: string;
@@ -232,7 +234,9 @@ export class MindService {
 
 	/** Store a memory (long or short term). Scanned + non-empty-checked before it is persisted. */
 	async remember(input: RememberInput): Promise<RememberResult> {
+		if (input.term !== "long" && input.term !== "short") return { ok: false, reason: "unknown memory term" };
 		if (input.scope !== undefined && !["project", "persona", "shared"].includes(input.scope)) return { ok: false, reason: "unknown memory scope" };
+		if (input.term === "long" && input.scope === undefined) return { ok: false, reason: "long-term memory requires an explicit scope: project, persona, or shared" };
 		if (input.term === "short" && input.scope !== undefined && input.scope !== "project") return { ok: false, reason: "short-term memory belongs to the project" };
 		const now = this.now();
 		const text = input.text.trim();
@@ -261,8 +265,8 @@ export class MindService {
 		const scan = scanContent(text);
 		if (!scan.ok) return { ok: false, reason: scan.reason ?? "rejected by content scanner" };
 
-		// An objective is the persona's durable north-star — always long-term, never a decaying note.
-		const term: MemoryTerm = input.kind === "objective" ? "long" : input.term;
+		// Kind describes content; only the caller-selected term controls lifetime.
+		const term = input.term;
 		const makeInput: MemoryInput = { term, kind: input.kind, text };
 		if (input.tags) makeInput.tags = input.tags;
 		if (input.ttlHours !== undefined) makeInput.ttlHours = input.ttlHours;

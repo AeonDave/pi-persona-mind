@@ -3,12 +3,22 @@ import type { MemoryEntry, MemoryKind } from "../../src/core/memory.ts";
 export type MemoryEvaluationTier = "persona" | "project" | "working";
 export type MemoryEvaluationFact = MemoryEntry & { tier: MemoryEvaluationTier };
 
+export type MemoryEvaluationSentinelCategory = "chronology" | "negation" | "exception" | "provenance";
+
+export interface MemoryEvaluationSentinel {
+	pairId: string;
+	category: MemoryEvaluationSentinelCategory;
+	expectedId: string;
+	pairWith?: string;
+}
+
 export interface MemoryEvaluationCase {
 	id: string;
 	query: string;
 	/** Empty only for the explicit no-shared-vocabulary abstention case. */
 	relevantIds: readonly string[];
 	why: string;
+	sentinel?: MemoryEvaluationSentinel;
 }
 
 export const MEMORY_EVALUATION_NOW = Date.parse("2026-10-25T00:00:00.000Z");
@@ -57,7 +67,7 @@ export const MEMORY_EVALUATION_FACTS: readonly MemoryEvaluationFact[] = [
 	fact("project-isolation", "invariant", "Project durable memory belongs to one canonical repository and must never leak into other projects.", ["project owner", "repository isolation"], "project", 10),
 	fact("session-branch", "invariant", "Session notes replay only on the active Pi branch and preserve their origin session ID.", ["branch notes", "session memory"], "persona", 45),
 	fact("branch-exception", "gotcha", "Do not replay a note after a branch fork unless it exists on the active branch.", ["active branch", "except fork"], "persona", 32),
-	fact("runtime-version", "convention", "The host baseline is Pi 1.4.0 and Node 22.19 or newer; historical host adapters are removed.", ["runtime version", "no legacy host"], "persona", 26),
+	fact("runtime-version", "convention", "The host baseline is Pi 1.5.2 and Node 22.19 or newer; historical host adapters are removed.", ["runtime version", "no legacy host"], "persona", 26),
 	fact("promotion-order", "invariant", "Promotion writes the durable destination before removing STM, so interruption can leave a duplicate but never lose the source.", ["promotion order", "durable first"], "persona", 20),
 	fact("project-schema-current", "note", "Project-long memory is durable, project STM expires, and durable project facts retain persona attribution.", ["project schema", "durable project"], "project", 2),
 	fact("project-schema-old", "note", "Project memories are all short-lived and automatically expire after 48 hours.", ["project schema", "legacy"], "project", 100),
@@ -75,7 +85,8 @@ export const MEMORY_EVALUATION_FACTS: readonly MemoryEvaluationFact[] = [
 export const MEMORY_EVALUATION_CASES: readonly MemoryEvaluationCase[] = [
 	{ id: "provider-pin", query: "provider qualified model strict billing providers", relevantIds: ["provider-pin"], why: "known terms" },
 	{ id: "strict-recovery", query: "strategy recovery main model user authorized", relevantIds: ["strict-recovery"], why: "known terms over older retry guidance" },
-	{ id: "retry-exception", query: "do not retry provider errors except unknown model explicit authorization", relevantIds: ["retry-exception"], why: "negation and exception retention" },
+	{ id: "retry-exception", query: "do not retry provider errors except unknown model explicit authorization", relevantIds: ["retry-exception"], why: "negation and exception retention", sentinel: { pairId: "retry-policy", category: "negation", expectedId: "retry-exception", pairWith: "retry-old-history" } },
+	{ id: "retry-old-history", query: "historical retry any provider failure regardless of policy", relevantIds: ["retry-old"], why: "an obsolete rule remains explicitly findable when requested", sentinel: { pairId: "retry-policy", category: "negation", expectedId: "retry-old", pairWith: "retry-exception" } },
 	{ id: "idle-window", query: "idle timeout every event tokens streamed output progress", relevantIds: ["idle-window"], why: "known terms over an obsolete value" },
 	{ id: "wallclock-cap", query: "hard wall clock cap never resets", relevantIds: ["wallclock-cap"], why: "known terms" },
 	{ id: "startup-current", query: "startup deadline zero progress first real output", relevantIds: ["startup-current"], why: "known terms and current rule" },
@@ -86,19 +97,20 @@ export const MEMORY_EVALUATION_CASES: readonly MemoryEvaluationCase[] = [
 	{ id: "memory-path", query: "src/core/memory.ts recall ranking lastSeenAt", relevantIds: ["memory-path"], why: "exact repository path" },
 	{ id: "design-contract", query: "docs/DESIGN.md loaded memory owner contract", relevantIds: ["design-contract"], why: "exact documentation path" },
 	{ id: "project-isolation", query: "project owner repository isolation", relevantIds: ["project-isolation"], why: "explicit tag bridge" },
-	{ id: "session-branch", query: "branch notes session memory origin session id", relevantIds: ["session-branch"], why: "explicit tag bridge" },
-	{ id: "branch-exception", query: "do not replay note after branch fork unless active branch", relevantIds: ["branch-exception"], why: "negation and exception retention" },
-	{ id: "runtime-version", query: "Pi 1.4.0 Node 22.19 no historical host adapters", relevantIds: ["runtime-version"], why: "known terms" },
+	{ id: "session-branch", query: "branch notes session memory origin session id", relevantIds: ["session-branch"], why: "explicit tag bridge", sentinel: { pairId: "branch-replay", category: "exception", expectedId: "session-branch", pairWith: "branch-exception" } },
+	{ id: "branch-exception", query: "do not replay note after branch fork unless active branch", relevantIds: ["branch-exception"], why: "negation and exception retention", sentinel: { pairId: "branch-replay", category: "exception", expectedId: "branch-exception", pairWith: "session-branch" } },
+	{ id: "runtime-version", query: "Pi 1.5.2 Node 22.19 no historical host adapters", relevantIds: ["runtime-version"], why: "known terms" },
 	{ id: "promotion-order", query: "promotion durable destination before removing STM", relevantIds: ["promotion-order"], why: "known terms" },
 	{ id: "project-schema-current", query: "current project schema durable persona attribution", relevantIds: ["project-schema-current"], why: "temporal correction with shared tags" },
 	{ id: "owner-current", query: "loaded owner persona selection saved runtime identity", relevantIds: ["owner-current"], why: "temporal correction with shared tags" },
-	{ id: "capture-origin", query: "direct user capture quoted worker output", relevantIds: ["capture-origin"], why: "source and trust boundary" },
+	{ id: "capture-origin", query: "direct user capture quoted worker output", relevantIds: ["capture-origin"], why: "source and trust boundary", sentinel: { pairId: "capture-origin", category: "provenance", expectedId: "capture-origin" } },
 	{ id: "wake-contract", query: "wakes display only no model turn", relevantIds: ["wake-contract"], why: "negative behavior invariant" },
 	{ id: "backlog-order", query: "taken backlog due priority ordinary open work", relevantIds: ["backlog-order"], why: "explicit tag bridge" },
 	{ id: "retrieval-contract", query: "retrieval limits tags paths no embeddings", relevantIds: ["retrieval-contract"], why: "explicit tag bridge" },
 	{ id: "startup-old", query: "startup timeout 60 seconds", relevantIds: ["startup-old"], why: "historical value remains explicitly findable" },
 	{ id: "idle-current", query: "current idle timeout events tokens", relevantIds: ["idle-window"], why: "temporal correction over recent obsolete detail" },
-	{ id: "owner-current-again", query: "loaded persona selection active owner", relevantIds: ["owner-current"], why: "temporal correction over saved selection" },
+	{ id: "owner-current-again", query: "loaded persona selection active owner", relevantIds: ["owner-current"], why: "temporal correction over saved selection", sentinel: { pairId: "memory-owner-timeline", category: "chronology", expectedId: "owner-current", pairWith: "owner-old-history" } },
+	{ id: "owner-old-history", query: "historical rule use saved Persona settings to choose the active memory owner", relevantIds: ["owner-old"], why: "the superseded owner rule remains findable when explicitly queried", sentinel: { pairId: "memory-owner-timeline", category: "chronology", expectedId: "owner-old", pairWith: "owner-current-again" } },
 	{ id: "recent-noise", query: "provider retry policy strict explicit user authorization", relevantIds: ["retry-exception"], why: "relevant older fact outranks recent unrelated notes" },
 	{ id: "unlabeled-synonym-abstention", query: "resume conversation brownout", relevantIds: [], why: "no shared vocabulary or synonym tag; abstention is correct" },
 ];

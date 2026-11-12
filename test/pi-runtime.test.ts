@@ -11,7 +11,7 @@ import { runtimeHarness } from "./setup/pi-runtime.ts";
 
 const entry = fileURLToPath(new URL("../src/index.ts", import.meta.url));
 
-test("real Pi 1.4: a newly overdue backlog alarm is displayed once without another model turn", { timeout: 30_000 }, async () => {
+test("real Pi 1.5.2: a newly overdue backlog alarm is displayed once without another model turn", { timeout: 30_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "mind-native-live-wake-"));
   let h: Awaited<ReturnType<typeof runtimeHarness>> | undefined;
   try {
@@ -42,7 +42,7 @@ test("real Pi 1.4: a newly overdue backlog alarm is displayed once without anoth
   }
 });
 
-test("real Pi 1.4 codemode: only relayed blocked output nudges the supervisor", { timeout: 30_000 }, async () => {
+test("real Pi 1.5.2 codemode: only relayed blocked output nudges the supervisor", { timeout: 30_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "mind-native-codemode-"));
   let h: Awaited<ReturnType<typeof runtimeHarness>> | undefined;
   const nested: string[] = [];
@@ -78,7 +78,7 @@ test("real Pi 1.4 codemode: only relayed blocked output nudges the supervisor", 
   }
 });
 
-test("real Pi 1.4: user capture persists before the model and reloads into a fresh session", { timeout: 30_000 }, async () => {
+test("real Pi 1.5.2: AUTO capture is a session note and does not cross into a new session", { timeout: 30_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "mind-pi-runtime-"));
   let h: Awaited<ReturnType<typeof runtimeHarness>> | undefined;
   try {
@@ -96,14 +96,14 @@ test("real Pi 1.4: user capture persists before the model and reloads into a fre
     assert.match(injected, /persona-mind/);
     const session = h.session;
     const recall = await session.extensionRunner!.createToolContext("native-recall", undefined)
-      .executeTool("memory", { action: "recall", query: "reviewable" });
+      .executeTool("memory", { action: "recall", query: "reviewable", scope: "session" });
     assert.match(JSON.stringify(recall.result.content), /small, reviewable changes/);
     await h.dispose();
     h = await runtimeHarness(root, entry);
     await h.bind();
     h.faux.setResponses([(context) => {
-      assert.match(JSON.stringify(context.messages.filter((message) => message.role === "system")), /small, reviewable changes/);
-      return fauxAssistantMessage("Still remembered.");
+      assert.doesNotMatch(JSON.stringify(context.messages.filter((message) => message.role === "system")), /small, reviewable changes/);
+      return fauxAssistantMessage("The new session has no inherited session note.");
     }]);
     await h.session.prompt("What conventions apply?", { source: "interactive" });
     assert.equal(h.faux.state.callCount, 1, "resurfacing itself adds no model call");
@@ -113,7 +113,7 @@ test("real Pi 1.4: user capture persists before the model and reloads into a fre
   }
 });
 
-test("real Pi 1.4: memory tools execute through the agent loop and workers remain read-only", { timeout: 30_000 }, async () => {
+test("real Pi 1.5.2: memory tools execute through the agent loop and workers remain read-only", { timeout: 30_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "mind-pi-worker-"));
   const previousLeg = process.env.PI_PERSONA_LEG;
   let h: Awaited<ReturnType<typeof runtimeHarness>> | undefined;
@@ -122,7 +122,7 @@ test("real Pi 1.4: memory tools execute through the agent loop and workers remai
     await h.bind();
     h.session.setActiveToolsByName(["memory"]);
     h.faux.setResponses([
-      fauxAssistantMessage(fauxToolCall("memory", { action: "remember", term: "long", kind: "preference", text: "The user prefers blue widgets." }), { stopReason: "toolUse" }),
+      fauxAssistantMessage(fauxToolCall("memory", { action: "remember", term: "long", scope: "persona", kind: "preference", text: "The user prefers blue widgets." }), { stopReason: "toolUse" }),
       fauxAssistantMessage("Saved."),
     ]);
     await h.session.prompt("Save the verified preference.", { source: "interactive" });

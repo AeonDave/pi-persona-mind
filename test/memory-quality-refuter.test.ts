@@ -67,13 +67,13 @@ test("cross-project persona writes cannot become silently deleted through a stal
 		const mind = new MindService({ persona: "elite", slug: "repo-a", projectRoot: join(dir, "a"), paths }, { now: () => T });
 		const other = new MindService({ persona: "elite", slug: "repo-b", projectRoot: join(dir, "b"), paths: mindPaths(dir, "elite", "repo-b") }, { now: () => T });
 		const text = "Project compiler flags are intentionally distinct";
-		assert.ok((await mind.remember({ term: "long", kind: "note", text, tags: ["a,b"] })).ok);
+		assert.ok((await mind.remember({ term: "long", scope: "persona", kind: "note", text, tags: ["a,b"] })).ok);
 		let interposed = false;
 		JsonStore.prototype.load = async function () {
 			const snapshot = await originalLoad.call(this);
 			if (this.filePath === paths.ltm && !interposed) {
 				interposed = true;
-				concurrentWrite = other.remember({ term: "long", kind: "note", text, tags: ["a", "b"] });
+				concurrentWrite = other.remember({ term: "long", scope: "persona", kind: "note", text, tags: ["a", "b"] });
 				// If a global transaction lock is introduced the competing writer correctly waits.
 				await Promise.race([concurrentWrite, new Promise<void>((resolve) => setTimeout(resolve, 80))]);
 			}
@@ -95,7 +95,7 @@ test("background memory migration serializes with a foreground legacy-alias forg
 		const paths = mindPaths(dir, "elite", "repo");
 		const mind = new MindService({ persona: "elite", slug: "repo", projectRoot: dir, paths }, { now: () => T });
 		const text = "A repository fact with historical tagged aliases";
-		assert.ok((await mind.remember({ term: "long", kind: "note", text, tags: ["a,b"] })).ok);
+		assert.ok((await mind.remember({ term: "long", scope: "persona", kind: "note", text, tags: ["a,b"] })).ok);
 		const incoming = makeMemory({ term: "long", kind: "note", text, tags: ["a", "b"] }, T);
 		const oldLtm = join(dir, "pi-persona-mind", "memory", "ltm");
 		await mkdir(oldLtm, { recursive: true });
@@ -124,7 +124,7 @@ test("forget preserves an affected fact changed by a direct current-store writer
 	try {
 		const paths = mindPaths(dir, "elite", "repo");
 		const mind = new MindService({ persona: "elite", slug: "repo", projectRoot: dir, paths }, { now: () => T });
-		const saved = await mind.remember({ term: "long", kind: "note", text: "Original source before concurrent evidence" }); assert.ok(saved.ok);
+		const saved = await mind.remember({ term: "long", scope: "persona", kind: "note", text: "Original source before concurrent evidence" }); assert.ok(saved.ok);
 		let interposed = false;
 		JsonStore.prototype.load = async function () {
 			const snapshot = await originalLoad.call(this);
@@ -146,7 +146,7 @@ test("promotion preserves graduation but never retires a lineage handle that bec
 	try {
 		const mind = new MindService({ persona: "elite", slug: "repo", projectRoot: dir, paths: mindPaths(dir, "elite", "repo") }, { now: () => T });
 		const text = "Build flag policy";
-		const original = await mind.remember({ term: "long", kind: "note", text, tags: ["a,b"] }); assert.ok(original.ok);
+		const original = await mind.remember({ term: "long", scope: "persona", kind: "note", text, tags: ["a,b"] }); assert.ok(original.ok);
 		const alias = legacyContentId("note", text, ["a,b"]);
 		const working = await mind.remember({ term: "short", kind: "note", text: "Reviewed replacement build policy", supersedes: alias }); assert.ok(working.ok);
 		const shared = await mind.remember({ term: "long", scope: "shared", kind: "note", text, tags: ["a", "b"] }); assert.ok(shared.ok);

@@ -21,7 +21,7 @@ test("native Pi keeps Mind inactive without a loaded companion, including direct
     assert.ok(!h.session.getActiveToolNames().includes("memory"));
     assert.ok(!h.session.getActiveToolNames().includes("backlog"));
     const context = h.session.extensionRunner!.createToolContext("missing-companion-probe", undefined);
-    const outcome = await context.executeTool("memory", { action: "remember", term: "long", kind: "note", text: "Programmatic writes also require the companion." });
+    const outcome = await context.executeTool("memory", { action: "remember", term: "long", scope: "persona", kind: "note", text: "Programmatic writes also require the companion." });
     assert.ok(outcome.isError || (outcome.result?.details as { ok?: boolean } | undefined)?.ok === false, JSON.stringify(outcome));
     await h.session.prompt("/persona-mind reset workspace");
     assert.equal(existsSync(join(h.agentDir, "persona-mind")), false, "inactive extension created no memory/import/lock directories");

@@ -51,11 +51,6 @@
     "eval:memory": "node --import tsx scripts/evaluate-memory.ts",
     "verify": "npm run typecheck && npm test"
   },
-  "overrides": {
-    "@earendil-works/pi-coding-agent@1.4.0": {
-      "undici": "8.12.3"
-    }
-  },
   "pi": {
     "image": "https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v0.8.7/assets/banner.png",
     "extensions": [
@@ -83,10 +78,10 @@
     }
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "1.4.0",
-    "@earendil-works/pi-ai": "1.4.0",
-    "@earendil-works/pi-coding-agent": "1.4.0",
-    "@earendil-works/pi-tui": "1.4.0",
+    "@earendil-works/pi-agent-core": "1.5.2",
+    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "@earendil-works/pi-tui": "1.5.2",
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typebox": "*",

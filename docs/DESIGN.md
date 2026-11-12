@@ -1,14 +1,15 @@
 # pi-persona-mind — current design
 
 This is the binding implementation contract. Release history belongs in [CHANGELOG](../CHANGELOG.md);
-the user workflow is in [README](../README.md). Evidence behind consolidation decisions is in
+the user workflow is in [README](../README.md). Local design rationale and evaluation boundaries are in
 [MEMORY-RESEARCH](MEMORY-RESEARCH.md).
 
 ## Host and module boundaries
 
-This design contract describes release 0.8.7.
+This design contract describes the current development tree; released changes are recorded separately
+in CHANGELOG.md.
 
-Target the latest stable Pi only, currently 1.4.0, and Node >=22.19. All four development Pi packages
+Target the latest stable Pi only, currently 1.5.2, and Node >=22.19. All four development Pi packages
 are pinned together; runtime host/typebox packages remain optional wildcard peers. No second host
 runtime or historical hook-shape adapter is bundled. A development-only security override does not
 patch an installed host.
@@ -52,13 +53,19 @@ Command parsing/presentation lives outside the factory. Important seams:
 
 LTM/STM facts have content identity based on kind, text and sorted tags; provenance is excluded.
 Exact re-recording updates identical normalized content (not semantic equivalence). lastSeenAt tracks recording/promotion, not
-recall frequency. Read operations do not boost ranking or reset expiry. An objective is durable
-in the ordinary store; an explicitly session-scoped objective remains in that session.
+recall frequency. Read operations do not boost ranking or reset expiry. `term` alone selects lifetime:
+`kind: objective` is not automatically promoted, so a short objective remains expiring project context
+and a session objective remains on that active native session branch.
 
 Supersession retires an active row. derivedFrom stores bounded IDs. Optimizer before images provide
 bounded recoverability; ordinary supersession/forget are not a temporal database or unlimited undo.
-Promotion defaults to project LTM and requires an owned live STM source; persona/shared destinations
-must be explicit. Existing persona facts are never reassigned to guessed projects. Promotion removes
+Every long-term `remember` requires an explicit destination: project LTM, persona LTM, or shared LTM;
+there is no implicit persona destination. Short-term memory remains project-scoped by default. Promotion
+defaults to project LTM and requires an owned live STM source; persona/shared promotion destinations
+must be explicit. A scope value selects API routing intent; it is not authenticated user consent. Use
+session for task-specific or uncertain choices (models, strategies, task constraints), project for
+stable repository facts, persona for facts intended across all projects of the same persona, and shared
+only for facts truly intended across personas. Existing persona facts are never reassigned to guessed projects. Promotion removes
 only its exact source row; equal-text observations from another owner retain their provenance.
 
 ## Scope and companion integration
@@ -210,7 +217,7 @@ Stores carry version, sequence, updatedAt and entries. Mutations use same-direct
 fsync, atomic rename, exclusive lockfiles and ownership checks. Directory fsync is best-effort on
 Windows. A live/foreign/malformed lock holder is never stolen merely for being old. Corruption is
 recovered or quarantined with diagnostics, never silently treated as an empty valid store.
-The atomic-store pattern is adapted from OpenLore (MIT).
+Third-party attribution and license notices are retained in [LICENSE](../LICENSE).
 
 Multi-store memory decisions serialize through one profile-wide memory transaction lock, anchored
 beside shared LTM. A project-only lock is insufficient: persona/shared facts are visible across
@@ -247,11 +254,16 @@ wake sources. It cannot be steered, stopped as a worker, counted as an agent or 
 telemetry. Pending proposals are staged, not running. Native owner and scope changes suppress
 late events; terminal rows have bounded retention. This is cooperative UI, not task authority.
 
-Direct-user strong persistence cues may be captured deterministically before the model starts;
-casual cues only suggest a tool call. Prompt/off modes preserve their declared behavior. Quoted,
-fenced, peer and worker material is not a direct-user capture request. No-cue input skips migration
-waits. Lifecycle generations prevent late capture receipts from leaking into a replacement session;
-an accepted write may finish in its original store.
+In AUTO mode, strong direct-user persistence cues may be captured deterministically before the model
+starts, but every such capture is provisional and writes only a native active-branch session note—never
+external project/persona/shared memory, migration destinations, or optimizer dirty state. This includes
+“remember”, “from now on”, and explicitly durable/permanent wording. The receipt says session-only, says
+no durable store was written, and invites a separate deliberate scoped memory call if broader retention
+matches actual user intent; it does not forbid deliberate durable curation. A session append failure
+has no durable fallback. Prompt mode remains nudge-only and off disables detection/capture. Quoted,
+fenced, peer, worker, extension-follow-up and unattributed content are not direct-user capture input.
+No-cue input skips migration waits. Lifecycle/current-input/owner generations prevent stale capture
+notices; accepted notes stay with the original native owner and are never copied to a replacement session.
 
 Normal injection uses entry caps (8 persona/shared LTM, 4 project LTM, 5 STM, 6 backlog), plus a
 combined 2,400-token planning estimate across all memory blocks, including session notes (up to 600),
@@ -270,14 +282,35 @@ Wakes are display-only appendEntry plus a short toast, never sendUserMessage/tri
 due reminders are not replayed. Newly due reminders are armed immediately and cancel on closure.
 Keep pending/delivered deadline identity across maintenance re-arms.
 
-Use shared expandable-card helpers: compact sanitized chrome, terminal-width clipping, full safe body
-on expansion. Saved-memory tool bodies do not repeat their call title. A session read is not a save
-receipt. Commands retain reports in custom-entry history; warnings/toasts stay short. Display callbacks
-must still belong to their accepting session and scope after asynchronous reads.
+Standalone cards use Persona's single `createCardFrame` implementation through the synchronous local
+`pi-persona:card-frame:v1` presentation query. Mind mirrors the small structural contract and queries
+at each renderer invocation, without hard-importing an optional package or caching a factory across
+reload. Missing, incompatible, ambiguous or throwing providers use a minimal sanitized full-text
+history fallback, not a second styled card engine. This port conveys no memory, scheduling or
+security authority. Presentation models carry title, semantic state, full body, width-aware preview,
+optional metadata and Markdown; the frame owns theme, truncation, expansion and padding.
+
+Entry cards read the current public `pi.getSettings().outputPad` (native 0/1, default 1) because entry
+render options omit it, and use host-provided expand hints. Native memory/backlog tool results retain
+Pi's shell and receive no duplicate padding or standalone frame. Saved-memory receipts use a compact
+summary with an expand hint; expansion reveals the original receipt, including its addressable ID,
+without rewriting the tool payload or repeating the call title. A session read is not a save receipt. Optimization previews must retain their
+selected-window qualification and never imply every record was reviewed; expansion retains worker,
+model/effort and terminal-reference provenance. Commands retain reports in custom-entry history;
+warnings/toasts stay short and are not duplicate durable cards. Display callbacks must still belong
+to their accepting session and scope after asynchronous reads.
 
 ## Verification boundaries
 
-Tests isolate PI_PERSONA_* and a throwaway PI_AGENT_DIR, use the actual Pi 1.4 SDK/tool pipeline and
+The source-checkout `eval:memory` command reports individual paired sentinel ranks and actual bounded
+injection outcomes, retaining historical queries and corruption/removed-fact negative controls.
+Token diagnostics compare the unchanged UTF-8-bytes/3 estimate to pinned published reference vectors,
+with exact input/token-ID hashes and source provenance. All inputs use the same calculation: no
+language detector, language-specific factor, local tokenizer execution or runtime network request.
+The reference encoding is not the current model's billing counter, and eight curated vectors do not
+establish broad language coverage or justify automatic budget tuning. The runtime budget is unchanged.
+
+Tests isolate PI_PERSONA_* and a throwaway PI_AGENT_DIR, use the actual Pi 1.5.2 SDK/tool pipeline and
 offline providers, and join session_shutdown before SDK disposal. Native session tests cover persisted
 reopen, branch/fork, in-memory behavior and owner revocation. Store tests cover lost writes, stale plans,
 invalid inputs and concurrent apply. Installed-host/package qualification complements source tests.

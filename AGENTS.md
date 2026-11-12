@@ -9,13 +9,15 @@ coupled through a versioned local companion handshake to
 - Typecheck: `npm run typecheck` (`tsc --noEmit`, strict + `exactOptionalPropertyTypes`)
 - Tests: `npm test` · both: `npm run verify`
 - Hermetic choke point: `node --import tsx --import ./test/setup/hermetic-env.ts --test test/*.test.ts`
-- Installed Pi 1.4 qualification: `node --import tsx scripts/qualify-host.mjs <absolute-pi-package-root> <absolute-pi-persona-extension-path> [<absolute-packed-mind-extension-path>]`
+- Installed Pi 1.5.2 qualification: `node --import tsx scripts/qualify-host.mjs <absolute-pi-package-root> <absolute-pi-persona-extension-path> [<absolute-packed-mind-extension-path>]`
   (isolated profile, offline synthetic provider; no cloud authentication/model-quality claim).
 
 ## Conventions
 
+- User-requested commits use **AeonDave** as both author and committer, retaining the user's configured
+  email. Never add `Co-authored-by` or assistant/bot attribution; do not push unless explicitly requested.
 - Erasable-syntax-only TS. `src/core/*` is pure (no Pi imports) and unit-tested.
-- Target the latest stable Pi only (currently 1.4.0), Node 22.19.0+. Keep host packages and
+- Target the latest stable Pi only (currently 1.5.2), Node 22.19.0+. Keep host packages and
   typebox as optional peers on `*`, with all four Pi development packages pinned together.
   No historical-host branches; never bundle a second host runtime. Scope development security
   overrides to their affected parent/version and remove them when that graph no longer needs them.
@@ -34,16 +36,28 @@ coupled through a versioned local companion handshake to
 - Model configuration changes are not persona switches;
   `/persona models` must leave Mind's scope unchanged. Do not duplicate persona discovery here.
 - Wakes are display-only (`appendEntry` + toast). Never `sendUserMessage` / `triggerTurn`.
-- Lifecycle generations bound capture/injection UI state to the accepting session. An accepted
-  explicit capture may finish in its original store; its acknowledgement must not leak to a new turn.
+- Lifecycle generations bind capture/injection UI state to the accepting session. An accepted
+  session-only capture may remain on its original native branch; its acknowledgement must not leak to a new turn.
 - Nested tool results reach only their caller. Nudge on a blocked report only when the top-level
   result actually relays it; bound provenance by `parentToolCallId` and clear it on lifecycle change.
-- Persona/shared and repository LTM are durable across sessions. `scope: project` with long term
-  stays in the repository; promotion defaults there and requires an owned source. `project-long`
-  is the optimizer target; `project` still means working STM. Shared writes use `scope: shared`,
-  not a boolean. Existing persona facts are not automatically reassigned. STM/backlog auto-delete after ~48h. Explicit session notes live
-  in Pi's native active branch, survive compaction/resume, and stay absent from delegated workers.
-  A non-persistent host session reports in-memory storage; forget is a branch-local tombstone.
+- Persona/shared and repository LTM are durable across sessions. Every long-term `remember` must
+  explicitly choose `scope: project|persona|shared`; there is no implicit persona destination.
+  `project` with long term stays in the repository; promotion defaults to project and requires an
+  owned source. `project-long` is the optimizer target; `project` still means working STM. Shared
+  writes use `scope: shared`, not a boolean. Scope expresses API routing intent, not authenticated
+  user consent. Use session for task-specific/uncertain choices (models, strategies, task constraints),
+  project for stable repository facts, persona for intent across all projects of the same persona,
+  and shared only for intent across personas. Existing persona facts are not automatically reassigned.
+  STM/backlog auto-delete after ~48h. `kind: objective` never changes the requested lifetime. Explicit
+  session notes live in Pi's native active branch, survive compaction/resume when session history is
+  persistent, are not copied to a new session, and stay absent from delegated workers. A non-persistent
+  host session reports in-memory storage; forget is a branch-local tombstone.
+- AUTO strong direct-user cue capture writes only native session notes; even explicit “remember”,
+  “from now on”, or durable wording does not write project/persona/shared stores or dirty optimizer
+  targets. Capture feedback states session-only lifetime and does not claim durable storage. Prompt
+  mode remains nudge-only; off disables capture; foreign/quoted/worker content remains non-direct.
+  Broader persistence requires a deliberate memory call with an explicit scope chosen from actual intent.
+  Never fall back to durable storage if a native session append fails.
 - Bare `/mind optimize` (also `/mind optimize all`) reviews one bounded window for each currently allowed nonshared target, sequentially, at most three workers; home allows persona only. Named `/mind optimize project|project-long|persona` stays single-target. All explicit work bypasses automatic dirty/token/cooldown and auto-off gates but not owner, busy, validation or CAS safeguards; retain the real Persona worker, strict JSON/provenance/preview/apply/receipt path, exact session model, no fallback/tools, per-tier outcomes, and honest bounded no-op/skip diagnostics. A skipped page is not proof the whole target is empty. Stop a batch on cancellation, owner change or failed/refused/uncertain work. Shared is refused with a pointer to `/mind optimize inspect shared`; it is excluded from all LLM automatic and explicit writes. Inspect/history defaults stay unchanged. Do not publish a separate persistent activity row for full optimization; let Persona's normal worker row terminate. Interrupted/stale explicit runs never apply, report across owner change, or arm an automatic retry.
 - Optimization inspect/stage exact replacements/apply a short-lived plan ID remains available through explicit inspect/show/apply commands and the memory tool. Similarity
   is advisory. Compare the original raw store fingerprint under its lock; reject stale/expired

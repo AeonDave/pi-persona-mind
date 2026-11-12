@@ -3,7 +3,6 @@
  * they only bound what a collapsed Pi card paints.
  */
 
-import { keyHint } from "@earendil-works/pi-coding-agent";
 import { sliceByColumn, stripTerminalSequences, Text, visibleWidth } from "@earendil-works/pi-tui";
 
 export const MAX_COLLAPSED_CARD_LINES = 3;
@@ -27,14 +26,15 @@ export interface CardTheme {
 	bold: (text: string) => string;
 }
 
-function sanitizeCardText(text: string): string {
+export function sanitizeCardText(text: string): string {
 	return stripTerminalSequences(text.replace(/\r\n?/g, "\n")).replace(C0_AND_DEL, "");
 }
 
 /** Bound a collapsed card: a few semantic lines, each clipped by column, then a drill-down marker. */
 export function compactVisibleText(input: string, opts: CompactVisibleTextOptions = {}): CompactVisibleTextResult {
 	const maxLines = Math.max(1, Math.floor(opts.maxLines ?? MAX_COLLAPSED_CARD_LINES));
-	const maxLineColumns = Math.max(16, Math.floor(opts.maxLineChars ?? MAX_COLLAPSED_CARD_CHARS));
+	const requestedColumns = opts.maxLineChars ?? MAX_COLLAPSED_CARD_CHARS;
+	const maxLineColumns = Number.isFinite(requestedColumns) ? Math.max(1, Math.floor(requestedColumns)) : MAX_COLLAPSED_CARD_CHARS;
 	const source = sanitizeCardText(input)
 		.split("\n")
 		.map((line) => line.trim())
@@ -63,32 +63,22 @@ export function compactVisibleText(input: string, opts: CompactVisibleTextOption
 	};
 }
 
-/** Pi's configured expand binding; fall back to the default so a missing keymap still names a key. */
-export function expandDetailHint(): string {
-	try {
-		return keyHint("app.tools.expand", "to expand");
-	} catch {
-		return "ctrl+o to expand";
-	}
-}
+/** Optional expansion hint supplied by Pi's active renderer context. */
+export type DetailHint = () => string;
 
-function formatExpandableBody(body: string, expanded: boolean, theme: CardTheme): string {
+function formatExpandableBody(body: string, expanded: boolean, theme: CardTheme, detailHint?: DetailHint, summary?: string): string {
 	const full = sanitizeCardText(body).trim() || "(no output)";
 	if (expanded) return theme.fg("toolOutput", full);
-	const preview = compactVisibleText(full);
-	const hint = preview.truncated ? `\n${theme.fg("dim", expandDetailHint())}` : "";
+	const compact = summary === undefined ? full : sanitizeCardText(summary).trim();
+	const preview = compactVisibleText(compact);
+	const hidden = preview.truncated || compact !== full;
+	const hint = hidden && detailHint ? `\n${theme.fg("dim", sanitizeCardText(detailHint()))}` : "";
 	return `${theme.fg("toolOutput", preview.text)}${hint}`;
 }
 
-/** Result body only: Pi renders the call title. Expansion is lossless against sanitized `body`. */
-export function renderExpandableResult(body: string, expanded: boolean, theme: CardTheme): Text {
-	return new Text(formatExpandableBody(body, expanded, theme), 0, 0);
-}
-
-/** Standalone entries such as backlog wakes have no Pi tool title and still need their own. */
-export function renderExpandableCard(label: string, body: string, expanded: boolean, theme: CardTheme): Text {
-	const title = theme.fg("accent", theme.bold(label));
-	return new Text(`${title}\n${formatExpandableBody(body, expanded, theme)}`, 0, 0);
+/** Result body only: Pi owns the title/shell. An optional compact summary never replaces expanded evidence. */
+export function renderExpandableResult(body: string, expanded: boolean, theme: CardTheme, detailHint?: DetailHint, summary?: string): Text {
+	return new Text(formatExpandableBody(body, expanded, theme, detailHint, summary), 0, 0);
 }
 
 export function toolResultText(result: { content?: ReadonlyArray<{ type: string; text?: string }> }): string {

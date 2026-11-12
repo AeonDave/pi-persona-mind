@@ -23,19 +23,19 @@ const sessionNote = {
 
 function makeToolHarness(activity?: MindActivityRunner) {
 	let tool: Record<string, unknown> | undefined;
-	const calls: { mindRecall: string[]; sessionRecall: string[]; remember: number; nativeForget: number; sessionForget: number; optimizeInspect: number; inspectOffsets: number[]; optimizeStage: number; optimizeApply: number } = {
-		mindRecall: [], sessionRecall: [], remember: 0, nativeForget: 0, sessionForget: 0, optimizeInspect: 0, inspectOffsets: [], optimizeStage: 0, optimizeApply: 0,
+	const calls: { mindRecall: string[]; sessionRecall: string[]; nativeRememberInputs: unknown[]; sessionRememberInputs: unknown[]; nativeForget: number; sessionForget: number; optimizeInspect: number; inspectOffsets: number[]; optimizeStage: number; optimizeApply: number } = {
+		mindRecall: [], sessionRecall: [], nativeRememberInputs: [], sessionRememberInputs: [], nativeForget: 0, sessionForget: 0, optimizeInspect: 0, inspectOffsets: [], optimizeStage: 0, optimizeApply: 0,
 	};
 	const state = { sessionCurrent: true, ownerGeneration: 0, holdInspection: false, releaseInspection: undefined as ((value: typeof inspection) => void) | undefined };
 	const mind = {
-		remember: async () => { calls.remember++; return { ok: true, entry: nativeEntry }; },
+		remember: async (input: unknown) => { calls.nativeRememberInputs.push(input); return { ok: true, entry: nativeEntry }; },
 		recall: async (_query: string, scope: string) => { calls.mindRecall.push(scope); return { hits: [nativeEntry], total: 1, withheldUnsafe: 0 }; },
 		readMemory: async (id: string, scope: string) => ({ ok: true, entries: [{ entry: { ...nativeEntry, id }, target: scope === "short" ? "project" : "persona" }], total: 1, withheld: 0 }),
 		forget: async () => { calls.nativeForget++; return { removed: 1 }; },
 		promote: async () => ({ ok: true, entry: nativeEntry }),
 	};
 	const sessionMemory = {
-		activate() {}, deactivate() {}, isCurrent: () => state.sessionCurrent, captureOwner: () => { const generation = state.ownerGeneration; return () => state.sessionCurrent && generation === state.ownerGeneration; }, remember: (_ctx: unknown, _input: unknown) => { calls.remember++; return { ok: true, storage: "session", entry: sessionNote }; },
+		activate() {}, deactivate() {}, isCurrent: () => state.sessionCurrent, captureOwner: () => { const generation = state.ownerGeneration; return () => state.sessionCurrent && generation === state.ownerGeneration; }, remember: (_ctx: unknown, input: unknown) => { calls.sessionRememberInputs.push(input); return { ok: true, storage: "session", entry: sessionNote }; },
 		recall: (_ctx: unknown, options: { query?: string }) => { calls.sessionRecall.push(options.query ?? ""); return { ok: true, notes: [sessionNote], hits: [sessionNote], total: 1, withheld: 0, max: 8, storage: "session" }; },
 		read: () => ({ ok: true, entry: sessionNote, storage: "session" }), forget: () => { calls.sessionForget++; return { ok: true, removed: 1, storage: "session" }; },
 		snapshot: () => ({ ok: true, notes: [sessionNote], storage: "session" }), injection: () => "",
@@ -62,9 +62,66 @@ function makeToolHarness(activity?: MindActivityRunner) {
 	};
 }
 
+test("memory guidance maps task context and durable scopes without treating scope as consent", () => {
+	const h = makeToolHarness();
+	const declaration = JSON.stringify(h.tool);
+	assert.match(declaration, /term=session/);
+	assert.match(declaration, /models, strategies, and task constraints/);
+	assert.match(declaration, /stable repository facts/);
+	assert.match(declaration, /all projects of this persona/);
+	assert.match(declaration, /across personas/);
+	assert.match(declaration, /not authenticated consent/);
+});
+
 async function execute(harness: ReturnType<typeof makeToolHarness>, params: Record<string, unknown>) {
 	return harness.tool.execute("call", params, undefined, undefined, harness.ctx);
 }
+
+test("unscoped long-term remember is refused before the MindService is called", async () => {
+	const h = makeToolHarness();
+	const result = await execute(h, { action: "remember", term: "long", kind: "note", text: "stable repo fact" });
+	assert.equal(result.details.ok, false);
+	assert.equal(result.details.reason, "invalid_parameters");
+	assert.equal(h.calls.nativeRememberInputs.length, 0);
+	assert.equal(h.calls.sessionRememberInputs.length, 0);
+	assert.match(result.content[0]!.text, /scope.*project.*persona.*shared/i);
+	assert.match(result.content[0]!.text, /action.*remember.*term.*long.*kind.*invariant.*text/i);
+});
+
+test("session remember accepts redundant session scope and refuses incompatible or unsupported fields with correction examples", async () => {
+	const h = makeToolHarness();
+	const saved = await execute(h, { action: "remember", term: "session", scope: "session", kind: "objective", text: "Keep this branch focused." });
+	assert.equal(saved.details.ok, true);
+	assert.equal(h.calls.nativeRememberInputs.length, 0, "session notes never enter the durable service");
+	assert.deepEqual(h.calls.sessionRememberInputs, [{ kind: "objective", text: "Keep this branch focused." }]);
+	assert.equal(h.calls.sessionRecall.length, 0);
+
+	for (const invalid of [
+		{ tags: ["workflow"] },
+		{ ttlHours: 2 },
+		{ supersedes: "safe-id" },
+		{ derivedFrom: ["safe-id"] },
+		{ scope: "project" },
+	]) {
+		const result = await execute(h, { action: "remember", term: "session", kind: "note", text: "current branch only", ...invalid });
+		assert.equal(result.details.ok, false);
+		assert.match(result.content[0]!.text, /action.*remember.*term.*session.*kind.*note.*text/i);
+		if ("scope" in invalid) assert.match(result.content[0]!.text, /scope/i);
+		else assert.match(result.content[0]!.text, new RegExp(Object.keys(invalid)[0]!, "i"));
+	}
+	const missingTerm = await execute(h, { action: "remember", kind: "note", text: "current branch only" });
+	assert.equal(missingTerm.details.ok, false);
+	assert.match(missingTerm.content[0]!.text, /action.*remember.*term.*session.*kind.*note.*text/i);
+});
+
+test("explicit long-term scope is forwarded unchanged for project, persona, and shared destinations", async () => {
+	const h = makeToolHarness();
+	for (const scope of ["project", "persona", "shared"] as const) {
+		const result = await execute(h, { action: "remember", term: "long", kind: "note", text: `${scope} fact`, scope });
+		assert.equal(result.details.ok, true);
+	}
+	assert.deepEqual(h.calls.nativeRememberInputs.map((input) => (input as { scope?: string }).scope), ["project", "persona", "shared"]);
+});
 
 test("memory remember and recall route explicit session scope to session notes only", async () => {
 	const h = makeToolHarness();
@@ -72,11 +129,12 @@ test("memory remember and recall route explicit session scope to session notes o
 	assert.equal(saved.details.storage, "session");
 	assert.equal(saved.details.action, "remember");
 	assert.equal(saved.details.id, sessionNote.id);
-	assert.equal(h.calls.remember, 1);
+	assert.equal(h.calls.sessionRememberInputs.length, 1);
+	assert.equal(h.calls.nativeRememberInputs.length, 0);
 	assert.match(saved.content[0]!.text, /session note/i);
 	const savedCard = h.tool.renderResult(saved, { expanded: true }, { fg: (_name, text) => text, bold: (text) => text }).render(240).toString();
-	assert.match(savedCard, /Session note saved/);
-	assert.doesNotMatch(savedCard, /belongs to this active session/);
+	assert.ok(savedCard.includes(sessionNote.id), "expanded session receipt preserves its addressable id");
+	assert.match(savedCard, /belongs to this active session/);
 
 	const recalled = await execute(h, { action: "recall", scope: "session", query: "offline host" });
 	assert.equal(recalled.details.count, 1);
@@ -127,7 +185,23 @@ test("memory read uses the session journal for session ids and never imports the
 	assert.equal(result.details.storage, "session");
 	assert.match(result.content[0]!.text, /result:opaque-current-session-ref/);
 	assert.match(result.content[0]!.text, /origin session: native-session-id.*not auto-resolved or imported/i);
-	assert.equal(h.calls.remember, 0);
+	assert.equal(h.calls.nativeRememberInputs.length, 0);
+	assert.equal(h.calls.sessionRememberInputs.length, 0);
+});
+
+test("memory forget refuses explicit non-session scope for session ids without touching either store", async () => {
+	const h = makeToolHarness();
+	for (const scope of ["project", "persona", "shared", "long", "short", "both"]) {
+		const result = await execute(h, { action: "forget", id: sessionNote.id, scope });
+		assert.equal(result.details.ok, false, scope);
+		assert.equal(result.details.reason, "scope_mismatch", scope);
+		assert.equal(h.calls.sessionForget, 0, scope);
+		assert.equal(h.calls.nativeForget, 0, scope);
+	}
+	const allowed = await execute(h, { action: "forget", id: sessionNote.id, scope: "session" });
+	assert.equal(allowed.details.ok, true);
+	assert.equal(h.calls.sessionForget, 1);
+	assert.equal(h.calls.nativeForget, 0);
 });
 
 test("memory forget routes session note ids to an active-branch tombstone only", async () => {

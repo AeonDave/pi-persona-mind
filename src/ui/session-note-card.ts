@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { MAX_SESSION_NOTE_CHARS, SESSION_MEMORY_KINDS, SESSION_NOTE_ENTRY_TYPE, MAX_SESSION_SOURCE_CHARS } from "../core/session-memory.ts";
-import { renderExpandableCard } from "./presentation.ts";
+import { cardFrameDetailHint, cardFramePresentation, type MindCardUI } from "./card-frame.ts";
 
 interface SessionNoteCardModel {
 	title: string;
@@ -42,9 +42,14 @@ function sessionNoteCardModel(value: unknown): SessionNoteCardModel | undefined 
 }
 
 /** Register a semantic standalone card for session-note save and forget events. */
-export function registerSessionNoteRenderer(pi: Pick<ExtensionAPI, "registerEntryRenderer">): void {
-	pi.registerEntryRenderer<unknown>(SESSION_NOTE_ENTRY_TYPE, (entry, { expanded }, theme) => {
+export function registerSessionNoteRenderer(pi: Pick<ExtensionAPI, "registerEntryRenderer">, cardUI: MindCardUI): void {
+	pi.registerEntryRenderer<unknown>(SESSION_NOTE_ENTRY_TYPE, (entry, { expanded, keyHint }, theme) => {
 		const model = sessionNoteCardModel(entry.data);
-		return model ? renderExpandableCard(model.title, model.body, expanded, theme) : undefined;
+		return model ? cardUI.renderCard(cardFramePresentation(model.title, model.body), {
+			expanded,
+			theme,
+			outputPad: cardUI.outputPad(),
+			detailHint: cardFrameDetailHint(keyHint),
+		}) : undefined;
 	});
 }

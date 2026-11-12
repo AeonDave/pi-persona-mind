@@ -119,8 +119,8 @@ export function registerBacklogTool(pi: ExtensionAPI, getMind: GetMind): void {
 				? say(`${params.id} → ${state}.`, { id: params.id, state, ok: true })
 				: say(`Not updated: ${r.reason ?? `backlog item "${params.id}" does not exist or cannot transition to ${state}`}.`, { ok: false, reason: r.reason ?? "invalid state transition" });
 		},
-		renderResult(result, { expanded }, theme) {
-			return renderExpandableResult(toolResultText(result), expanded, theme);
+		renderResult(result, { expanded }, theme, context) {
+			return renderExpandableResult(toolResultText(result), expanded, theme, () => context.keyHint("app.tools.expand", "to expand"));
 		},
 	});
 }

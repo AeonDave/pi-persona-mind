@@ -155,7 +155,8 @@ test("explicit skip formatting is deterministic, target-qualified, bounded, and 
 test("memory scope selects STM, durable project LTM, persona LTM, and excludes shared LTM", () => {
 	assert.equal(autoOptimizeTarget({ action: "remember", term: "short" }), "project");
 	assert.equal(autoOptimizeTarget({ action: "remember", term: "long", scope: "project" }), "project-long");
-	assert.equal(autoOptimizeTarget({ action: "remember", term: "long" }), "persona");
+	assert.equal(autoOptimizeTarget({ action: "remember", term: "long" }), undefined, "an invalid unscoped long write cannot dirty a default tier");
+	assert.equal(autoOptimizeTarget({ action: "remember", term: "session", kind: "objective" }), undefined, "session notes never dirty durable optimizer targets");
 	assert.equal(autoOptimizeTarget({ action: "remember", term: "long", scope: "persona" }), "persona");
 	assert.equal(autoOptimizeTarget({ action: "remember", term: "long", scope: "shared" }), undefined);
 	assert.equal(autoOptimizeTarget({ action: "promote" }), "project-long");

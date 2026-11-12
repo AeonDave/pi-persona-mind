@@ -6,10 +6,10 @@ function json(relative: string) {
 	return JSON.parse(readFileSync(new URL(relative, import.meta.url), "utf8"));
 }
 
-test("the manifest qualifies Pi 1.4 without bundling the host or TypeBox", () => {
+test("the manifest qualifies Pi 1.5.2 without bundling the host or TypeBox", () => {
 	const manifest = json("../package.json");
   const lock = json("../package-lock.json");
-  for (const host of ["pi-ai", "pi-agent-core", "pi-coding-agent", "pi-tui"]) assert.equal(manifest.devDependencies[`@earendil-works/${host}`], "1.4.0");
+  for (const host of ["pi-ai", "pi-agent-core", "pi-coding-agent", "pi-tui"]) assert.equal(manifest.devDependencies[`@earendil-works/${host}`], "1.5.2");
 	assert.equal(manifest.engines.node, ">=22.19.0");
 	assert.equal(lock.version, manifest.version);
 	assert.equal(lock.packages[""].version, manifest.version);
@@ -19,7 +19,7 @@ test("the manifest qualifies Pi 1.4 without bundling the host or TypeBox", () =>
 		assert.equal(manifest.dependencies?.[name], undefined);
 	}
 	for (const name of ["@earendil-works/pi-coding-agent", "@earendil-works/pi-tui"]) {
-		assert.equal(manifest.devDependencies[name], "1.4.0");
+		assert.equal(manifest.devDependencies[name], "1.5.2");
 	}
 	assert.deepEqual(manifest.pi.extensions, ["./src/index.ts"]);
 	assert.ok(manifest.files.includes("src"));

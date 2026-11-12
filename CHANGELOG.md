@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased]
+
+- Require explicit project/persona/shared scope for every long-term remember at both the public tool and
+  MindService boundary; short-term memory stays project-scoped by default, and objective kind no longer
+  changes the caller-selected lifetime.
+- Route AUTO strong direct-user cues only to native active-branch session notes, with explicit session-only
+  receipts and no durable fallback or optimizer dirtying. Session tool corrections include canonical
+  examples; redundant `scope=session` is accepted without making scope mandatory.
+- Target the current Pi 1.5.2 host and align offline qualification metadata.
+- Standalone Mind entries use Persona's one shared card frame through a versioned local presentation
+  query, honoring native padding and configured expand keys. Native memory/backlog tool shells remain
+  host-owned; retained entries have a readable plain-text fallback without a compatible frame provider.
+- Expanded save receipts expose their original IDs and lifetime evidence; compact summaries disclose
+  hidden detail. Explicit scope mismatches cannot tombstone a session note through another tier.
+- Extend the existing offline evaluator with paired sentinel outcomes and provenance-checked token
+  reference diagnostics. Calculation is language-agnostic; no runtime ranking, budget, dependency,
+  service or model-call changes are introduced. Published reference vectors are not billing counts.
+
 ## [0.8.7](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.8.7) - 2026-10-27
 
 - Interrupted explicit optimization batches identify the tiers not yet reviewed. Worker failures

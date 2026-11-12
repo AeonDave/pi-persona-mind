@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Offline qualification against an explicitly installed Pi 1.4 host.
+ * Offline qualification against an explicitly installed Pi 1.5.2 host.
  * All profiles, sessions, fixtures, and writes are isolated under a fresh OS-temp root.
  *
  * Usage:
@@ -24,7 +24,7 @@ if (!hostArg || !isAbsolute(hostArg)) {
 const hostRoot = resolve(hostArg);
 const hostPackage = JSON.parse(await readFile(join(hostRoot, "package.json"), "utf8"));
 assert.equal(hostPackage.name, "@earendil-works/pi-coding-agent");
-assert.equal(hostPackage.version, "1.4.0", `Expected Pi 1.4.0, found ${hostPackage.version}`);
+assert.equal(hostPackage.version, "1.5.2", `Expected Pi 1.5.2, found ${hostPackage.version}`);
 
 const mindEntry = process.argv[4] ? resolve(process.argv[4]) : resolve(fileURLToPath(new URL("../src/index.ts", import.meta.url)));
 if (process.argv[4] && !isAbsolute(process.argv[4])) throw new Error("Optional Mind extension path must be absolute.");
@@ -50,7 +50,7 @@ const personaDir = join(agentDir, "persona", "agents");
 const projectDir = join(workspace, ".pi");
 const projectAgentsDir = join(projectDir, "agents");
 const extensionPaths = [mindEntry, ...(parentEntry ? [parentEntry] : [])];
-const hostProbeEntry = join(tempRoot, "pi14-host-identity-probe.ts");
+const hostProbeEntry = join(tempRoot, "pi152-host-identity-probe.ts");
 const loaderExtensionPaths = [...extensionPaths, hostProbeEntry];
 let session;
 let fetchBefore;
@@ -185,7 +185,7 @@ try {
 
 	const host = await import(pathToFileURL(join(hostRoot, "dist", "index.js")).href);
 	const faux = await import(pathToFileURL(join(hostRoot, "node_modules", "@earendil-works", "pi-ai", "dist", "providers", "faux.js")).href);
-	assert.equal(host.VERSION, "1.4.0");
+	assert.equal(host.VERSION, "1.5.2");
 
 	const settingsManager = host.SettingsManager.inMemory({ retry: { enabled: false }, compaction: { enabled: false } });
 	const resourceLoader = new host.DefaultResourceLoader({
@@ -243,12 +243,12 @@ try {
 	const identityProbe = sessionManager.getEntries().find((entry) => entry.type === "custom" && entry.customType === "mind-host-identity-probe");
 	assert.ok(identityProbe, "The installed host loader did not execute the identity probe extension");
 	const identityProbeJson = JSON.stringify(identityProbe).replaceAll("\\\\", "/");
-	mustContain(identityProbeJson, '"version":"1.4.0"', "installed-host extension import probe");
+	mustContain(identityProbeJson, '"version":"1.5.2"', "installed-host extension import probe");
 	mustContain(identityProbeJson, agentDir.replaceAll("\\", "/"), "installed-host extension profile probe");
 
 	const hasParent = Boolean(parentEntry);
 	const activeTools = ["memory", "backlog", ...(hasParent ? ["delegate"] : [])];
-	assert.ok(activeTools.every((name) => session.getAllTools().some((tool) => tool.name === name)), "Expected Mind/parent tools did not register in Pi 1.4");
+	assert.ok(activeTools.every((name) => session.getAllTools().some((tool) => tool.name === name)), "Expected Mind/parent tools did not register in Pi 1.5.2");
 	session.setActiveToolsByName(activeTools);
 
 	// Activate alpha through the real parent command so Mind follows the actual marker contract.
@@ -294,13 +294,19 @@ try {
 		assert.equal(outcome.isError, false, `${name} fixture failed: ${textOf(outcome.result?.content)}`);
 		return outcome;
 	};
-	const customRecall = await runTool("memory", { action: "recall", query: "paper comet", scope: "both" });
-	mustOmit(textOf(customRecall.result?.content), "paper comet", "memory recall after pi-persona custom report");
+	const customRecall = await runTool("memory", { action: "recall", query: "paper comet", scope: "session" });
+	mustOmit(textOf(customRecall.result?.content), "paper comet", "session recall after pi-persona custom report");
+	const capturedSession = await runTool("memory", { action: "recall", query: "copper lantern", scope: "session" });
+	mustContain(textOf(capturedSession.result?.content), "copper lantern", "trusted deferred session note");
+	for (const query of ["concise terminal summary", "copper lantern"]) {
+		const durableRecall = await runTool("memory", { action: "recall", query, scope: "both" });
+		assert.equal(durableRecall.result?.details?.count, 0, `AUTO capture must not create a persistent memory for ${query}`);
+	}
 	const alphaPrivate = "Alpha-private convention: keep fixture notes scoped to alpha.";
 	const sharedLtm = "Shared convention: the stable local fixture is the source of truth.";
 	const shortTerm = "Alpha STM marker: workspace review is in progress.";
 	const backlogText = "Alpha backlog marker: inspect the qualification fixture once.";
-	await runTool("memory", { action: "remember", term: "long", kind: "convention", text: alphaPrivate });
+	await runTool("memory", { action: "remember", term: "long", scope: "persona", kind: "convention", text: alphaPrivate });
 	await runTool("memory", { action: "remember", term: "long", kind: "convention", text: sharedLtm, scope: "shared" });
 	await runTool("memory", { action: "remember", term: "short", kind: "note", text: shortTerm });
 	await runTool("backlog", { action: "add", text: backlogText, dueInSeconds: 0.01 });
@@ -363,7 +369,7 @@ try {
 		mustContain(betaPrompt, "Shared convention: the stable local fixture", "beta native prompt");
 		mustOmit(betaPrompt, "Alpha-private convention", "beta native prompt");
 		mustContain(betaPrompt, "Alpha STM marker", "beta native prompt (project-scoped STM positive control)");
-		mustOmit(betaPrompt, "copper lantern", "beta native prompt");
+		mustContain(betaPrompt, "copper lantern", "beta native prompt (native active-branch session note survives persona switch)");
 
 		// Switch back to alpha for the in-process child. The actual child loader reads the same
 		// isolated settings.json, and the dedicated leg marker should make Mind inject only LTM.
@@ -423,8 +429,8 @@ try {
 	assert.equal(fetchRequests, 0, "Outbound fetch tripwire fired");
 	report.status = "PASS";
 	report.checks = {
-		installedPi14Loader: true,
-		installedExtensionApiVersion: "1.4.0",
+		installedPi152Loader: true,
+		installedExtensionApiVersion: "1.5.2",
 		directHumanMemoryInjected: true,
 		customReportNoContamination: true,
 		blockedHintOccurrences: blockedHints.length,

@@ -28,7 +28,7 @@ import { resetMindSettings, resolveMindSettings } from "./core/mind-settings.ts"
 import { MindService } from "./core/service.ts";
 import { registerBacklogTool } from "./tools/backlog.ts";
 import { registerMemoryTool } from "./tools/memory.ts";
-import { renderExpandableCard } from "./ui/presentation.ts";
+import { cardFrameDetailHint, cardFramePresentation, createMindCardUI } from "./ui/card-frame.ts";
 import { createSessionMemory } from "./session-memory.ts";
 import { registerSessionNoteRenderer } from "./ui/session-note-card.ts";
 import type { MemoryOptimizer } from "./core/optimize-service.ts";
@@ -307,8 +307,9 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		return new MindService(resolveMindScope(ctx), { onWarn: (message) => surfaceWarning(ctx, message) });
 	};
 	const sessionMemory = createSessionMemory(pi);
-	registerSessionNoteRenderer(pi);
-	registerMindResultRenderer(pi);
+	const mindCardUI = createMindCardUI(pi);
+	registerSessionNoteRenderer(pi, mindCardUI);
+	registerMindResultRenderer(pi, mindCardUI);
 	let optimizerCache: { manager: ExtensionContext["sessionManager"]; key: string; optimizer: MemoryOptimizer } | undefined;
 	const discardOptimizer = (): void => {
 		optimizerCache?.optimizer.invalidate();
@@ -336,9 +337,14 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		});
 	};
 
-	pi.registerEntryRenderer<{ content: string }>(WAKE_ENTRY_TYPE, (entry, { expanded }, theme) => {
+	pi.registerEntryRenderer<{ content: string }>(WAKE_ENTRY_TYPE, (entry, { expanded, keyHint }, theme) => {
 		const body = typeof entry.data?.content === "string" ? entry.data.content : "";
-		return renderExpandableCard("pi-persona-mind", body, expanded, theme);
+		return mindCardUI.renderCard(cardFramePresentation("pi-persona-mind", body), {
+			expanded,
+			theme,
+			outputPad: mindCardUI.outputPad(),
+			detailHint: cardFrameDetailHint(keyHint),
+		});
 	});
 
 	/** Human-visible due reminder: toast + collapsed card. Must never sendUserMessage / triggerTurn. */
@@ -814,69 +820,62 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			nestedBlockedRelays.delete(oldest);
 		}
 	};
-	const captureDirectCues = async (
+	const captureDirectCues = (
 		text: string,
 		ctx: ExtensionContext,
 		lifecycleGeneration: number,
 		inputGeneration: number,
-	): Promise<CaptureNotice | undefined> => {
+	): CaptureNotice | undefined => {
 		const cues = detectCaptureCues(text);
 		if (cues.length === 0) return undefined;
 		const explicit = capturePolicy === "auto" ? cues.filter((cue) => cue.strong) : [];
-		const mind = explicit.length > 0 ? getMind(ctx) : undefined;
 		const ownerCurrent = captureMemoryOwner(ctx);
 		const isCurrent = (): boolean => lifecycleGeneration === sessionLifecycleGeneration && inputGeneration === captureInputGeneration && ownerCurrent();
-		if (explicit.length > 0) {
-			await ensureLegacyMigrated(ctx);
-			if (isCurrent()) await reconcileScope(ctx, lifecycleGeneration);
-		}
-		const stored: string[] = [];
+		const stored: Array<{ id: string; storage: "session" | "memory" }> = [];
 		const failures: string[] = [];
-		if (mind) {
-			for (const cue of explicit) {
-				const label = cue.kind === "preference" ? "User preference" : cue.kind === "rationale" ? "Durable user decision" : "User explicitly asked to retain";
-				const result = await mind.remember({
-					term: cue.term,
-					kind: cue.kind,
-					text: `${label}: ${cue.candidate}`,
-					tags: ["auto-captured"],
-					source: "direct user persistence cue",
-				});
-				if (result.ok) {
-					stored.push(result.entry.id);
-					if (isCurrent()) autoOptimize.memoryAdded(ctx, cue.term === "long" ? "persona" : "project");
-				}
-				else failures.push(result.reason);
-			}
+		for (const cue of explicit) {
+			// No migration, persistent memory-store read/write, or optimizer notification belongs to
+			// automatic capture. SessionMemory performs the owner check immediately before append.
+			if (!isCurrent()) break;
+			const label = cue.kind === "preference" ? "User preference" : cue.kind === "rationale" ? "User decision" : "User asked to retain";
+			const result = sessionMemory.remember(ctx, {
+				kind: cue.kind,
+				text: `${label}: ${cue.candidate}`,
+				source: "direct user persistence cue",
+			});
+			if (result.ok) stored.push({ id: result.entry.id, storage: result.storage });
+			else failures.push(result.reason);
 		}
-		// Durable writes from the accepted user input are preserved across a session change, but its
-		// acknowledgement and prompt/UI state belong only to the session/input that accepted it.
+		// Captures already appended remain on the accepting native owner; notices remain input/session-local.
 		if (!isCurrent()) return undefined;
 		for (const cue of explicit) rememberCueHint(cue.snippet);
 
 		let hint = "";
 		if (stored.length > 0) {
-			hint = `⟢ pi-persona-mind — already captured ${stored.length} explicit user memor${stored.length === 1 ? "y" : "ies"} (${stored.join(", ")}); do not duplicate ${stored.length === 1 ? "it" : "them"}.`;
+			const ids = stored.map(({ id }) => id);
+			const persistentSession = stored.every(({ storage }) => storage === "session");
+			hint = persistentSession
+				? `⟢ pi-persona-mind — saved ${stored.length} cue${stored.length === 1 ? "" : "s"} as native active-branch session note${stored.length === 1 ? "" : "s"} only (${ids.join(", ")}). This is not a project/persona/shared durable save; do not duplicate the session note. If broader durability is intended, make a separate deliberate memory remember call with an explicit scope chosen from the user's actual intent.`
+				: `⟢ pi-persona-mind — kept ${stored.length} cue${stored.length === 1 ? "" : "s"} as session-only note${stored.length === 1 ? "" : "s"} in this runtime's in-memory session (${ids.join(", ")}); this host has no persistent session file, so it is not restart-durable. No project/persona/shared store was written. Do not duplicate the session note; broader durability needs a separate deliberate memory remember call with an explicit scope chosen from actual user intent.`;
 			try {
-				ctx.ui.notify(`[pi-persona-mind] Captured ${stored.length} explicit memor${stored.length === 1 ? "y" : "ies"}.`, "info");
+				ctx.ui.notify(`[pi-persona-mind] ${persistentSession ? "Saved only as active-branch session notes; no durable memory store was written." : "Kept session-only notes in this runtime's in-memory session; no durable memory store was written."}`, "info");
 			} catch {
 				/* headless/no UI */
 			}
-			await refreshStatus(ctx);
 		}
 		if (failures.length > 0) {
-			const reason = failures[0] ?? "unknown storage failure";
-			const retryHint = `⚠ pi-persona-mind could not auto-capture one explicit user memory: ${reason}. Before final, retry once with a safe declarative \`memory remember\` entry.`;
+			const reason = failures[0] ?? "unknown session append failure";
+			const retryHint = `⚠ pi-persona-mind could not append a session-only note: ${reason}. No external or durable write was attempted. Do not fall back to a durable store; if retention is still wanted, retry with term=session or make a separate deliberate long-term memory call with an explicit scope chosen from actual user intent.`;
 			hint = [hint, retryHint].filter(Boolean).join("\n\n");
-			surfaceWarning(ctx, `automatic capture failed: ${reason}`);
+			surfaceWarning(ctx, `session-only automatic capture failed: ${reason}`);
 		}
 		if (!hint && nudgeEnabled) {
 			const cue = cues[0];
 			if (cue) {
 				rememberCueHint(cue.snippet);
-				hint = `⟢ pi-persona-mind — possible durable ${cue.kind} detected in direct user input. Save one safe declarative memory only if it should outlive this task.`;
+				hint = `⟢ pi-persona-mind — possible ${cue.kind} candidate detected in direct user input. For task-specific or uncertain retention use memory remember with term=session. Use term=long only with an explicit project, persona, or shared scope when that broader lifetime matches the user's actual intent.`;
 				try {
-					ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme ? ctx.ui.theme.fg("accent", `💡 worth remembering? memory remember (${cue.kind})`) : `💡 worth remembering? (${cue.kind})`);
+					ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme ? ctx.ui.theme.fg("accent", `💡 review candidate · memory remember (${cue.kind}, term=session)` ) : `💡 review candidate (${cue.kind}, term=session)`);
 				} catch {
 					/* cosmetic */
 				}

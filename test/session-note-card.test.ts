@@ -1,21 +1,40 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { createEventBus, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text, type Component } from "@earendil-works/pi-tui";
 
+import { CARD_FRAME_EVENT, createMindCardUI, type CardFrameContext } from "../src/ui/card-frame.ts";
 import { SESSION_NOTE_ENTRY_TYPE } from "../src/core/session-memory.ts";
 import { registerSessionNoteRenderer } from "../src/ui/session-note-card.ts";
 
 type CardTheme = { fg: (_name: string, text: string) => string; bold: (text: string) => string };
+type Renderer = (entry: { data?: unknown }, options: { expanded: boolean; keyHint: (id: string, description: string) => string }, theme: CardTheme) => Component | undefined;
 const theme: CardTheme = { fg: (_name, text) => text, bold: (text) => text };
+const keyHint = (id: string, description: string) => `${id} ${description}`;
 
 function rendererForEntry() {
-	let renderer: ((entry: { data?: unknown }, options: { expanded: boolean }, theme: CardTheme) => { render(width: number): string[] } | undefined) | undefined;
+	const events = createEventBus();
+	events.on(CARD_FRAME_EVENT, (request: unknown) => {
+		if (!request || typeof request !== "object" || !("respond" in request) || typeof request.respond !== "function") return;
+		request.respond({
+			version: 1,
+			provider: "pi-persona",
+			createCard: (presentation: { title: string; full: string; preview: (width: number) => { text: string; truncated: boolean } }, context: CardFrameContext) => {
+				const preview = presentation.preview(80);
+				return new Text(`${presentation.title}\n${context.expanded ? presentation.full : `${preview.text}${preview.truncated ? `\n${context.detailHint()}` : ""}`}`, 0, 0);
+			},
+		});
+	});
+	let renderer: Renderer | undefined;
 	const pi = {
-		registerEntryRenderer(type: string, callback: typeof renderer) {
+		events,
+		getSettings: () => ({ outputPad: 1 }),
+		registerEntryRenderer(type: string, callback: Renderer) {
 			assert.equal(type, SESSION_NOTE_ENTRY_TYPE);
 			renderer = callback;
 		},
-	};
-	registerSessionNoteRenderer(pi as never);
+	} as unknown as Pick<ExtensionAPI, "events" | "getSettings" | "registerEntryRenderer">;
+	registerSessionNoteRenderer(pi, createMindCardUI(pi));
 	assert.ok(renderer);
 	return renderer;
 }
@@ -24,8 +43,8 @@ test("session note card has a semantic title and expands to the full note with p
 	const renderer = rendererForEntry();
 	const text = `A durable session observation ${"detail ".repeat(30)}tail-marker`;
 	const entry = { data: { version: 1, op: "save", note: { id: "session:00000000-0000-4000-8000-000000000001", kind: "preference", text, source: "result:opaque-ref", recordedAt: "2026-10-25T00:00:00.000Z", originSessionId: "session-42" } } };
-	const collapsed = renderer(entry, { expanded: false }, theme)?.render(200).join("\n") ?? "";
-	const expanded = renderer(entry, { expanded: true }, theme)?.render(200).join("\n") ?? "";
+	const collapsed = renderer(entry, { expanded: false, keyHint }, theme)?.render(200).join("\n") ?? "";
+	const expanded = renderer(entry, { expanded: true, keyHint }, theme)?.render(200).join("\n") ?? "";
 	assert.match(collapsed, /Session note · preference/);
 	assert.doesNotMatch(collapsed, /tail-marker/);
 	assert.match(collapsed, /expand/i);
@@ -36,8 +55,8 @@ test("session note card has a semantic title and expands to the full note with p
 
 test("session note tombstones render as retired entries and malformed data stays harmless", () => {
 	const renderer = rendererForEntry();
-	const retired = renderer({ data: { version: 1, op: "forget", id: "session:00000000-0000-4000-8000-000000000001" } }, { expanded: false }, theme)?.render(200).join("\n") ?? "";
+	const retired = renderer({ data: { version: 1, op: "forget", id: "session:00000000-0000-4000-8000-000000000001" } }, { expanded: false, keyHint }, theme)?.render(200).join("\n") ?? "";
 	assert.match(retired, /Session note retired/);
 	assert.match(retired, /session:00000000-0000-4000-8000-000000000001/);
-	assert.equal(renderer({ data: { version: 1, op: "save", note: { text: "bad" } } }, { expanded: false }, theme), undefined);
+	assert.equal(renderer({ data: { version: 1, op: "save", note: { text: "bad" } } }, { expanded: false, keyHint }, theme), undefined);
 });

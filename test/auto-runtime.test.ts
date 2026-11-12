@@ -53,7 +53,7 @@ function usageMessage(input: number, output: number, cacheRead = 0) {
 async function seed(h: Harness) {
 	const scope = resolveScope(h.agentDir, h.cwd, { persona: null });
 	const mind = new MindService(scope);
-	for (const text of notes) await mind.remember({ term: "long", kind: "convention", text });
+	for (const text of notes) await mind.remember({ term: "long", scope: "persona", kind: "convention", text });
 	return scope;
 }
 
@@ -66,7 +66,7 @@ test("native automatic optimization coalesces saves, preserves history and appli
 		await h.bind();
 		h.session.setActiveToolsByName(["memory"]);
 		h.faux.setResponses([
-			fauxAssistantMessage(notes.map((text) => fauxToolCall("memory", { action: "remember", term: "long", kind: "convention", text })), { stopReason: "toolUse" }),
+			fauxAssistantMessage(notes.map((text) => fauxToolCall("memory", { action: "remember", term: "long", scope: "persona", kind: "convention", text })), { stopReason: "toolUse" }),
 			fauxAssistantMessage("Saved both verified facts."),
 		]);
 		await h.session.prompt("Save these verified release conventions.");
@@ -163,22 +163,23 @@ test("native bare optimize skips empty project tiers, reviews seeded persona mem
 		await h.bind();
 		const scope = resolveScope(h.agentDir, h.cwd, { persona: "dev" });
 		const mind = new MindService(scope);
-		for (const text of notes) await mind.remember({ term: "long", kind: "convention", text });
+		for (const text of notes) await mind.remember({ term: "long", scope: "persona", kind: "convention", text });
 		assert.equal(existsSync(scope.paths.stm), false, "the empty project short-term store remains absent");
 		assert.equal(existsSync(scope.paths.projectLtm), false, "the empty project-long store remains absent");
 
 		await h.session.prompt("/mind optimize");
 		assert.match(h.notifications.join("\n"), /project, project-long, persona.*bounded.*sequentially/i);
 		await until(() => worker.requests.length === 1, "bare command reaches persona worker after empty project tiers");
-		assert.ok(h.notifications.some((message) => /Mind · Target: project — skipped: empty\/exhausted page; no worker started, no memory changed\./.test(message)), "the collapsed skip toast identifies its target, outcome, and reason");
-		assert.ok(h.notifications.some((message) => /Mind · Target: project-long — skipped: empty\/exhausted page; no worker started, no memory changed\./.test(message)), "every skipped tier has an immediately informative toast");
+		assert.ok(h.notifications.some((message) => message === "Mind · project review update"), "the project report has one concise neutral toast");
+		assert.ok(h.notifications.some((message) => message === "Mind · project-long review update"), "every skipped tier retains one target-qualified toast");
 		const payload = JSON.parse(worker.requests[0]!.task.split("\n").at(-1)!);
 		assert.equal(payload.target, "persona");
 		assert.equal(payload.entries.length, 2);
 		worker.requests[0]!.finish({ status: "done", ok: true, output: JSON.stringify({ operations: [{ sourceIds: payload.entries.map((entry: { id: string }) => entry.id), kind: "convention", text: replacement }] }), resultRef: "result:bare-persona" });
 		await until(() => JSON.stringify(cards(h!)).includes("Undo: /mind optimize undo"), "persona apply and receipt");
-		assert.ok(h.notifications.some((message) => /Mind · Target: persona — proposal staged; validated apply pending/.test(message)), "proposal toast includes target and the proposal state");
-		assert.ok(h.notifications.some((message) => /Mind · Target: persona — 1 replacement applied/.test(message)), "result toast includes target and the completed outcome");
+		assert.ok(h.notifications.some((message) => message === "Mind · persona proposal update"), "proposal toast is short and does not duplicate report prose");
+		assert.ok(h.notifications.some((message) => message === "Mind · persona review update"), "result toast is target-qualified and outcome-neutral");
+		assert.ok(h.notifications.every((message) => !message.includes("Bounded coverage:")), "the informational toast does not repeat the durable card's coverage line");
 		const optimized = JSON.parse(await readFile(scope.paths.ltm, "utf8"));
 		assert.equal(optimized.entries.length, 1);
 		assert.equal(optimized.entries[0].text, replacement);
@@ -217,8 +218,8 @@ test("native optimizer requires one million main input tokens and a dirty store,
 		h.session.setActiveToolsByName(["memory"]);
 		h.faux.setResponses([
 			fauxAssistantMessage([
-				fauxToolCall("memory", { action: "remember", term: "long", kind: "convention", text: "The first optimizer batch keeps verified release evidence." }),
-				fauxToolCall("memory", { action: "remember", term: "long", kind: "convention", text: "Release evidence remains scoped to this persona." }),
+				fauxToolCall("memory", { action: "remember", term: "long", scope: "persona", kind: "convention", text: "The first optimizer batch keeps verified release evidence." }),
+				fauxToolCall("memory", { action: "remember", term: "long", scope: "persona", kind: "convention", text: "Release evidence remains scoped to this persona." }),
 			], { stopReason: "toolUse" }),
 			fauxAssistantMessage("Saved both verified facts."),
 		]);
@@ -233,7 +234,7 @@ test("native optimizer requires one million main input tokens and a dirty store,
 		const scope = resolveScope(h.agentDir, h.cwd, { persona: null });
 		const start = boundaries.length;
 		h.faux.setResponses([
-			fauxAssistantMessage(fauxToolCall("memory", { action: "remember", term: "long", kind: "convention", text: "A second fact waits for the main input budget." }), { stopReason: "toolUse" }),
+			fauxAssistantMessage(fauxToolCall("memory", { action: "remember", term: "long", scope: "persona", kind: "convention", text: "A second fact waits for the main input budget." }), { stopReason: "toolUse" }),
 			fauxAssistantMessage("Saved the additional fact."),
 		]);
 		await h.session.prompt("Save one more verified convention.");

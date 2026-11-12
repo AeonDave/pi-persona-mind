@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
-import { compactVisibleText, renderExpandableCard, renderExpandableResult, toolResultText } from "../src/ui/presentation.ts";
+import { compactVisibleText, renderExpandableResult, toolResultText } from "../src/ui/presentation.ts";
 
 const theme = { fg: (_name: string, text: string) => text, bold: (text: string) => text };
 
@@ -16,6 +17,12 @@ test("compactVisibleText bounds lines and width for a collapsed card", () => {
 	assert.match(preview.text, /\+8 more/);
 });
 
+test("compactVisibleText honors narrow display-column bounds for wide Unicode", () => {
+	const preview = compactVisibleText("界面 details are retained", { maxLineChars: 5 });
+	assert.equal(preview.truncated, true);
+	assert.ok(preview.text.split("\n").every((line) => visibleWidth(line) <= 5));
+});
+
 test("compactVisibleText leaves a short result untruncated", () => {
 	const preview = compactVisibleText("Remembered abc — long-term note.");
 	assert.equal(preview.truncated, false);
@@ -25,16 +32,29 @@ test("compactVisibleText leaves a short result untruncated", () => {
 
 test("tool results omit the title while standalone cards retain it", () => {
 	const body = ["10 recalled of 12:", ...Array.from({ length: 10 }, (_, i) => `- [${i}] (note) fact ${i}`)].join("\n");
-	const collapsed = renderExpandableResult(body, false, theme).render(200).map((line) => line.trimEnd()).join("\n");
-	const expanded = renderExpandableResult(body, true, theme).render(200).map((line) => line.trimEnd()).join("\n");
+	const keyHint = (id: string, description: string) => `${id} ${description} (F6)`;
+	const collapsed = renderExpandableResult(body, false, theme, () => keyHint("app.tools.expand", "to expand")).render(200).map((line) => line.trimEnd()).join("\n");
+	const expanded = renderExpandableResult(body, true, theme, () => keyHint("app.tools.expand", "to expand")).render(200).map((line) => line.trimEnd()).join("\n");
 	assert.doesNotMatch(collapsed, /^memory(?:\n|$)/, "Pi already renders the tool title above this result");
 	assert.doesNotMatch(expanded, /^memory(?:\n|$)/);
-	assert.match(collapsed, /to expand|ctrl\+o/i);
+	assert.match(collapsed, /F6/);
+	assert.doesNotMatch(collapsed, /ctrl\+o/i);
 	assert.ok(collapsed.split("\n").length < expanded.split("\n").length);
 	assert.match(expanded, /fact 9/);
 	assert.doesNotMatch(collapsed, /fact 9/);
-	const wake = renderExpandableCard("backlog wake", "A saved reminder is due.", false, theme).render(200).map((line) => line.trimEnd()).join("\n");
-	assert.equal(wake, "backlog wake\nA saved reminder is due.");
+	const unhinted = renderExpandableResult(body, false, theme).render(200).map((line) => line.trimEnd()).join("\n");
+	assert.doesNotMatch(unhinted, /ctrl\+o/i);
+});
+
+test("a compact receipt summary signals hidden detail and expands to the original body", () => {
+	const body = "Remembered stable-id — long-term note.";
+	const hint = () => "F6 to expand";
+	const collapsed = renderExpandableResult(body, false, theme, hint, "Saved").render(200).map((line) => line.trimEnd()).join("\n");
+	assert.equal(collapsed, "Saved\nF6 to expand");
+	const expanded = renderExpandableResult(body, true, theme, hint, "Saved").render(200).map((line) => line.trimEnd()).join("\n");
+	assert.equal(expanded, body);
+	const unchanged = renderExpandableResult(body, false, theme, hint, body).render(200).map((line) => line.trimEnd()).join("\n");
+	assert.equal(unchanged, body, "an identical compact body does not create a false expansion hint");
 });
 
 test("toolResultText reads the first text part", () => {
