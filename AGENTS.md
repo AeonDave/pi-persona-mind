@@ -66,7 +66,9 @@ coupled through a versioned local companion handshake to
   unless `PI_PERSONA_MIND_OPTIMIZE=off`; session commands may switch it immediately. Queue after a
   successful remember/promotion. First eligible burst has no token floor; later attempts need dirty
   memories AND 1M main-session input tokens since the prior launch (exclude output/cache/worker usage).
-  Usage alone never marks memories dirty. Coalesce 2s after `agent_settled` while idle with no queued
+  Actual explicit worker launches also reset the automatic token/cooldown baseline and persist their
+  completed digests, but interrupted explicit work never grants automatic retry. Usage alone never
+  marks memories dirty. Coalesce 2s after `agent_settled` while idle with no queued
   work; cool down 5min between actual attempts. Only the interrupted attempt can retry without the
   token floor, after a later settled event and cooldown. One worker per instance; unchanged semantic
   digests skip review. New input, agent start,
@@ -78,7 +80,8 @@ coupled through a versioned local companion handshake to
   supplied sources; single-record rewrites remain explicit-only. A window without a same-kind pair
   cannot start an automatic model call or consume its first-attempt allowance. Shared memories and
   age-based deletion remain excluded. Persist the full proposal audit before apply, but keep it out
-  of the automatic transcript; show one compact result note, no routine info toast, and no no-op card.
+  of the automatic transcript; show one informative `mind` toast on successful change, no routine
+  result card, and no no-op card or toast. Keep durable history and guarded undo available.
   Manual detail and important warnings remain visible. Worker completion is not proof of semantic truth.
 - Rotate completed automatic review over older records/pages; account for actual byte admission,
   preserve newest-fact inclusion, and never mark stopped/interrupted work as completed. No unbounded

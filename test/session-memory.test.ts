@@ -28,6 +28,21 @@ test("session injection ranks the current task and shares a bounded token estima
 	assert.equal((block.match(/<\/session-notes>/g) ?? []).length, 1);
 });
 
+test("session recall uses canonical lexical/path ranking and preserves native recency ties and source lookup", () => {
+	const f = fixture();
+	const older = f.notes.remember(f.ctx, { kind: "note", text: "Use rollback for database changes.", source: "deployment journal" });
+	const newer = f.notes.remember(f.ctx, { kind: "note", text: "Rollback protects migrations in src/auth/session.ts." });
+	assert.ok(older.ok && newer.ok);
+	assert.equal(f.notes.recall(f.ctx, { query: "rollback?", max: 8 }).total, 2, "punctuation follows the same tokenizer as durable recall");
+	assert.deepEqual(f.notes.recall(f.ctx, { query: "src\\auth\\session.ts", max: 8 }).hits.map((note) => note.id), [newer.entry.id]);
+	assert.deepEqual(f.notes.recall(f.ctx, { query: "journal", max: 8 }).hits.map((note) => note.id), [older.entry.id]);
+	assert.deepEqual(f.notes.recall(f.ctx, { query: "rollback", max: 8 }).hits.map((note) => note.id), [newer.entry.id, older.entry.id]);
+	assert.equal(f.notes.recall(f.ctx, { query: "roll", max: 8 }).total, 0, "unrelated substrings do not become a second matching policy");
+	const bounded = f.notes.recall(f.ctx, { query: "rollback", max: 1 });
+	assert.equal(bounded.total, 2); assert.equal(bounded.withheld, 1); assert.equal(bounded.hits.length, 1);
+	assert.deepEqual(f.notes.recall(f.ctx, { query: "", max: 8 }).hits.map((note) => note.id), [newer.entry.id, older.entry.id]);
+});
+
 test("a session objective retains its local lifetime and kind", () => {
 	const f = fixture();
 	const saved = f.notes.remember(f.ctx, { kind: "objective", text: "For this branch, verify the host contract." });

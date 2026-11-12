@@ -25,6 +25,33 @@ test("inspection can reach old facts through bounded pages without refreshing th
 	assert.equal((await optimizer.inspect("persona", { offset: -1 })).ok, false);
 }));
 
+test("owner invalidation during preview cannot resurrect a staged plan or write memory", async () => fixture(async ({ optimizer, project }) => {
+	const original = fact("A retained fact belongs to the accepting owner.");
+	await project.update(() => [original]);
+	const inspection = await optimizer.inspect("project"); assert.ok(inspection.ok);
+	const bytes = await readFile(project.filePath, "utf8");
+	const inspect = project.inspectStrict.bind(project);
+	let started!: () => void;
+	let release!: () => void;
+	const reading = new Promise<void>((resolve) => { started = resolve; });
+	const released = new Promise<void>((resolve) => { release = resolve; });
+	project.inspectStrict = async () => { const snapshot = await inspect(); started(); await released; return snapshot; };
+	const pending = optimizer.preview({ fingerprint: inspection.fingerprint,
+		operations: [{ sourceIds: [original.id], kind: "note", text: "A stale replacement must never be staged." }] });
+	await reading;
+	optimizer.invalidate();
+	release();
+	const result = await pending;
+	project.inspectStrict = inspect;
+	assert.equal(result.ok, false, "a read begun by the revoked owner cannot stage a new plan");
+	if (!result.ok) assert.match(result.reason, /owner|invalidat/i);
+	assert.equal(await readFile(project.filePath, "utf8"), bytes);
+	// Invalidation starts a fresh generation; it does not permanently break the reusable instance.
+	const current = await optimizer.preview({ fingerprint: inspection.fingerprint,
+		operations: [{ sourceIds: [original.id], kind: "note", text: "A current-generation reviewed replacement." }] });
+	assert.ok(current.ok);
+}));
+
 test("omitted replacement tags preserve the selected union; explicit empty tags clear them", async () => fixture(async ({ optimizer, project }) => {
 	const a = fact("first tagged source", { tags: ["security", "access"] });
 	const b = fact("second tagged source", { tags: ["audit", "security"] });

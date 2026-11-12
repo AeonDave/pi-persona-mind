@@ -79,7 +79,7 @@ test("native automatic optimization coalesces saves, preserves history and appli
 		assert.equal(payload.entries.length, 2);
 		assert.match(worker.requests[0]!.task, /Return exactly one JSON object/);
 		worker.requests[0]!.finish({ status: "done", ok: true, output: JSON.stringify({ operations: [{ sourceIds: payload.entries.map((e: { id: string }) => e.id), kind: "convention", text: replacement }] }), resultRef: "result:offline" });
-		await until(() => JSON.stringify(cards(h!)).includes("Mind automatic result"), "automatic parent apply");
+		await until(() => h!.notifications.includes("mind · persona · 1 replacement applied"), "automatic parent apply toast");
 		const after = JSON.parse(await readFile(scope.paths.ltm, "utf8"));
 		assert.equal(after.entries.length, 1);
 		assert.equal(after.entries[0].text, replacement);
@@ -88,11 +88,13 @@ test("native automatic optimization coalesces saves, preserves history and appli
 		const audit = entries.filter((e) => e.type === "custom" && e.customType === "pi-persona-mind-auto-proposal");
 		assert.equal(audit.length, 1, "the complete proposal remains in a separate durable audit entry");
 		assert.equal(h.session.extensionRunner!.getEntryRenderer("pi-persona-mind-auto-proposal"), undefined, "Pi has no renderer for the audit entry");
-		assert.equal(cards(h).length, 1, "only one visible result entry is appended");
-		assert.ok(entries.indexOf(audit[0]!) < entries.indexOf(cards(h)[0]!), "proposal audit precedes result");
+		assert.equal(cards(h).length, 0, "automatic success adds no transcript result card");
 		assert.ok(notes.every((text) => JSON.stringify(audit).includes(text)), "full source evidence survives replacement");
-		assert.match(JSON.stringify(cards(h)), /result:offline/);
-		assert.equal(h.notifications.length, 0, "automatic success has no toast");
+		assert.match(JSON.stringify(audit), /result:offline/, "the proposal preserves the worker result reference");
+		const history = await new MindService(scope).createOptimizer().history("persona");
+		assert.equal(history.ok, true);
+		if (history.ok) assert.equal(history.receipts.filter((receipt) => receipt.state === "applied").length, 1, "one durable applied receipt remains available for history and undo");
+		assert.deepEqual(h.notifications, ["mind · persona · 1 replacement applied"], "automatic success has exactly one informative toast");
 		assert.equal(h.faux.state.callCount, 2, "maintenance never wakes the main model");
 	} finally { await h?.dispose(); await rm(root, { recursive: true, force: true }); }
 });
@@ -283,4 +285,25 @@ test("native optimizer requires one million main input tokens and a dirty store,
 		assert.equal(await readFile(scope.paths.ltm, "utf8"), before, "a cancelled proposal cannot replace memory");
 		assert.doesNotMatch(JSON.stringify(cards(h)), /Mind automatic proposal/);
 	} finally { Date.now = realDateNow; await h?.dispose(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("native reactivation retains explicit launch accounting without restoring a cancelled manual retry", { timeout: 20_000 }, async () => {
+	const root = await mkdtemp(join(tmpdir(), "mind-explicit-restore-"));
+	let h: Harness | undefined;
+	const worker = workerFixture();
+	try {
+		h = await runtimeHarness(root, entry, [worker.factory]); await h.bind(); await seed(h);
+		await h.session.prompt("/mind optimize persona");
+		await until(() => worker.requests.length === 1, "explicit worker starts");
+		h.faux.setResponses([usageMessage(0, 0)]);
+		await h.session.prompt("Continue foreground work.");
+		assert.equal(worker.cancellations(), 1);
+		await h.bind();
+		await h.session.prompt("/mind optimize auto status");
+		const status = JSON.stringify(cards(h).at(-1));
+		assert.match(status, /no dirty memory; new memory is required/, "the persisted manual launch consumed the first-attempt allowance");
+		assert.match(status, /0\/1,000,000 main input tokens since last attempt/);
+		assert.doesNotMatch(status, /interrupted review pending|first review waits/);
+		assert.equal(worker.requests.length, 1, "reactivation does not turn explicit cancellation into automatic work");
+	} finally { await h?.dispose(); await rm(root, { recursive: true, force: true }); }
 });

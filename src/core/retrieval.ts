@@ -64,13 +64,12 @@ function entryPathMatches(entry: RetrievalSource, paths: readonly string[]): str
 	return paths.filter((path) => content.includes(path));
 }
 
-function rankItem<T extends RetrievalSource>(entry: T, query: string): RetrievalRank<T> {
-	const terms = queryTerms(query);
+function rankItem<T extends RetrievalSource>(entry: T, terms: readonly string[], paths: readonly string[]): RetrievalRank<T> {
 	const textWords = new Set(words(entry.text));
 	const tagWords = new Set((entry.tags ?? []).flatMap(words));
 	const textTerms = terms.filter((term) => textWords.has(term));
 	const tagTerms = terms.filter((term) => !textWords.has(term) && tagWords.has(term));
-	const pathMatches = entryPathMatches(entry, queryPaths(query));
+	const pathMatches = entryPathMatches(entry, paths);
 	const textScore = textTerms.reduce((sum, term) => sum + (NEGATION_AND_EXCEPTION.has(term) ? 4 : 3), 0);
 	const tagScore = tagTerms.reduce((sum, term) => sum + (NEGATION_AND_EXCEPTION.has(term) ? 3 : 2), 0);
 	const score = textScore + tagScore + pathMatches.length * 12;
@@ -83,7 +82,9 @@ export function rankRetrievalEntries<T extends RetrievalSource>(
 	query: string,
 	tieBreak?: (a: T, b: T) => number,
 ): RetrievalRank<T>[] {
-	return entries.map((entry) => rankItem(entry, query)).sort((a, b) => {
+	const terms = queryTerms(query);
+	const paths = queryPaths(query);
+	return entries.map((entry) => rankItem(entry, terms, paths)).sort((a, b) => {
 		if (a.score !== b.score) return b.score - a.score;
 		const tie = tieBreak?.(a.entry, b.entry) ?? 0;
 		if (tie !== 0) return tie;

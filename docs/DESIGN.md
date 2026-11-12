@@ -143,6 +143,8 @@ keep the earliest source expiry; consolidation cannot revive or extend stale wor
 Unselected entries are preserved. No capacity-enforcing truncation is allowed.
 
 At most four plans per session/scope owner, ten-minute lifetime. Preview is immutable to callers.
+Invalidation during an asynchronous preview read also refuses that preview; it cannot stage a new
+plan belonging to the invalidated owner after the read returns.
 Apply rechecks raw-byte fingerprint, lifetime, source expiry and owner invalidation under the store lock
 and Mind's mutation lock. Even a same-sequence external file replacement invalidates the fingerprint.
 Concurrent apply cannot commit twice. Session/scope changes discard plans; applying never spawns a model.
@@ -179,17 +181,24 @@ Doctor reports the scheduler's current status. No persistent preference is silen
 
 A successful remember/promotion marks its eligible tier dirty. The first eligible burst needs no
 token minimum. Later attempts require dirty memories and 1,000,000 main-session input tokens since
-the preceding actual launch; output, cache read/write and worker tokens are excluded. Usage alone
+the preceding actual launch, including an explicit review; output, cache read/write and worker tokens are excluded. Usage alone
 cannot dirty a tier. Rapid additions coalesce, and dirty tiers left after a review wait for the same
 token gate rather than launching in a cleanup loop. Token counters restart at zero on activation;
 the native session's attempt records preserve whether the first attempt already happened.
 Requests coalesce for two seconds after native `agent_settled`, while idle and without queued work.
 Actual worker attempts have a five-minute cooldown and only one may be in flight per Mind instance.
+Explicit commands bypass automatic admission gates but record their actual launches and settled
+digests. They never receive automatic retry permission when interrupted. Failed attempt persistence
+cancels and joins the admitted worker before releasing the active slot.
 Separate started/settled receipts preserve the attempt target and cooldown without treating an
-interrupted review as completed. A semantic digest skips unchanged settled inputs, including terminal
-refusals and the state already produced by a successful apply. Only a retry of the interrupted attempt
+interrupted review as completed. Restore considers only the latest attempt for each target, so an
+older interrupted input cannot reappear after its changed-input retry has settled. A semantic digest
+skips unchanged settled inputs, including terminal refusals. Only a retry of the interrupted attempt
 bypasses the token gate; it still requires a later native settled event and cooldown. Cancellation
-alone never rearms it. Incoming input, `agent_start`, off,
+alone never rearms it. Unexpected current-owner failures persist terminal suppression without advancing
+the page cursor; a warning asks for inspection when an apply may have completed. If persistence itself
+fails, durable retry suppression cannot be guaranteed and the failure remains visible.
+Incoming input, `agent_start`, off,
 session/persona/workspace changes and shutdown cancel and invalidate pending plans. Delegated legs
 do not recursively schedule automatic workers. Shared memories are excluded.
 
@@ -216,11 +225,14 @@ survive, and semantic deletion by age is not introduced.
 
 Before apply, the complete automatic proposal is appended to an unrendered native audit entry; append
 failure still prevents application. Durable store before images and guarded undo remain unchanged.
-An actual automatic change produces one small expandable result note without a duplicate info toast.
+An actual automatic change produces one lowercase `mind` information toast using the scheduler's
+existing structured target and summary, without adding a routine transcript result card.
 Automatic no-ops settle silently while retaining attempt/digest/status evidence. Failures, refusals and
 uncertain receipt finalization remain visible with an important warning. Explicit/manual reports keep
-their detailed cards. Expansion and history preserve worker/model/effort, result reference and undo
-provenance. No semantic-quality guarantee or invented token savings follows from execution.
+their detailed cards. The unrendered proposal audit preserves worker/model/effort and result reference;
+`/mind optimize history <target>` exposes durable changes and undo provenance. The real worker's
+normal Persona row uses lowercase `mind` and terminates through the same tracked lifecycle.
+No semantic-quality guarantee or invented token savings follows from execution.
 
 ## Durable files and recovery
 
@@ -235,6 +247,11 @@ Stores carry version, sequence, updatedAt and entries. Mutations use same-direct
 fsync, atomic rename, exclusive lockfiles and ownership checks. Directory fsync is best-effort on
 Windows. A live/foreign/malformed lock holder is never stolen merely for being old. Corruption is
 recovered or quarantined with diagnostics, never silently treated as an empty valid store.
+Windows sharing conflicts during recovery-gate acquisition return to the existing bounded lock
+wait; they never authorize entering the protected callback or deleting another recovery gate.
+Ordinary memory stores default to 10,000 entries and 4 MiB; writes over capacity fail without truncating
+existing facts. Backlog terminal retention and optimizer history have their own bounds. Retrieval and
+injection remain bounded independently of archive size.
 Third-party attribution and license notices are retained in [LICENSE](../LICENSE).
 
 Multi-store memory decisions serialize through one profile-wide memory transaction lock, anchored

@@ -84,8 +84,12 @@ export function createSessionMemory(pi: Pick<ExtensionAPI, "appendEntry">): Sess
 			const max = Number.isFinite(opts.max) ? Math.max(1, Math.min(50, Math.floor(opts.max!))) : 8;
 			const query = opts.query ?? "";
 			if (query.length > 2_000) return { ...status, ok: false, reason: "session recall query exceeds 2000 characters", hits: [], total: 0, withheld: 0, max };
-			const words = query.toLocaleLowerCase().split(/\s+/).filter(Boolean);
-			const matched = snapshot.notes.filter((note) => words.every((word) => `${note.text} ${note.source ?? ""}`.toLocaleLowerCase().includes(word))).reverse();
+			// Source provenance remains searchable as lexical metadata; native branch order owns
+			// recency ties, including equal timestamps or a host clock that moved backwards.
+			const ranked = rankRetrievalEntries(snapshot.notes.map((note, position) => ({
+				note, position, id: note.id, text: note.text, tags: note.source ? [note.source] : [],
+			})), query, (a, b) => b.position - a.position);
+			const matched = ranked.filter((match) => !query.trim() || match.score > 0).map((match) => match.entry.note);
 			return { ...status, hits: matched.slice(0, max), total: matched.length, withheld: Math.max(0, matched.length - max), max };
 		},
 		read(ctx, id) {

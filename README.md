@@ -11,6 +11,9 @@ short-term context, session notes and deferred work. Requires a loaded compatibl
 [pi-persona](https://github.com/AeonDave/pi-persona); a settings file or installed package alone
 is not sufficient. Saved claims are not automatically verified facts.
 
+This README describes the current source checkout. Published changes are listed in
+[the changelog](CHANGELOG.md); the latest published version is 0.8.7.
+
 ## Requirements
 
 - Latest stable Pi (currently 1.5.2)
@@ -84,10 +87,19 @@ stop later tiers. Successful changes can be reviewed and undone with the corresp
 undo commands. Optimization uses a visible Persona-hosted worker on the current session model.
 
 Automatic maintenance consolidates multiple compatible sources; it does not apply single-record
-rewrites. A real change shows one brief note with expandable details and undo provenance. Its full
-proposal audit is retained without a second large card; no-op reviews are silent. Important warnings
+rewrites. The live worker is labelled `mind`. A real change shows one informative toast, for example
+`mind · persona · 1 replacement applied`, without adding routine result cards. Its full proposal audit
+and durable undo receipt are retained; use `/mind optimize history <target>` to inspect changes.
+No-op reviews are silent. Important warnings
 stay visible, and explicit/manual operations keep their detailed reports. This is a conservative
 eligibility policy, not a guarantee that every model-generated merge is semantically correct.
+
+Automatic review coalesces new saves after the foreground turn settles. After an actual review
+launch, it requires new memory, one million further main-session input tokens and a five-minute
+cooldown. A manual review also resets that automatic baseline, so a queued automatic pass cannot
+immediately repeat it. Explicit commands still run on request without waiting for those thresholds.
+An interrupted automatic attempt may retry after a later settled event and the cooldown, without
+another token wait; interrupted manual work does not become automatic work.
 
 Already-open Pi sessions can keep the previous implementation in memory. Use `/mind optimize auto off`
 there until a native `/reload` or restart loads the updated extensions; `/persona reload` alone is not
@@ -101,6 +113,24 @@ The `memory` tool supports `remember`, `recall`, `read`, `forget`, `promote` and
 
 Capture preferences can be set with `PI_PERSONA_MIND_CAPTURE=auto|prompt|off`; capture suggestions
 can be disabled with `PI_PERSONA_MIND_NUDGE=off`. See `/mind doctor` for effective session settings.
+
+## Long-running projects
+
+Store lasting repository decisions in `project` long-term memory; short-term project facts and
+backlog expire after about 48 hours. Session notes survive compaction and reopening the same native
+branch, but a new session does not inherit them. Automatic cue capture alone is session-only.
+
+Each turn receives a ranked selection within a shared 2,400-token planning estimate, not the whole
+archive. Use `memory recall` with distinctive terms, paths or tags, then `memory read` for the full
+record and provenance. Older optimizer records remain accessible through paginated inspection.
+The current ranker is lexical; it does not infer every paraphrase or decide which conflicting claim
+is true.
+
+Ordinary memory stores default to at most 10,000 entries and 4 MiB. A capacity failure refuses the
+memory write instead of truncating existing facts. Consolidations preserve source lineage, keep working-memory expiry,
+and retain bounded undo history: at most 32 receipts and 2 MiB per target. `/mind doctor` exposes
+storage and recovery warnings; history and undo help inspect or reverse a particular consolidation.
+Backlog expiry and bounded completed-item retention are separate from durable memory retention.
 
 ## Offline evaluation (source checkout)
 

@@ -11,7 +11,7 @@ export const AUTO_ATTEMPT_ENTRY = "pi-persona-mind-auto-attempt";
 type Target = AutoOptimizeTarget;
 type Optimizer = Pick<MemoryOptimizer, "inspect" | "preview" | "apply" | "invalidate">;
 interface CoverageCursor { offset: number; withinPage: number }
-export interface AutoAttempt { digest: string; at: number; state: "started" | "settled"; target?: Target }
+export interface AutoAttempt { digest: string; at: number; state: "started" | "settled"; target?: Target; explicit?: true }
 export interface AutoOptimizeReportContext {
 	automatic: boolean;
 	target: Target;
@@ -63,8 +63,12 @@ export class AutoOptimizeScheduler {
 		this.seen = new Set([...settledDigests].slice(-64));
 		this.lastAttempt = Math.max(-Infinity, ...owner.attempts.filter((a) => a.at <= this.now()).map((a) => a.at));
 		if (this.enabled) {
-			for (const attempt of owner.attempts) {
-				if (attempt.state === "started" && !settledDigests.has(attempt.digest) && attempt.target && owner.allowedTargets.includes(attempt.target)) {
+			// A later attempt supersedes the interrupted trigger for that tier, even when new
+			// records changed its digest. Never resurrect an older launch after the retry settled.
+			const latestByTarget = new Map<Target, AutoAttempt>();
+			for (const attempt of owner.attempts) if (attempt.target) latestByTarget.set(attempt.target, attempt);
+			for (const attempt of latestByTarget.values()) {
+				if (attempt.state === "started" && !attempt.explicit && !settledDigests.has(attempt.digest) && attempt.target && owner.allowedTargets.includes(attempt.target)) {
 					this.pending.add(attempt.target);
 					this.retryTargets.add(attempt.target);
 					this.retryAttempts.set(attempt.target, { digest: attempt.digest, at: attempt.at });
@@ -149,8 +153,8 @@ export class AutoOptimizeScheduler {
 	private safeCurrent(owner: AutoOptimizeOwner): boolean { try { return this.owner === owner && owner.current(); } catch { return false; } }
 	private safeIdle(owner: AutoOptimizeOwner): boolean { try { return owner.idle(); } catch { return false; } }
 	private allows(owner: AutoOptimizeOwner, target: Target): boolean { return owner.allowedTargets.includes(target); }
-	private remember(owner: AutoOptimizeOwner, target: Target, digest: string, state: AutoAttempt["state"], at: number): void {
-		owner.recordAttempt({ digest, target, at, state });
+	private remember(owner: AutoOptimizeOwner, target: Target, digest: string, state: AutoAttempt["state"], at: number, explicit = false): void {
+		owner.recordAttempt({ digest, target, at, state, ...(explicit ? { explicit: true } : {}) });
 		if (state === "settled") {
 			this.seen.add(digest); while (this.seen.size > 64) this.seen.delete(this.seen.values().next().value!);
 		}
@@ -290,24 +294,31 @@ export class AutoOptimizeScheduler {
 				running.cancel = worker.cancel;
 				running.retryTarget = target;
 				this.retryTargets.delete(target);
-				if (!explicit) { this.lastAttempt = attemptAt; this.inputTokens = 0; }
+				// Explicit requests bypass admission gates, but every actual worker resets the
+				// automatic baseline so a queued dirty tier cannot run again seconds later.
+				this.lastAttempt = attemptAt; this.inputTokens = 0;
 				this.last = "Mind is reviewing memory";
 				unsettledTarget = target;
 				const settle = (): void => {
-					if (!explicit) this.remember(owner, target, input.digest, "settled", attemptAt);
+					this.remember(owner, target, input.digest, "settled", attemptAt, explicit);
 					if (nextCursor) this.cursors.set(target, nextCursor);
 					this.retryAttempts.delete(target);
 					unsettledTarget = undefined;
 				};
 				try {
+					this.remember(owner, target, input.digest, "started", attemptAt, explicit);
 					if (!explicit) {
-						this.remember(owner, target, input.digest, "started", attemptAt);
 						this.retryAttempts.set(target, { digest: input.digest, at: attemptAt });
 						attemptRecorded = true;
 					}
 				} catch {
 					try { running.cancel?.(); } catch { /* best-effort stop before apply */ }
 					this.last = "attempt could not be saved; worker cancelled before apply";
+					// Keep the one-worker slot until cancellation has actually joined its worker.
+					try { await worker.completion; } catch { /* failed cancellation is still terminal */ }
+					report(target, explicit ? "Mind optimization result" : "Mind automatic result",
+						`Bounded review stopped: ${this.last}; memory unchanged.\nWorker ${worker.runId} · ${worker.model} · ${worker.thinking}`,
+						"attempt could not be saved; memory unchanged", explicit, true);
 					return;
 				}
 				const result = await worker.completion;
@@ -373,6 +384,19 @@ export class AutoOptimizeScheduler {
 		} catch (error) {
 			if (!explicit) {
 				this.last = "automatic review failed unexpectedly; inspect current memory before retrying because apply may have completed";
+				if (unsettledTarget && current()) {
+					const attempt = this.retryAttempts.get(unsettledTarget);
+					if (attempt) {
+						try {
+							// Terminal failure is not completed coverage. Persist suppression without
+							// advancing the cursor, so reload cannot retry a possibly committed apply.
+							this.remember(owner, unsettledTarget, attempt.digest, "settled", attempt.at);
+							this.retryAttempts.delete(unsettledTarget);
+							this.retryTargets.delete(unsettledTarget);
+							unsettledTarget = undefined;
+						} catch { /* Keep the warning even when terminal accounting cannot be saved. */ }
+					}
+				}
 				if (activeTarget && current()) {
 					try { report(activeTarget, "Mind automatic result", this.last, "review failed; inspect memory before retrying", false, true); } catch { /* reporting can itself fail */ }
 				}

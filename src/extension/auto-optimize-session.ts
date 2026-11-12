@@ -69,7 +69,7 @@ export function installAutoOptimize(pi: ExtensionAPI, deps: Dependencies): AutoO
 			const data = entry.data as Record<string, unknown>;
 			if (data.version === 1 && data.owner === key && typeof data.digest === "string" && /^[a-f0-9]{64}$/.test(data.digest) && typeof data.at === "number" && Number.isFinite(data.at) && data.at >= 0 && data.at <= Date.now() && (data.state === "started" || data.state === "settled")) {
 				const target = data.target === "project" || data.target === "project-long" || data.target === "persona" ? data.target : undefined;
-				attempts.push({ digest: data.digest, at: data.at, state: data.state, ...(target ? { target } : {}) });
+				attempts.push({ digest: data.digest, at: data.at, state: data.state, ...(target ? { target } : {}), ...(data.explicit === true ? { explicit: true } : {}) });
 				if (attempts.length > 64) attempts.shift();
 			}
 		}
@@ -84,6 +84,10 @@ export function installAutoOptimize(pi: ExtensionAPI, deps: Dependencies): AutoO
 				if (!current()) throw new Error("automatic memory owner changed");
 				if (reportContext?.automatic && reportContext.phase === "proposal") {
 					pi.appendEntry("pi-persona-mind-auto-proposal", { title, content: body });
+					return;
+				}
+				if (reportContext?.automatic && !reportContext.attention) {
+					ctx.ui.notify(`mind · ${reportContext.target} · ${reportContext.summary}`, "info");
 					return;
 				}
 				pi.appendEntry(MIND_RESULT_ENTRY_TYPE, { title, content: body, ...(reportContext?.automatic ? { reportContext } : {}) });

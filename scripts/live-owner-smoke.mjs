@@ -24,8 +24,6 @@ const cwd = join(root, "workspace");
 const mindEntry = mindOverride ? resolve(mindOverride) : fileURLToPath(new URL("../src/index.ts", import.meta.url));
 const fixtureEntry = join(root, "auto-fixture.mjs");
 let session;
-let finishAutomatic;
-const automaticFinished = new Promise((done) => { finishAutomatic = done; });
 const notifications = [];
 const widgets = [];
 const theme = new Proxy({}, { get: () => (...args) => args.at(-1) ?? "" });
@@ -34,7 +32,6 @@ const rpcUi = {
 	select: async () => undefined, confirm: async () => false, input: async () => undefined,
 	notify: (message, level) => {
 		notifications.push({ message: String(message), level });
-		if (String(message).startsWith("Mind · ")) finishAutomatic();
 	},
 	onTerminalInput: () => () => {}, setStatus: () => {},
 	setWidget: (key, content) => {
@@ -86,6 +83,8 @@ export function createFixture() {
       body = "AMBER-ALPHA-947";
     }
     if (marker >= 0) {
+      const tools = context.messages.filter((message) => message.role === "system").flatMap((message) => message.toolsAdded ?? []);
+      if (tools.length !== 0) throw new Error("Automatic Mind worker received tools");
       const payload = JSON.parse(text.slice(marker + 1));
       if (payload.entries.length !== 2) throw new Error("Offline fixture expected two supplied source records");
       body = JSON.stringify({ operations: [{ sourceIds: payload.entries.map((entry) => entry.id), kind: "note", text: "The Aurora qualification project's release report must include both the test summary and the exact release version." }] });
@@ -148,6 +147,7 @@ export default function(pi) { pi.registerProvider(createFixture().provider); }
 		const before = await ctx.executeTool("memory", { action: "optimize", mode: "inspect", target: "persona", max: 100 });
 		assert.equal(before.isError, false);
 		assert.equal(before.result?.details?.total, 2, "the isolated smoke must start with exactly its two saved facts");
+		notifications.length = 0;
 		let starts = 0;
 		let settled = 0;
 		const unsubscribe = session.subscribe((event) => {
@@ -155,6 +155,7 @@ export default function(pi) { pi.registerProvider(createFixture().provider); }
 			if (event.type === "agent_settled") settled++;
 		});
 		let deadline;
+		let polling = true;
 		try {
 			const timeout = new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error(`Automatic review did not finish within 150 seconds: ${JSON.stringify({ notifications, widgets: widgets.slice(-4) })}`)), 150_000); });
 			// This native foreground request ends naturally in agent_settled. We do not call
@@ -164,8 +165,15 @@ export default function(pi) { pi.registerProvider(createFixture().provider); }
 			assert.equal(reply?.role, "assistant", "the native foreground turn must finish with an assistant message");
 			assert.notEqual(reply.stopReason, "error", `Foreground provider request failed: ${reply.errorMessage ?? "unknown provider error"}`);
 			assert.notEqual(reply.stopReason, "aborted", "the native foreground trigger was aborted");
-			await Promise.race([automaticFinished, timeout]);
-		} finally { clearTimeout(deadline); unsubscribe(); }
+			// Only the harness polls the existing persisted attempt marker. It covers silent
+			// no-ops as well as applied and failed attempts, without waking the supervisor.
+			const settledAttempt = async () => {
+				while (polling && !session.sessionManager.getBranch().some((entry) => entry.type === "custom" && entry.customType === "pi-persona-mind-auto-attempt" && entry.data?.target === "persona" && entry.data?.state === "settled")) {
+					await new Promise((done) => setTimeout(done, 50));
+				}
+			};
+			await Promise.race([settledAttempt(), timeout]);
+		} finally { polling = false; clearTimeout(deadline); unsubscribe(); }
 		const entries = session.sessionManager.getBranch();
 		const cards = entries.filter((entry) => entry.type === "custom" && entry.customType === "pi-persona-mind-result").map((entry) => entry.data);
 		const terminal = entries.filter((entry) => entry.type === "custom" && entry.customType === "pi-persona-terminal-result" && entry.data?.agent === "mind");
@@ -177,34 +185,39 @@ export default function(pi) { pi.registerProvider(createFixture().provider); }
 		assert.ok(report.usage.input + report.usage.output > 0, "the provider response must carry recorded usage");
 		const displayModel = modelRef.split("/").at(-1).replace(/^claude-/, "");
 		const effortTag = effortSigla(supervisorThinking);
-		const workerWidget = widgets.find((text) => /Mind/.test(text) && text.includes(displayModel) && (!effortTag || text.includes(` · ${effortTag}`)));
+		const workerWidget = widgets.find((text) => /mind · /.test(text) && text.includes(displayModel) && (!effortTag || text.includes(` · ${effortTag}`)));
 		assert.ok(workerWidget, "the real worker must appear in the native agent widget with its selected model and effort");
 		assert.equal(starts, 1, "maintenance must not wake a second foreground turn");
 		assert.equal(settled, 1, "the foreground trigger must reach native agent_settled once");
-		const result = cards.find((card) => card.title === "Mind automatic result");
-		const noOp = cards.find((card) => card.title === "Mind automatic optimization" && /bounded review found no safe consolidation/.test(card.content));
-		assert.ok(result || noOp, `Expected applied proposal or an explicit conservative no-op: ${JSON.stringify(cards)}`);
-		if (result) {
-			const proposalIndex = cards.findIndex((card) => card.title === "Mind automatic proposal");
-			assert.ok(proposalIndex >= 0 && proposalIndex < cards.indexOf(result), "before/after proposal must precede the application result");
-			const proposal = cards[proposalIndex];
-			assert.match(proposal.content, /Staged proposed change/);
-			assert.match(proposal.content, /"before":/);
-			assert.match(proposal.content, /"after":/);
-		}
+		const proposals = entries.filter((entry) => entry.type === "custom" && entry.customType === "pi-persona-mind-auto-proposal");
+		assert.equal(session.extensionRunner.getEntryRenderer("pi-persona-mind-auto-proposal"), undefined, "proposal audit is unrendered");
+		const settlementIndex = entries.findIndex((entry) => entry.type === "custom" && entry.customType === "pi-persona-mind-auto-attempt" && entry.data?.target === "persona" && entry.data?.state === "settled");
+		const proposalBeforeSettlement = proposals.length === 1 && entries.indexOf(proposals[0]) < settlementIndex;
 		const after = await ctx.executeTool("memory", { action: "optimize", mode: "inspect", target: "persona", max: 100 });
 		assert.equal(after.isError, false);
-		let receipts = [];
-		if (result) {
-			const history = await ctx.executeTool("memory", { action: "optimize", mode: "history", target: "persona", max: 20 });
-			assert.equal(history.isError, false, `persona optimization history could not be inspected: ${JSON.stringify(history)}`);
-			receipts = history.result?.details?.receipts;
-			assert.ok(Array.isArray(receipts), "persona optimization history must expose its retained receipts");
+		const history = await ctx.executeTool("memory", { action: "optimize", mode: "history", target: "persona", max: 20 });
+		assert.equal(history.isError, false, `persona optimization history could not be inspected: ${JSON.stringify(history)}`);
+		const receipts = history.result?.details?.receipts;
+		assert.ok(Array.isArray(receipts), "persona optimization history must expose its retained receipts");
+		const outcome = assertLiveAutoOutcome({ cards, notifications, proposals: proposals.map((entry) => entry.data), proposalBeforeSettlement, workerOutput: report.body, before: before.result.details, after: after.result.details, receipts });
+		if (outcome === "applied") {
+			const source = before.result.details.entries;
+			const saved = after.result.details.entries;
+			const change = receipts[0].changes[0];
+			assert.deepEqual(change.before.map((entry) => entry.id).sort(), source.map((entry) => entry.id).sort(), "receipt retains both actual source facts");
+			for (const key of ["id", "kind", "text", "source", "derivedFrom"]) assert.deepEqual(saved[0][key], change.after[key], `inspected replacement ${key} matches the durable receipt`);
+			assert.deepEqual(new Set(saved[0].derivedFrom), new Set(source.map((entry) => entry.id)), "replacement preserves both source IDs");
+			for (const entry of source) assert.ok(proposals[0].data.content.includes(entry.text), "proposal audit preserves each original fact");
+			const undone = await ctx.executeTool("memory", { action: "optimize", mode: "undo", target: "persona", receiptId: receipts[0].receiptId });
+			assert.equal(undone.isError, false);
+			assert.equal(undone.result?.details?.ok, true, "the durable receipt can actually undo the apply");
+			const restored = await ctx.executeTool("memory", { action: "optimize", mode: "inspect", target: "persona", max: 100 });
+			const byId = (entries) => [...entries].sort((a, b) => a.id.localeCompare(b.id));
+			assert.deepEqual(byId(restored.result?.details?.entries), byId(source), "undo restores both original inspected facts");
 		}
-		const outcome = assertLiveAutoOutcome({ cards, before: before.result.details, after: after.result.details, receipts });
 		const diskHistory = await readFile(session.sessionManager.getSessionFile(), "utf8");
 		assert.match(diskHistory, /pi-persona-terminal-result/);
-		assert.match(diskHistory, /Mind automatic (?:result|optimization)/);
+		if (outcome === "applied") assert.match(diskHistory, /pi-persona-mind-auto-proposal/);
 		console.log(JSON.stringify({ status: "PASS", mode: "automatic", providerKind: offline ? "offline-scripted-fixture" : "real-provider", engine, model: report.model, thinkingRequested: report.thinkingRequested, thinkingEffective: report.thinkingEffective, nativeAgentSettled: settled, nativeWorkerView: true, terminalReport: { ref: report.ref, status: report.status, usage: report.usage, body: report.body }, outcome, beforeCount: before.result.details.total, afterCount: after.result.details.total, cards, widget: workerWidget }));
 	} else {
 	await session.prompt("/persona beta");

@@ -150,6 +150,110 @@ test("automatic singleton operation refuses the whole proposal before preview an
 	f.advance(); f.scheduler.settled(); assert.equal(f.pending(), 0);
 });
 
+test("explicit attempts share the automatic cooldown and token baseline without arming a retry", async () => {
+	const f = fixture();
+	f.scheduler.memoryAdded("project"); f.scheduler.settled();
+	assert.equal(f.scheduler.startExplicit("persona"), true);
+	await until(() => f.launches() === 1, "explicit worker");
+	f.finish('{"operations":[]}'); await f.scheduler.join();
+	assert.equal(f.pending(), 0, "a manual pass cannot immediately launch independently dirty automatic work");
+	assert.match(f.scheduler.status(), /1,000,000 main input tokens remain/);
+	f.scheduler.tokensUsed(AUTO_INPUT_TOKEN_THRESHOLD); f.scheduler.settled();
+	assert.deepEqual(f.delays(), [AUTO_COOLDOWN_MS], "automatic work respects the latest actual worker launch");
+	f.scheduler.stop();
+	f.scheduler.activate(f.owner); f.scheduler.memoryAdded("project"); f.scheduler.settled();
+	assert.equal(f.pending(), 0, "the explicit launch baseline survives activation");
+	f.scheduler.tokensUsed(AUTO_INPUT_TOKEN_THRESHOLD); f.scheduler.settled();
+	assert.deepEqual(f.delays(), [AUTO_COOLDOWN_MS]);
+	f.scheduler.stop();
+});
+
+test("a completed explicit window suppresses an automatic review of the same sources after restore", async () => {
+	const f = fixture(); f.scheduler.startExplicit("persona");
+	await until(() => f.launches() === 1, "explicit worker");
+	f.finish('{"operations":[]}'); await f.scheduler.join();
+	f.scheduler.activate(f.owner); f.advance(); f.scheduler.tokensUsed(AUTO_INPUT_TOKEN_THRESHOLD);
+	f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire();
+	f.finish('{"operations":[]}'); await f.scheduler.join();
+	assert.equal(f.launches(), 1, "the reviewed digest is shared across explicit and automatic requests");
+});
+
+test("an interrupted explicit receipt preserves cooldown but cannot restore an automatic retry", async () => {
+	const f = fixture(); f.scheduler.startExplicit("persona");
+	await until(() => f.launches() === 1, "explicit worker");
+	f.scheduler.interrupt(); await f.scheduler.join();
+	f.scheduler.activate(f.owner); f.scheduler.settled();
+	assert.equal(f.pending(), 0);
+	f.scheduler.memoryAdded("project"); f.scheduler.settled();
+	assert.equal(f.pending(), 0, "the manual attempt consumes the first-launch allowance");
+	f.scheduler.tokensUsed(AUTO_INPUT_TOKEN_THRESHOLD); f.scheduler.settled();
+	assert.deepEqual(f.delays(), [AUTO_COOLDOWN_MS]);
+	f.scheduler.stop();
+});
+
+test("retrying changed input retires its earlier interrupted receipt after settlement", async () => {
+	const f = fixture(); f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire();
+	f.scheduler.interrupt(); await f.scheduler.join();
+	const interruptedDigest = f.attempts[0]!.digest;
+	f.entries.push(makeMemory({ term: "long", kind: "convention", text: "A later fact changes the bounded review input.", persona: "dev" }, 2_000_000));
+	f.advance(); f.scheduler.settled(); await f.fire();
+	assert.equal(f.launches(), 2); f.finish('{"operations":[]}'); await f.scheduler.join();
+	assert.notEqual(f.attempts.at(-1)!.digest, interruptedDigest, "new input has a distinct review receipt");
+	f.scheduler.activate(f.owner); f.scheduler.settled();
+	assert.equal(f.pending(), 0, "an obsolete started digest must not regain the token-floor exception");
+});
+
+test("attempt persistence failure retains single-flight until the cancelled worker actually settles", async () => {
+	const f = fixture({ recordAttempt: () => { throw new Error("persist failed"); }, cancelCompletes: false });
+	f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire();
+	assert.equal(f.launches(), 1); assert.ok(f.events.includes("cancel"));
+	assert.equal(f.scheduler.startExplicit("project"), false, "a cancellation request is not worker completion");
+	f.finish({ status: "stopped", ok: false, output: "" }); await f.scheduler.join();
+	assert.equal(f.applied(), 0);
+});
+
+test("attempt persistence failure reports one current-owner terminal failure after joining cancellation", async () => {
+	for (const explicit of [false, true]) {
+		const f = fixture({ recordAttempt: () => { throw new Error("private persistence details"); }, cancelCompletes: false });
+		const contexts: Array<{ automatic: boolean; attention: boolean }> = [];
+		const original = f.owner.report;
+		f.owner.report = (title, body, context) => { if (context) contexts.push(context); original(title, body, context); };
+		if (explicit) { f.scheduler.startExplicit("persona"); await until(() => f.launches() === 1, "explicit worker before save failure"); }
+		else { f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire(); }
+		assert.equal(f.reports.length, 0, "the terminal report waits until cancellation has joined");
+		f.finish({ status: "done", ok: true, output: '{"operations":[]}' }); await f.scheduler.join();
+		assert.equal(f.applied(), 0); assert.equal(f.reports.length, 1);
+		assert.match(f.reports[0]!.body, /attempt could not be saved.*before apply; memory unchanged/);
+		assert.match(f.reports[0]!.body, /Worker run · provider\/current · high/);
+		assert.doesNotMatch(f.reports[0]!.body, /private persistence details|replacement.*applied/i);
+		assert.deepEqual(contexts, [{ automatic: !explicit, target: "persona", phase: "result", summary: "attempt could not be saved; memory unchanged", attention: true }]);
+	}
+});
+
+test("attempt persistence failure never reports into a revoked owner after cancellation joins", async () => {
+	for (const explicit of [false, true]) {
+		const f = fixture({ recordAttempt: () => { throw new Error("persist failed"); }, cancelCompletes: false });
+		if (explicit) { f.scheduler.startExplicit("persona"); await until(() => f.launches() === 1, "explicit worker before revocation"); }
+		else { f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire(); }
+		f.revoke(); f.finish({ status: "stopped", ok: false, output: "" }); await f.scheduler.join();
+		assert.equal(f.reports.length, 0); assert.equal(f.applied(), 0);
+	}
+});
+
+test("uncertain automatic preview or apply failure cannot restore a token-free retry", async () => {
+	for (const failure of ["previewThrows", "applyThrows"] as const) {
+		const f = fixture({ [failure]: true });
+		f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire();
+		f.finish(JSON.stringify({ operations: [{ sourceIds: f.entries.map((entry) => entry.id), kind: "convention", text: "A validated replacement proposal." }] }));
+		await f.scheduler.join();
+		const terminal = f.reports.at(-1)?.body ?? "";
+		assert.match(terminal, /inspect current memory before retrying/);
+		assert.doesNotMatch(terminal, /memory unchanged|replacement.*applied/i);
+		f.scheduler.activate(f.owner); f.scheduler.settled();
+		assert.equal(f.pending(), 0, "uncertain work requires inspection even after owner reactivation");
+	}
+});
+
 test("one singleton invalidates an otherwise eligible multi-operation automatic proposal", async () => {
 	const extra = makeMemory({ term: "long", kind: "note", text: "other fact" }, 1_000_000);
 	const f = fixture(); f.entries.push(extra);
@@ -240,7 +344,8 @@ test("bare explicit review covers every allowed target in sequence, without over
 	assert.deepEqual(f.inspected, ["project", "project-long", "persona"]);
 	assert.deepEqual(f.inspectCalls.map(({ target, offset, max }) => [target, offset, max]), [["project", 0, 100], ["project-long", 0, 100], ["persona", 0, 100]], "the batch selects one bounded page for each tier");
 	assert.equal(f.maxActiveWorkers(), 1);
-	assert.equal(f.attempts.length, 0, "manual batch work does not arm automatic retries or persist automatic attempts");
+	assert.equal(f.attempts.length, 6, "each manual worker preserves its launch and settlement baseline");
+	assert.ok(f.attempts.every((attempt) => attempt.explicit === true), "manual receipts never arm automatic retries");
 	assert.ok(f.reports.some((report) => /Target: project-long/.test(report.body)));
 	assert.ok(f.reports.some((report) => /Target: persona/.test(report.body)));
 });
@@ -298,7 +403,7 @@ test("cancellation of an in-flight batch worker suppresses late apply and every 
 	assert.deepEqual(f.inspected, ["project"]);
 	assert.equal(f.applied(), 0);
 	assert.deepEqual(f.reports, []);
-	assert.equal(f.attempts.length, 0, "manual cancellation does not persist or rearm a manual retry");
+	assert.deepEqual(f.attempts.map(({ state, explicit }) => ({ state, explicit })), [{ state: "started", explicit: true }], "manual cancellation preserves its baseline without a retryable receipt");
 });
 
 test("cancellation triggered by a skipped tier stops before inspecting the next tier", async () => {
@@ -373,7 +478,7 @@ test("explicit review bypasses automatic off, token and cooldown gates but requi
 	f.finish(JSON.stringify({ operations: [{ sourceIds: f.entries.map((entry) => entry.id), kind: "convention", text: "Persona keeps concise explicit memory." }] }));
 	await f.scheduler.join();
 	assert.equal(f.applied(), 1, "valid worker output follows the existing preview/apply pipeline even while auto is off");
-	assert.equal(f.attempts.length, 0, "manual work does not create automatic retry receipts");
+	assert.ok(f.attempts.length === 2 && f.attempts.every((attempt) => attempt.explicit === true), "manual work records its baseline without automatic retry receipts");
 	assert.match(f.reports.find((report) => report.title === "Mind optimization result")?.body ?? "", /Undo: \/mind optimize undo auto-receipt persona/, "the ordinary result preserves the durable undo receipt reference");
 	assert.match(f.reports.at(-1)?.body ?? "", /Bounded coverage: one selected record window/);
 	assert.match(f.reports.find((report) => report.title === "Mind optimization proposal")?.body ?? "", /Staged proposed change/);
@@ -395,8 +500,10 @@ test("explicit work cancels queued auto timers and join retains the active worke
 	assert.equal(f.launches(), 1, "the stale callback must not admit a competing auto pass");
 	f.finish('{"operations":[]}'); await join;
 	assert.equal(joined, true);
-	assert.equal(f.pending(), 1, "accepted explicit work preserves independently pending automatic work");
-	assert.deepEqual(f.delays(), [2_000], "the preserved automatic pass is rescheduled through its normal idle delay");
+	assert.equal(f.pending(), 0, "independently dirty automatic work still needs input tokens after the explicit launch");
+	f.scheduler.tokensUsed(AUTO_INPUT_TOKEN_THRESHOLD); f.scheduler.settled();
+	assert.deepEqual(f.delays(), [AUTO_COOLDOWN_MS], "preserved automatic work honors the shared launch cooldown");
+	f.scheduler.stop();
 });
 
 test("explicit unexpected preview/apply failures append cautious owner-current terminal reports", async () => {
@@ -482,7 +589,7 @@ test("explicit cancellation or owner change suppresses late apply and report wit
 	await f.scheduler.join();
 	assert.equal(f.applied(), 0);
 	assert.deepEqual(f.reports, []);
-	assert.equal(f.attempts.length, 0);
+	assert.deepEqual(f.attempts.map(({ state, explicit }) => ({ state, explicit })), [{ state: "started", explicit: true }]);
 
 	const stale = fixture();
 	assert.equal(stale.scheduler.startExplicit("persona"), true);

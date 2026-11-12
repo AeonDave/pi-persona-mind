@@ -79,6 +79,16 @@ async function execute(harness: ReturnType<typeof makeToolHarness>, params: Reco
 	return harness.tool.execute("call", params, undefined, undefined, harness.ctx);
 }
 
+test("save receipts promise retained retrieval rather than guaranteed context reinjection", async () => {
+	const h = makeToolHarness();
+	const result = await execute(h, { action: "remember", term: "long", scope: "project", kind: "note", text: "A stable repository fact." });
+	const text = result.content.map((block: { text?: string }) => block.text ?? "").join("\n");
+	assert.match(text, /recall\/read/i);
+	assert.match(text, /ranked.*context/i);
+	assert.doesNotMatch(text, /will re-appear/i);
+	assert.doesNotMatch(JSON.stringify(h.tool), /Facts are re-injected.*each turn/);
+});
+
 test("model-selected global memories remain writable after local session retention without a confirmation gate", async () => {
 	const h = makeToolHarness();
 	assert.equal((await execute(h, { action: "remember", term: "session", kind: "note", text: "Use a temporary strategy only for this task." })).details.ok, true);

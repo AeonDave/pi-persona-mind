@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import fsPromises from "node:fs/promises";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, open, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
+import { syncBuiltinESMExports } from "node:module";
+import { performance } from "node:perf_hooks";
 import { after, before, test } from "node:test";
 
 import { atomicWriteFile, JsonStore, quarantineCorrupt, withFileLock } from "../src/core/store.ts";
@@ -451,6 +454,59 @@ test("withFileLock fails closed while another process owns the recovery gate", a
 	await rm(`${lock}.recovery`, { recursive: true, force: true });
 	await attempt;
 	assert.equal(entered, true, "the waiter proceeds once the recovery owner releases its gate");
+});
+
+test("withFileLock retries a Windows recovery gate sharing violation without bypassing ownership", { skip: process.platform !== "win32" }, async (t) => {
+	const lock = join(dir, "recovery-mkdir-sharing.lock");
+	await writeFile(lock, `${hostname()}:999999-0`, "utf8");
+	const original = fsPromises.mkdir;
+	let injected = false;
+	let entered = 0;
+	t.mock.method(fsPromises, "mkdir", async (...args: Parameters<typeof mkdir>) => {
+		if (args[0] === `${lock}.recovery` && !injected) {
+			injected = true;
+			throw Object.assign(new Error("injected Windows directory deletion sharing violation"), { code: "EPERM" });
+		}
+		return original(...args);
+	});
+	syncBuiltinESMExports();
+	try {
+		await withFileLock(lock, async (token) => {
+			assert.equal(readFileSync(lock, "utf8"), token, "only the installed canonical token grants entry");
+			entered++;
+		});
+		assert.equal(injected, true);
+		assert.equal(entered, 1, "retry eventually acquires a fresh canonical lock exactly once");
+		assert.equal(existsSync(lock), false);
+		assert.equal(existsSync(`${lock}.recovery`), false);
+	} finally {
+		t.mock.restoreAll(); syncBuiltinESMExports();
+	}
+});
+
+test("withFileLock bounds persistent Windows recovery gate denial and preserves the dead token", { skip: process.platform !== "win32" }, async (t) => {
+	const lock = join(dir, "recovery-mkdir-denied.lock");
+	const token = `${hostname()}:999999-0`;
+	await writeFile(lock, token, "utf8");
+	const original = fsPromises.mkdir;
+	let clock = 0;
+	let entered = false;
+	t.mock.method(fsPromises, "mkdir", async (...args: Parameters<typeof mkdir>) => {
+		if (args[0] === `${lock}.recovery`) {
+			clock = 31_000;
+			throw Object.assign(new Error("injected persistent recovery gate denial"), { code: "EPERM" });
+		}
+		return original(...args);
+	});
+	t.mock.method(performance, "now", () => clock);
+	syncBuiltinESMExports();
+	try {
+		await assert.rejects(withFileLock(lock, async () => { entered = true; }), /timed out.*sustained write contention/);
+		assert.equal(entered, false);
+		assert.equal(readFileSync(lock, "utf8"), token, "denial never grants recovery authority or deletes another token");
+	} finally {
+		t.mock.restoreAll(); syncBuiltinESMExports();
+	}
 });
 
 test("separate processes recovering one dead lock never overlap callbacks", async () => {

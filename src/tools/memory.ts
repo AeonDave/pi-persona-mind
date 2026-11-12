@@ -120,8 +120,8 @@ export function registerMemoryTool(pi: ExtensionAPI, getMind: GetMind, sessionMe
 		],
 		description: [
 			"`remember` stores context for an explicitly chosen lifetime: `session` for active-branch notes only (best for task-specific or uncertain choices), `short` for expiring project working context, or `long` for durable facts with a REQUIRED explicit `scope=project|persona|shared`. Use project for stable repository facts, persona for intent across all projects of the same persona, and shared only for intent across personas. Long-term scope has no implicit default; the scope selects an API destination and does not authenticate consent. Automatic cue capture is always provisional session-only, even for explicit durability phrases; it does not make an external/durable save. Broader retention needs a deliberate scoped memory call. Promotion defaults to project. `recall` searches; `read` gets full text; `forget` retires by id with optional scope. For `optimize`, inspect candidates, read full entries, compare against current evidence, stage explicit reviewed replacements preserving exceptions and provenance, then apply an exact reviewed plan. Inspect is read-only; it does not call a model or write.",
-			"Facts are re-injected into your context automatically each turn, so remember what you would",
-			"want to know next session. Keep entries DECLARATIVE, never store secrets.",
+			"Stored facts remain available through recall/read; relevant facts are ranked for bounded context each turn.",
+			"Keep entries DECLARATIVE, never store secrets.",
 		].join(" "),
 		parameters: MemoryParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -268,7 +268,7 @@ async function runMemoryAction(mind: MindService, params: MemoryToolParams, ctx:
 		const r = await mind.remember(input);
 		const destination = params.term === "long" ? params.scope as "project" | "persona" | "shared" : "project";
 		return r.ok
-			? say(`Remembered ${r.entry.id} — ${r.entry.expiresAt ? "short" : "long"}-term ${params.kind} in ${destination} scope. It will re-appear in your context.`, {
+			? say(`Remembered ${r.entry.id} — ${r.entry.expiresAt ? "short" : "long"}-term ${params.kind} in ${destination} scope. Available through memory recall/read and ranked for bounded context.`, {
 				id: r.entry.id,
 				ok: true,
 				scope: destination,

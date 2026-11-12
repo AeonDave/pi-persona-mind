@@ -2,11 +2,32 @@
 
 ## [Unreleased]
 
+- Show the active worker as lowercase `mind`; successful automatic consolidation emits one informative
+  toast instead of routine result cards. Proposal audits and durable undo history remain available;
+  explicit reports and important warnings stay visible.
+- Include manual worker launches in automatic cooldown/token accounting, preserve their completed
+  digests, and keep interrupted manual work out of automatic retries. Hold the active slot until a
+  cancelled worker settles when attempt persistence fails.
+- Refuse optimization previews invalidated while their store read is in flight.
+- Use the same lexical/path ranker for session recall and archive retrieval, including punctuation,
+  source references and CJK text. Save receipts explain bounded context selection instead of promising
+  that every saved fact will reappear automatically.
+- Parse each retrieval query once per search instead of once per record, preserving ranking and
+  tie order while reducing repeated work in large archives.
+- Restore only the latest automatic attempt for each target; persist uncertain terminal failures
+  without advancing coverage and surface attempt-persistence failures after cancellation joins.
+- Handle Windows sharing conflicts while acquiring the dead-lock recovery gate as bounded
+  contention, preserving exclusive callbacks and the existing ownership checks.
+- Qualify long-project memory at the 10,000-entry store limit: old-fact recall/read/injection,
+  pagination, reopen, capacity refusal, consolidation, undo and preservation of unrelated facts.
+- Update live qualification to verify the actual toast/audit/receipt contract, exact multi-source
+  application and successful undo in both Persona engines.
+- Resolve installed Pi qualification dependencies through the selected host's public package
+  exports, including ordinary hoisted npm layouts.
 - Use lowercase Mind card headings and review notification prefixes while preserving saved history
   and custom titles.
 - Keep automatic maintenance quiet: persist the full proposal audit without a visible proposal card,
-  show one brief expandable note for a change, omit routine info toasts and no-op cards, and preserve
-  manual detail and important warnings.
+  omit no-op notifications, and preserve manual detail and important warnings.
 - Limit background application to multi-source consolidation; skip model admission without a
   compatible pair and leave single-record edits available to explicit workflows. This is an eligibility
   guard, not a semantic-truth guarantee. Ordinary LLM-selected global memory saves remain available.

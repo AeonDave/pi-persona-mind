@@ -58,10 +58,12 @@ export class MemoryOptimizer {
 	}
 
 	async preview(input: OptimizePreviewInput): Promise<OptimizePlan | OptimizeFailure> {
+		const generation = this.generation;
 		const target = input.target ?? "project";
 		if (!isOptimizeTarget(target)) return { ok: false, reason: "unknown memory optimizer target" };
 		try {
 			const snapshot = await this.options.stores[target].inspectStrict();
+			if (this.generation !== generation) return { ok: false, reason: "memory owner changed; preview invalidated before staging" };
 			if (snapshot.fingerprint !== input.fingerprint) return { ok: false, reason: "memory store changed since inspection; inspect again" };
 			const now = this.now();
 			const result = planConsolidation(snapshot.store.entries, input.operations, target, this.options.persona, now);

@@ -2,52 +2,54 @@ import assert from "node:assert/strict";
 
 export interface LiveAutoCard { title: string; content: string }
 export interface LiveAutoInspection { total: number; fingerprint: string }
-export interface LiveAutoReceipt { receiptId: string; target: string; state: string }
+export interface LiveAutoReceipt {
+	receiptId: string; target: string; state: string;
+	changes: readonly { before: readonly { id: string }[]; after: { id: string } }[];
+}
 export interface LiveAutoOutcomeInput {
 	cards: readonly LiveAutoCard[];
+	notifications: readonly { message: string; level: string }[];
+	proposals: readonly { content: string }[];
+	proposalBeforeSettlement: boolean;
+	workerOutput: string;
 	before: LiveAutoInspection;
 	after: LiveAutoInspection;
 	receipts: readonly LiveAutoReceipt[];
 }
 export type LiveAutoOutcome = "applied" | "conservative-no-op";
 
-const NO_OP_LINE = "Bounded coverage: one selected record window; bounded review found no safe consolidation in this record set.";
-
-/** Qualify the automatic result using the durable card and independent post-run inspection. */
+/** Qualify the settled worker through independent audit, UI, store and history evidence. */
 export function assertLiveAutoOutcome(input: LiveAutoOutcomeInput): LiveAutoOutcome {
-	const results = input.cards.filter((card) => card.title === "Mind automatic result");
-	const noOps = input.cards.filter((card) => card.title === "Mind automatic optimization" && card.content.split(/\r?\n/, 1)[0] === NO_OP_LINE);
-	assert.equal(results.length + noOps.length, 1, "expected exactly one successful automatic result or bounded no-op");
-	assert.equal(input.before.total, 2, "isolated automatic fixture must start with its two persona records");
-	assert.equal(typeof input.before.fingerprint, "string");
-	assert.ok(input.before.fingerprint.length > 0, "before inspection must carry the store fingerprint");
-	assert.equal(typeof input.after.fingerprint, "string");
-	assert.ok(input.after.fingerprint.length > 0, "after inspection must carry the store fingerprint");
-
-	if (noOps.length === 1) {
-		assert.equal(input.after.total, input.before.total, "a conservative no-op must preserve the inspected record count");
-		assert.equal(input.after.fingerprint, input.before.fingerprint, "a conservative no-op must preserve the exact inspected store fingerprint");
+	assert.equal(input.cards.length, 0, "automatic success or no-op must not create result cards");
+	assert.equal(input.before.total, 2, "fixture must start with two persona records");
+	assert.ok(input.before.fingerprint && input.after.fingerprint, "store inspections need fingerprints");
+	const output: unknown = JSON.parse(input.workerOutput);
+	assert.ok(output && typeof output === "object" && Array.isArray((output as { operations?: unknown }).operations), "worker output must contain operations");
+	const operations = (output as { operations: { sourceIds?: unknown }[] }).operations;
+	if (operations.length === 0) {
+		assert.equal(input.notifications.length, 0, "no-op is silent");
+		assert.equal(input.proposals.length, 0);
+		assert.equal(input.receipts.length, 0);
+		assert.equal(input.after.total, 2);
+		assert.equal(input.after.fingerprint, input.before.fingerprint);
 		return "conservative-no-op";
 	}
-
-	const result = results[0]!;
-	assert.doesNotMatch(result.content, /^\s*Warning\s*:/im, "a warned apply is not a clean automatic success");
-	const firstLine = result.content.split(/\r?\n/, 1)[0] ?? "";
-	const summary = /^Bounded coverage: one selected record window; (\d+) → (\d+) memories; (\d+) replacement\(s\)$/u.exec(firstLine);
-	assert.ok(summary, `automatic result must use the exact success summary grammar: ${firstLine}`);
-	const beforeCount = Number(summary[1]);
-	const afterCount = Number(summary[2]);
-	const replacements = Number(summary[3]);
-	assert.equal(beforeCount, input.before.total, "reported before count must match the initial persona inspection");
-	assert.equal(afterCount, input.after.total, "reported after count must match the final persona inspection");
-	assert.ok(afterCount >= 1 && afterCount <= 2, "the isolated fixture must retain one or two persona records");
-	assert.ok(replacements > 0 && replacements <= 2, "successful automatic apply must report one or two replacements");
-	assert.notEqual(input.after.fingerprint, input.before.fingerprint, "a successful consolidation must change the inspected store fingerprint");
-
-	const undoLines = [...result.content.matchAll(/^Undo: \/mind optimize undo ([\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}) persona\.$/gim)];
-	assert.equal(undoLines.length, 1, "successful automatic apply must show one persona undo receipt");
-	const receiptId = undoLines[0]?.[1];
-	assert.ok(receiptId, "persona undo receipt id must be present");
-	assert.ok(input.receipts.some((receipt) => receipt.receiptId === receiptId && receipt.target === "persona" && receipt.state === "applied"), "the undo link must resolve to a durable applied receipt in persona history");
+	assert.equal(operations.length, 1);
+	const sourceIds = operations[0]?.sourceIds;
+	assert.ok(Array.isArray(sourceIds) && sourceIds.length === 2 && new Set(sourceIds).size === 2, "automatic consolidation must use both distinct records");
+	assert.deepEqual(input.notifications, [{ message: "mind · persona · 1 replacement applied", level: "info" }]);
+	assert.equal(input.proposals.length, 1);
+	assert.match(input.proposals[0]!.content, /Staged proposed change/);
+	assert.match(input.proposals[0]!.content, /"before":/);
+	assert.match(input.proposals[0]!.content, /"after":/);
+	assert.equal(input.proposalBeforeSettlement, true, "proposal audit precedes apply settlement");
+	assert.equal(input.after.total, 1, "both records must consolidate into one");
+	assert.notEqual(input.after.fingerprint, input.before.fingerprint);
+	assert.equal(input.receipts.length, 1);
+	const receipt = input.receipts[0]!;
+	assert.ok(receipt.receiptId && receipt.target === "persona" && receipt.state === "applied", "one finalized persona receipt is required");
+	assert.equal(receipt.changes.length, 1);
+	assert.deepEqual(receipt.changes[0]!.before.map((entry) => entry.id).sort(), [...sourceIds].sort(), "receipt must cover the actual proposal sources");
+	assert.ok(receipt.changes[0]!.after.id, "receipt must retain replacement");
 	return "applied";
 }

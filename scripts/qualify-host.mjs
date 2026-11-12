@@ -25,6 +25,8 @@ const hostRoot = resolve(hostArg);
 const hostPackage = JSON.parse(await readFile(join(hostRoot, "package.json"), "utf8"));
 assert.equal(hostPackage.name, "@earendil-works/pi-coding-agent");
 assert.equal(hostPackage.version, "1.5.2", `Expected Pi 1.5.2, found ${hostPackage.version}`);
+assert.equal(typeof hostPackage.main, "string", "The selected host must declare its SDK entry");
+const hostEntryURL = pathToFileURL(join(hostRoot, hostPackage.main)).href;
 
 const mindEntry = process.argv[4] ? resolve(process.argv[4]) : resolve(fileURLToPath(new URL("../src/index.ts", import.meta.url)));
 if (process.argv[4] && !isAbsolute(process.argv[4])) throw new Error("Optional Mind extension path must be absolute.");
@@ -157,9 +159,10 @@ registerHooks({
 	resolve(specifier, context, nextResolve) {
 		for (const name of PACKAGE_NAMES) {
 			const bare = `@earendil-works/${name}`;
-			if (specifier !== bare) continue;
-			const root = name === "pi-coding-agent" ? hostRoot : join(hostRoot, "node_modules", "@earendil-works", name);
-			return nextResolve(pathToFileURL(join(root, "dist", "index.js")).href, context);
+			if (specifier !== bare && !specifier.startsWith(`${bare}/`)) continue;
+			// Resolve the current host's real ESM exports, including hoisted dependencies.
+			// A nested node_modules layout is not part of Pi's installation contract.
+			return nextResolve(specifier, { ...context, parentURL: hostEntryURL });
 		}
 		return nextResolve(specifier, context);
 	},
@@ -183,8 +186,8 @@ try {
 		throw new Error("Offline qualification tripwire: outbound fetch is disabled.");
 	};
 
-	const host = await import(pathToFileURL(join(hostRoot, "dist", "index.js")).href);
-	const faux = await import(pathToFileURL(join(hostRoot, "node_modules", "@earendil-works", "pi-ai", "dist", "providers", "faux.js")).href);
+	const host = await import(hostEntryURL);
+	const faux = await import("@earendil-works/pi-ai/providers/faux");
 	assert.equal(host.VERSION, "1.5.2");
 
 	const settingsManager = host.SettingsManager.inMemory({ retry: { enabled: false }, compaction: { enabled: false } });

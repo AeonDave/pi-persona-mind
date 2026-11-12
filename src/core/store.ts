@@ -474,7 +474,11 @@ async function recoverDeadLocalLock(
 		try {
 			await mkdir(gate);
 		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+			const code = (err as NodeJS.ErrnoException).code;
+			// Windows may report EPERM while a contender's removed gate is still pending
+			// deletion. We acquired nothing: retry through the caller's bounded contention
+			// wait, without removing the gate or inspecting/replacing the canonical token.
+			if (code === "EEXIST" || (process.platform === "win32" && code === "EPERM")) return false;
 			throw err;
 		}
 		try {
