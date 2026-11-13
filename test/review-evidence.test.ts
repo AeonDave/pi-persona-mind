@@ -27,6 +27,68 @@ test("collects explicit textual repo files and detects changed bytes", async () 
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("canonical root aliases remain fresh despite legacy realpath spelling differences", async (t) => {
+  const root = await repo();
+  const aliases = await repo();
+  try {
+    const alias = join(aliases, "workspace");
+    await symlink(root, alias, process.platform === "win32" ? "junction" : "dir");
+    await writeFile(join(root, "safe.md"), "Safe repository fact");
+    const originalRealpath = fs.realpathSync;
+    // Model legacy JS realpath retaining an alias while native realpath expands it
+    // (Windows short names); both spellings refer to the same real directory.
+    const legacy = t.mock.method(fs, "realpathSync", (...args: Parameters<typeof originalRealpath>) =>
+      String(args[0]) === alias ? alias : originalRealpath(...args));
+    Object.assign(legacy, { native: originalRealpath.native });
+    syncBuiltinESMExports();
+    for (const cwd of [root, alias]) {
+      const snap = await collectReviewEvidence(context(cwd), ["safe.md"], () => true);
+      assert.equal(snap.evidence.length, 1);
+      assert.equal(snap.evidence[0]!.text, "1: Safe repository fact");
+      snap.assertFresh();
+    }
+  } finally {
+    t.mock.restoreAll(); syncBuiltinESMExports();
+    await rm(aliases, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+for (const change of ["alias-retarget", "root-identity"] as const) {
+  test(`freshness rejects ${change} before reading repository bytes`, async (t) => {
+    const root = await repo();
+    const aliases = await repo();
+    const outside = await repo();
+    const parked = join(aliases, "parked");
+    try {
+      const alias = join(aliases, "workspace");
+      await symlink(root, alias, process.platform === "win32" ? "junction" : "dir");
+      await writeFile(join(root, "safe.md"), "Safe repository fact");
+      await writeFile(join(outside, "safe.md"), "Other repository fact");
+      const snap = await collectReviewEvidence(context(alias), ["safe.md"], () => true);
+      if (change === "alias-retarget") {
+        await rm(alias, { recursive: true, force: true });
+        await symlink(outside, alias, process.platform === "win32" ? "junction" : "dir");
+      } else {
+        fs.renameSync(root, parked);
+        await mkdir(root);
+        await writeFile(join(root, "safe.md"), "Safe repository fact");
+      }
+      let reads = 0;
+      const originalRead = fs.readSync;
+      t.mock.method(fs, "readSync", (...args: Parameters<typeof originalRead>) => { reads++; return originalRead(...args); });
+      syncBuiltinESMExports();
+      assert.throws(() => snap.assertFresh(), /project root changed/i);
+      assert.equal(reads, 0, "root path and identity checks must precede content reads");
+    } finally {
+      t.mock.restoreAll(); syncBuiltinESMExports();
+      await rm(aliases, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+}
+
 test("keeps several explicit files within serialized evidence budget and withholds injections", async () => {
   const root = await repo();
   try {
@@ -209,13 +271,19 @@ test("rejects file and directory symlinks, including safe in-root targets", asyn
 for (const phase of ["collection", "freshness"] as const) {
   for (const swap of ["before-open", "after-open", "ancestor"] as const) {
     test(`${phase} refuses ${swap} symlink swaps without reading the swapped source`, async (t) => {
-      const root = await repo();
+      const realRoot = await repo();
+      const aliases = await repo();
+      const root = join(aliases, "workspace");
       const outside = await repo();
       try {
+        // Exercise a noncanonical cwd on every OS, like macOS /tmp -> /private/tmp.
+        await symlink(realRoot, root, process.platform === "win32" ? "junction" : "dir");
         await mkdir(join(root, "docs"));
         const path = join(root, "docs", "safe.md");
         const target = join(outside, "safe.md");
         await writeFile(path, "Original safe fact");
+        const openedPath = fs.realpathSync.native(path);
+        assert.notEqual(openedPath, path, "the fixture must exercise an aliased source path");
         await writeFile(target, "password=never-admit-swapped-secret");
         await symlink(target, join(root, "capability.md"));
         const snap = phase === "freshness" ? await collectReviewEvidence(context(root), ["docs/safe.md"], () => true) : undefined;
@@ -234,7 +302,7 @@ for (const phase of ["collection", "freshness"] as const) {
           }
         };
         t.mock.method(fs, "openSync", (name: fs.PathLike, flags: fs.OpenMode, mode?: fs.Mode) => {
-          if (String(name) !== path || swapped) return originalOpen(name, flags, mode);
+          if (String(name) !== openedPath || swapped) return originalOpen(name, flags, mode);
           if (process.platform !== "win32" && fs.constants.O_NOFOLLOW) assert.ok((Number(flags) & fs.constants.O_NOFOLLOW) !== 0);
           if (swap !== "after-open") replace();
           const fd = originalOpen(name, flags, mode);
@@ -249,7 +317,8 @@ for (const phase of ["collection", "freshness"] as const) {
         assert.equal(reads, 0, "identity/path failure must precede descriptor content reads");
       } finally {
         t.mock.restoreAll(); syncBuiltinESMExports();
-        await rm(root, { recursive: true, force: true });
+        await rm(aliases, { recursive: true, force: true });
+        await rm(realRoot, { recursive: true, force: true });
         await rm(outside, { recursive: true, force: true });
       }
     });

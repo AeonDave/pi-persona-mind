@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { Text, visibleWidth } from "@earendil-works/pi-tui";
 import type { InspectorPage, InspectorRequest } from "../src/extension/inspector-data.ts";
 import { createMemoryInspectorComponent, memoryInspectorViewportRows, openMemoryInspector } from "../src/ui/memory-inspector.ts";
 
@@ -235,6 +235,33 @@ test("inspector frames every view like F9 and reserves space for borders and pad
   assert.match(h.render(60, 12), /line-49/);
   h.key("s"); assertFrame();
   h.key("ESC"); h.key("ESC"); h.key("?"); assertFrame();
+});
+
+test("F10 matches F9 content gutters and separates header, records and navigation", async () => {
+  const h = harness(async () => ({ ...page([{ id: "spacing", title: "First record", body: "Full record text", source: { title: "Recorded source", body: "Original source text" } }]), total: 1, notice: "Bounded coverage" }));
+  await tick();
+  const blank = (line: string | undefined) => /^│ +│$/.test(line ?? "");
+  const frame = () => {
+    const rows = h.component.render(80, 24);
+    for (const row of rows.slice(1, -1)) assert.match(row, /^│  .*  │$/, "F9 Text padding plus frame padding gives two-column gutters");
+    for (const row of rows) assert.equal(visibleWidth(row), 80);
+    assert.ok(rows.length <= 24);
+    assert.ok(blank(rows[2]), "one blank row after the title, as in F9");
+    return rows;
+  };
+  const list = frame();
+  const f9Title = new Text("Memory inspector", 1, 0).render(76)[0]!;
+  assert.equal(list[1], `│ ${f9Title}${" ".repeat(Math.max(0, 76 - visibleWidth(f9Title)))} │`, "same native Text + frame padding used by Persona F9");
+  const selected = list.findIndex((row) => row.includes("▸ First record"));
+  assert.ok(blank(list[selected - 1]), "separate the metadata header from records");
+  const listFooter = list.findIndex((row) => row.includes("Tab / Shift+Tab tabs"));
+  assert.ok(blank(list[listFooter - 1]), "separate records from navigation");
+  for (const key of ["ENTER", "s", "?"]) {
+    h.key(key);
+    const rows = frame();
+    const footer = rows.findIndex((row) => row.includes("Up/Down scroll"));
+    assert.ok(blank(rows[footer - 1]), "detail, source and help keep a footer gutter");
+  }
 });
 
 test("action payload tracks actual list/detail selection and is unavailable without a handler or on other tabs", async () => {

@@ -8,7 +8,7 @@ import { test } from "node:test";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { MindService } from "../src/core/service.ts";
 import { createExtension } from "../src/index.ts";
-import { AutoOptimizeScheduler } from "../src/extension/auto-optimize.ts";
+import { AUTO_COOLDOWN_MS, AUTO_IDLE_MS, AutoOptimizeScheduler } from "../src/extension/auto-optimize.ts";
 import { OptimizeHistoryStore } from "../src/core/optimize-history.ts";
 import { resolveScope } from "../src/core/scope.ts";
 import type { MindWorkerResult } from "../src/extension/mind-worker.ts";
@@ -51,9 +51,14 @@ for (const automatic of [false, true]) test(`native branch navigation cancels he
 		manager.appendCustomEntry("branch-origin", {});
 		const id = manager.getSessionId(), file = manager.getSessionFile();
 		if (automatic) {
+			// The scheduler's idle timer is intentionally unref'd; a pending admission promise
+			// alone cannot keep Node 22 alive. Advance that timer, then join actual worker events.
+			t.mock.timers.enable({ apis: ["setTimeout"] });
 			// Use the actual tool-result and settled hooks without spending main-model tokens.
 			await h.session.extensionRunner!.emitToolResult({ type: "tool_result", toolName: "memory", toolCallId: "save", input: { action: "remember", term: "long", scope: "persona" }, content: [], details: { ok: true }, isError: false });
 			await h.session.extensionRunner!.emit({ type: "agent_settled", aborted: false });
+			assert.equal(requests, 0, "automatic admission waits for the idle window");
+			t.mock.timers.tick(AUTO_IDLE_MS);
 		} else await h.session.prompt("/mind optimize persona");
 		const task = await admitted.promise;
 		const payload = JSON.parse(task.split("\n").at(-1)!) as { entries: { id: string }[] };
@@ -71,9 +76,11 @@ for (const automatic of [false, true]) test(`native branch navigation cancels he
 		assert.equal(await readFile(scope.paths.ltm, "utf8"), before);
 		assert.equal(manager.getEntries().length, reports, "no late audit/result/attempt is appended on the destination branch");
 		assert.equal(h.notifications.length, notifications, "no stale report/toast");
-		clockOffset = 5 * 60_000 + 1;
+		clockOffset = AUTO_COOLDOWN_MS + 1;
 		await h.session.extensionRunner!.emit({ type: "agent_settled", aborted: false });
 		if (automatic) {
+			assert.equal(requests, 1, "retry also waits for the idle window after cooldown");
+			t.mock.timers.tick(AUTO_IDLE_MS);
 			const freshTask = await retry.promise;
 			assert.equal(requests, 2, "documented settled+cooldown retry starts a NEW worker");
 			assert.equal(await readFile(scope.paths.ltm, "utf8"), before, "old proposal was not resurrected by retry admission");
@@ -87,7 +94,7 @@ for (const automatic of [false, true]) test(`native branch navigation cancels he
 		}
 	} finally {
 		completion.resolve({ ok: false, status: "stopped", output: "" }); retryCompletion.resolve({ ok: false, status: "stopped", output: "" });
-		await h.dispose(); Date.now = realNow; t.mock.restoreAll(); await rm(root, { recursive: true, force: true });
+		await h.dispose(); Date.now = realNow; t.mock.timers.reset(); t.mock.restoreAll(); await rm(root, { recursive: true, force: true });
 	}
 });
 

@@ -21,7 +21,8 @@ coupled through a versioned local companion handshake to
   typebox as optional peers on `*`, with all four Pi development packages pinned together.
   No historical-host branches; never bundle a second host runtime. Scope development security
   overrides to their affected parent/version and remove them when that graph no longer needs them.
-- Tests clear `PI_PERSONA_*` case-insensitively and pin `PI_AGENT_DIR` to a throwaway directory.
+- Tests clear `PI_PERSONA_*` case-insensitively and pin `PI_AGENT_DIR` plus the SDK's
+  `PI_CODING_AGENT_DIR` to the same throwaway directory.
   Keep the hermetic import on every direct test invocation. Real SDK tests use an offline provider.
 - Require the loaded companion protocol at session activation and tool call time; missing or
   incompatible Persona means no capture, storage/migration, injection or scheduler activity.

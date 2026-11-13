@@ -71,7 +71,7 @@ function readRepositoryFile(root: string, path: string, remaining: number, check
 			stats.push(stat);
 		}
 		check();
-		if (!samePath(realpathSync(fullPath), fullPath)) throw new Error("Repository evidence canonical path changed");
+		if (!samePath(realpathSync.native(fullPath), fullPath)) throw new Error("Repository evidence canonical path changed");
 		return stats;
 	};
 	const before = inspect();
@@ -119,13 +119,15 @@ export async function collectReviewEvidence(ctx: ExtensionContext, paths: readon
 	const seen = new Set(selected.map((path) => process.platform === "win32" ? path.toLowerCase() : path));
 	if (seen.size !== selected.length) throw new Error("Duplicate repository evidence path");
 	check();
+	// fs/promises realpath uses native canonicalization; use its synchronous native
+	// counterpart below too (legacy realpathSync can retain Windows short-name aliases).
 	const root = await realpath(ctx.cwd);
 	check(); // No subsequent IO if ownership/trust was revoked across the async boundary.
 	const rootStat = lstatSync(root, { bigint: true });
 	if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("Review project root changed; evidence revoked");
 	const checkRoot = (): void => {
 		check();
-		if (!samePath(realpathSync(ctx.cwd), root)) throw new Error("Review project root changed; evidence revoked");
+		if (!samePath(realpathSync.native(ctx.cwd), root)) throw new Error("Review project root changed; evidence revoked");
 		check();
 		if (!sameIdentity(rootStat, lstatSync(root, { bigint: true }))) throw new Error("Review project root changed; evidence revoked");
 	};

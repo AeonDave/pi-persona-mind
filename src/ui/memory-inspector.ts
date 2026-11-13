@@ -213,10 +213,12 @@ export class MemoryInspectorComponent implements Component, Focusable {
     const outerRows = Math.max(1, Math.floor(height ?? this.options.viewportHeight?.() ?? this.tui.terminal?.rows ?? 1));
     // Match Persona's F9 frame, but degrade safely when the terminal cannot fit its chrome.
     if (outerWidth < 5 || outerRows < 3) return this.renderContent(outerWidth, outerRows);
-    const innerWidth = outerWidth - 4;
+    // F9 combines one column of Text padding with one column inside the frame.
+    const gutter = " ".repeat(outerWidth >= 7 ? 2 : 1);
+    const innerWidth = outerWidth - 2 - gutter.length * 2;
     const border = (text: string) => this.theme.fg("accent", text);
     const body = this.renderContent(innerWidth, outerRows - 2).map((line) =>
-      `${border("│")} ${line}${" ".repeat(Math.max(0, innerWidth - visibleWidth(line)))} ${border("│")}`);
+      `${border("│")}${gutter}${line}${" ".repeat(Math.max(0, innerWidth - visibleWidth(line)))}${gutter}${border("│")}`);
     return [border(`┌${"─".repeat(outerWidth - 2)}┐`), ...body, border(`└${"─".repeat(outerWidth - 2)}┘`)];
   }
 
@@ -246,8 +248,10 @@ export class MemoryInspectorComponent implements Component, Focusable {
       if (this.searching) {
         this.searchInput.focused = this.focused;
         if (rows >= 3) result.push(accent(t.bold("Memory inspector")));
+        if (rows >= 7) result.push("");
         if (rows >= 4) result.push(this.tab === "memories" ? `${dim("Scope: ")}${activeScope}` : activeScope);
         result.push(this.searchInput.render(safeWidth)[0] ?? "/");
+        if (rows >= 7) result.push("");
         if (rows >= 2) result.push(dim(`${key("tui.select.confirm")} apply · ${key("tui.select.cancel")} cancel`));
         return result.slice(0, rows).map(fit);
       }
@@ -297,7 +301,11 @@ export class MemoryInspectorComponent implements Component, Focusable {
       const footers = this.searching
         ? footer([`${key("tui.select.confirm")} apply`, `${key("tui.select.cancel")} cancel`])
         : [footer(["Tab / Shift+Tab tabs", ...optional.slice(0, 2)]), footer([`${pair("tui.select.up", "tui.select.down")} select`, `${key("tui.select.confirm")} open`, ...optional.slice(2, 4)]), footer(["? help", `${key("tui.select.cancel")}/F10 close`, ...optional.slice(4)])].flat();
-      const capacity = Math.max(0, rows - result.length - footers.length);
+      // Spend whitespace only when at least one record still fits. Match F9's
+      // title/content/footer separation rather than crowding the frame chrome.
+      const spaced = rows - result.length - footers.length >= 4;
+      if (spaced) { result.splice(1, 0, ""); result.push(""); }
+      const capacity = Math.max(0, rows - result.length - footers.length - Number(spaced));
       const maxStart = Math.max(0, items.length - capacity);
       this.listStart = Math.min(this.listStart, maxStart);
       if (this.selected < this.listStart) this.listStart = this.selected;
@@ -309,6 +317,7 @@ export class MemoryInspectorComponent implements Component, Focusable {
         const rendered = i === this.selected ? `${accent(line)}${marker ? dim(marker) : ""}` : `${fit(line)}${marker ? dim(marker) : ""}`;
         result.push(truncateToWidth(rendered, safeWidth));
       }
+      if (spaced) result.push("");
       result.push(...footers);
     } else {
       let breadcrumb: string;
@@ -354,13 +363,16 @@ export class MemoryInspectorComponent implements Component, Focusable {
         ];
       const scroll = this.view === "source" ? this.sourceScroll : this.view === "help" ? this.helpScroll : this.detailScroll;
       const indicatorRows = scroll > 0 ? 2 : 1;
-      const capacity = Math.max(0, rows - result.length - footers.length - indicatorRows);
+      const spaced = rows - result.length - footers.length - indicatorRows >= 3;
+      if (spaced) result.push("");
+      const capacity = Math.max(0, rows - result.length - footers.length - indicatorRows - Number(spaced));
       const maxStart = Math.max(0, displayWrapped.length - capacity);
       const start = Math.min(scroll, maxStart);
       this.setDetailScroll(start);
       if (start > 0) result.push(dim(`▲ ${start} lines above`));
       result.push(...displayWrapped.slice(start, start + capacity).map((line, index) => start + index === missingSourceIndex ? t.fg("warning", fit(line)) : this.view === "help" ? dim(line) : fit(line)));
       if (start + capacity < displayWrapped.length) result.push(dim(`▼ ${displayWrapped.length - start - capacity} lines below`));
+      if (spaced) result.push("");
       result.push(...footers);
     }
     return result.slice(0, rows).map(fit);

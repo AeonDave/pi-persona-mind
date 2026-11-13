@@ -246,7 +246,10 @@ test("inspector displays the prepared native session context and closes on branc
 		assert.match(rendered[0] ?? "", /^┌─+┐$/);
 		// The native wrapping can split the sentinel; remove only the frame/padding and
 		// rejoin visual rows, then still require every character of the original text.
-		const visibleBody = rendered.filter((line) => line.startsWith("│ ")).map((line) => line.slice(2, -2).trimEnd()).join("");
+		const visibleBody = rendered.filter((line) => line.startsWith("│")).map((line) => {
+			assert.match(line, /^│  .*  │$/, "F9-style two-column inner gutters");
+			return line.slice(3, -3).trimEnd();
+		}).join("");
 		assert.match(visibleBody, /inspector-native-sentinel/);
 	}
 	assert.equal(m.entries.length, before);

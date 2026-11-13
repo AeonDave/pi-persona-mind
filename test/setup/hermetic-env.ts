@@ -12,4 +12,5 @@ for (const key of Object.keys(process.env)) {
 }
 const agentDir = mkdtempSync(join(tmpdir(), "pi-mind-test-agent-"));
 process.env.PI_AGENT_DIR = agentDir;
+process.env.PI_CODING_AGENT_DIR = agentDir;
 process.once("exit", () => rmSync(agentDir, { recursive: true, force: true }));

@@ -11,6 +11,9 @@
   automatic maintenance retains its existing fresh-worker retry policy.
 - Join admitted knowledge-review application through approval, persistence, receipt finalization
   and cleanup during shutdown. Revocation does not pretend to roll back already committed writes.
+- Keep evidence root/file checks on the same native canonicalization path, including Windows
+  short-name aliases. Cross-platform swap tests retain real symlink and descriptor defenses.
+  Lifecycle tests explicitly advance automatic admission timers on the minimum supported Node.
 - Add explicit consolidation and evidence-grounded knowledge-review actions to F10. Review selected
   facts or bounded scope windows against parent-selected repository files and active-branch user-role
   text on the session model; show cited findings before separately approved corrections.
