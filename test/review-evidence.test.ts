@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, symlink, writeFile, rm } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test, { type TestContext } from "node:test";
+import test from "node:test";
 import { collectReviewEvidence } from "../src/extension/review-evidence.ts";
 
 async function repo() { return mkdtemp(join(tmpdir(), "mind-review-")); }
@@ -12,19 +12,8 @@ function context(cwd: string, entries: unknown[] = [], trusted = true) {
   return { cwd, isProjectTrusted: () => trusted, sessionManager: { getBranch: () => entries } } as never;
 }
 const user = (id: string, text: string) => ({ type: "message", id, parentId: null, timestamp: "2026-01-01T00:00:00Z", message: { role: "user", content: text } });
-// Windows file symlinks require Developer Mode or SeCreateSymbolicLinkPrivilege; some filesystems
-// do not implement symlinks. Only those observed capability errors permit this test to be untested.
-async function linkOrSkip(t: TestContext, target: string, path: string): Promise<boolean> {
-  try { await symlink(target, path); return true; }
-  catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOSYS" || code === "ENOTSUP" || process.platform === "win32" && code === "EPERM") {
-      t.skip(`File symlinks unavailable on this host/filesystem (${code}); symlink case untested`);
-      return false;
-    }
-    throw error;
-  }
-}
+// Symlink boundary tests are required. On Windows the test account needs Developer Mode or
+// SeCreateSymbolicLinkPrivilege; a missing capability fails explicitly rather than hiding coverage.
 
 test("collects explicit textual repo files and detects changed bytes", async () => {
   const root = await repo();
@@ -196,13 +185,13 @@ test("freshness rejects revoked trust, owner, branch identity and full native te
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("rejects file and directory symlinks, including safe in-root targets", async (t) => {
+test("rejects file and directory symlinks, including safe in-root targets", async () => {
   const root = await repo();
   const outside = await repo();
   try {
     await writeFile(join(root, "safe.md"), "Safe local text");
     await writeFile(join(outside, "safe.md"), "Safe outside text");
-    if (!await linkOrSkip(t, join(root, "safe.md"), join(root, "link.md"))) return;
+    await symlink(join(root, "safe.md"), join(root, "link.md"));
     await symlink(outside, join(root, "linked-dir"), process.platform === "win32" ? "junction" : "dir");
     await assert.rejects(collectReviewEvidence(context(root), ["link.md"], () => true), /symlink/i);
     await assert.rejects(collectReviewEvidence(context(root), ["linked-dir/safe.md"], () => true), /symlink/i);
@@ -228,7 +217,7 @@ for (const phase of ["collection", "freshness"] as const) {
         const target = join(outside, "safe.md");
         await writeFile(path, "Original safe fact");
         await writeFile(target, "password=never-admit-swapped-secret");
-        if (!await linkOrSkip(t, target, join(root, "capability.md"))) return;
+        await symlink(target, join(root, "capability.md"));
         const snap = phase === "freshness" ? await collectReviewEvidence(context(root), ["docs/safe.md"], () => true) : undefined;
         const originalOpen = fs.openSync;
         const originalRead = fs.readSync;
