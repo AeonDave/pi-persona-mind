@@ -47,6 +47,7 @@ const PERSONA_PRESENCE = { version: 1, provider: "pi-persona", role: "supervisor
 function mockPi(flags: Readonly<Record<string, boolean | string | undefined>> = {}, getSessionManager?: () => SessionManager, presence: unknown = PERSONA_PRESENCE) {
 	const tools = new Map<string, ToolLike>();
 	const commands = new Map<string, CommandLike>();
+	const shortcuts = new Map<string, { handler: (ctx: unknown) => unknown }>();
 	const handlers = new Map<string, Handler>();
 	const registeredFlags = new Set<string>();
 	const messages: string[] = [];
@@ -91,7 +92,7 @@ function mockPi(flags: Readonly<Record<string, boolean | string | undefined>> = 
 		getActiveTools: () => activeToolNames.slice(),
 		setActiveTools: (names: string[]) => { activeToolNames = names.slice(); },
 		registerCommand: (name: string, def: CommandLike) => commands.set(name, def),
-		registerShortcut: () => {},
+		registerShortcut: (key: string, definition: { handler: (ctx: unknown) => unknown }) => shortcuts.set(key, definition),
 		registerFlag: (name: string) => registeredFlags.add(name),
 		registerEntryRenderer: (type: string, renderer: EntryRendererForTest) => { entryRenderers.set(type, renderer); },
 		getSettings: () => ({ outputPad: 1 }),
@@ -108,7 +109,7 @@ function mockPi(flags: Readonly<Record<string, boolean | string | undefined>> = 
 		},
 		events,
 	};
-	return { pi: pi as never, tools, commands, handlers, messages, messageOptions, entries, entryRenderers, events, installPersona, unloadPersona, activeTools: () => activeToolNames.slice(),
+	return { pi: pi as never, tools, commands, shortcuts, handlers, messages, messageOptions, entries, entryRenderers, events, installPersona, unloadPersona, activeTools: () => activeToolNames.slice(),
 		setPersona: (persona: string | null, sessionId?: string) => { const next = { persona, ready: true }; if (sessionId) fixtureOwners.set(sessionId, next); else defaultOwner = next; },
 		setOwnerReady: (ready: boolean) => { defaultOwner = { ...defaultOwner, ready }; },
 		setOwnerProtocol: (enabled: boolean) => { ownerProtocol = enabled; },
@@ -196,6 +197,108 @@ test("session memory tools follow activation, shutdown, native branch, and new-s
 	await m.handlers.get("session_shutdown")?.({}, ctx);
 });
 
+test("F10 and browse require a current supervisor and never open TUI on RPC", async () => {
+	const m = mockPi();
+	const cwd = join(dir, "inspector-wiring", "project");
+	const ctx = { ...ctxFor(cwd), mode: "rpc" };
+	createExtension(m.pi, { agentDir: join(dir, "inspector-wiring", "agent") });
+	assert.ok(m.shortcuts.has("f10"));
+	await m.handlers.get("session_start")?.({}, ctx);
+	const entriesBefore = m.entries.length;
+	await m.shortcuts.get("f10")!.handler(ctx);
+	await m.commands.get("mind")!.handler("browse context", ctx);
+	assert.ok(ctx.notifications.filter((message) => /interactive terminal/.test(message)).length >= 2);
+	assert.equal(m.entries.length, entriesBefore, "opening the inspector does not append a transcript entry");
+	assert.equal(m.messages.length, 0);
+	await m.handlers.get("session_shutdown")?.({}, ctx);
+	const before = ctx.notifications.length;
+	await m.shortcuts.get("f10")!.handler(ctx);
+	assert.ok(ctx.notifications.length > before);
+	assert.match(ctx.notifications.at(-1) ?? "", /owner|session/i);
+});
+
+test("inspector displays the prepared native session context and closes on branch navigation", async () => {
+	const cwd = join(dir, "inspector-context", "project");
+	const manager = SessionManager.inMemory(cwd);
+	const m = mockPi({}, () => manager);
+	let view: { render(width: number): string[]; handleInput(data: string): void } | undefined;
+	const theme = { fg: (_name: string, text: string) => text, bold: (text: string) => text };
+	const kb = {
+		matches: (data: string, action: string) => data === "ENTER" && action === "tui.select.confirm" || data === "ESC" && action === "tui.select.cancel",
+		getKeys: (action: string) => ({ "tui.select.up": ["up"], "tui.select.down": ["down"], "tui.select.confirm": ["enter"], "tui.select.cancel": ["escape"], "tui.select.pageUp": ["pageUp"], "tui.select.pageDown": ["pageDown"] }[action] ?? []),
+	};
+	const ctx = { ...ctxFor(cwd), sessionManager: manager, ui: { ...ctxFor(cwd).ui,
+		custom: (factory: (tui: never, theme: never, keys: never, done: () => void) => NonNullable<typeof view>) => new Promise<void>((resolve) => {
+			view = factory({ terminal: { rows: 30 }, requestRender() {} } as never, theme as never, kb as never, resolve);
+		}),
+	} };
+	createExtension(m.pi, { agentDir: join(dir, "inspector-context", "agent") });
+	await m.handlers.get("session_start")?.({}, ctx);
+	await m.tools.get("memory")!.execute("save", { action: "remember", term: "session", kind: "note", text: "inspector-native-sentinel" }, undefined, undefined, ctx);
+	const injected = await m.handlers.get("before_agent_start")?.({ messageType: "user", systemPrompt: "BASE", prompt: "sentinel" }, ctx) as { systemPrompt: string };
+	assert.match(injected.systemPrompt, /inspector-native-sentinel/);
+	const before = m.entries.length;
+	const opened = m.commands.get("mind")!.handler("browse context", ctx);
+	await waitForCondition("prepared context page", () => /Last prepared/.test(view?.render(160).join("\n") ?? ""));
+	view!.handleInput("ENTER");
+	for (const width of [120, 160, 200]) {
+		const rendered = view!.render(width);
+		assert.match(rendered[0] ?? "", /^┌─+┐$/);
+		// The native wrapping can split the sentinel; remove only the frame/padding and
+		// rejoin visual rows, then still require every character of the original text.
+		const visibleBody = rendered.filter((line) => line.startsWith("│ ")).map((line) => line.slice(2, -2).trimEnd()).join("");
+		assert.match(visibleBody, /inspector-native-sentinel/);
+	}
+	assert.equal(m.entries.length, before);
+	assert.equal(m.messages.length, 0);
+	await m.handlers.get("session_tree")?.({}, ctx);
+	await opened;
+	assert.deepEqual(view!.render(160), []);
+	const reopened = m.commands.get("mind")!.handler("browse context", ctx);
+	await waitForCondition("cleared branch context", () => /No items on this page/.test(view?.render(200).join("\n") ?? ""));
+	view!.handleInput("?");
+	assert.match(view!.render(200).join("\n"), /No Mind context prepared/);
+	view!.handleInput("ESC");
+	view!.handleInput("ESC");
+	await reopened;
+	await m.handlers.get("session_shutdown")?.({}, ctx);
+});
+
+test("native review commands launch through Persona and require a separate approved apply", async () => {
+	const cwd = join(dir, "knowledge-review-wiring", "project");
+	await mkdir(cwd, { recursive: true });
+	await writeFile(join(cwd, "package.json"), '{"engines":{"node":">=22"}}');
+	const manager = SessionManager.inMemory(cwd);
+	const m = mockPi({}, () => manager);
+	const base = ctxFor(cwd);
+	const ctx = { ...base, sessionManager: manager, isProjectTrusted: () => true, isIdle: () => true, hasPendingMessages: () => false,
+		model: { provider: "offline", id: "current" }, thinkingLevel: "high", ui: { ...base.ui, input: async () => "package.json", confirm: async () => true } };
+	let launched = 0;
+	m.events.on("pi-persona:mind-worker:v1", (request) => {
+		const value = request as { task: string; respond(response: unknown): void };
+		assert.deepEqual(Object.keys(value).sort(), ["persona", "respond", "sessionId", "task", "version"], "no model override or fallback is smuggled into the companion contract");
+		const packet = JSON.parse(value.task.split("<quoted-review-data>")[1]!.split("</quoted-review-data>")[0]!) as { memories: { id: string }[]; evidence: { id: string }[] };
+		launched++;
+		value.respond({ ok: true, runId: "offline-review", model: "offline/current", thinking: "high", cancel() {}, completion: Promise.resolve({ ok: true, status: "done", output: JSON.stringify({ findings: [{ memoryId: packet.memories[0]!.id, status: "correct", reason: "The selected repository manifest requires Node 22 or newer.", evidenceIds: [packet.evidence[0]!.id], replacement: "The project requires Node 22 or newer." }] }) }) });
+	});
+	createExtension(m.pi, { agentDir: join(dir, "knowledge-review-wiring", "agent") });
+	await m.handlers.get("session_start")?.({}, ctx);
+	const memory = m.tools.get("memory")!;
+	await memory.execute("save", { action: "remember", term: "long", scope: "project", kind: "convention", text: "The project requires Node 18." }, undefined, undefined, ctx);
+	const handler = m.commands.get("mind")!.handler;
+	await handler("review project-long", ctx);
+	await waitForCondition("knowledge proposal", () => commandTexts(m).some((text) => text.includes("correction(s) staged")));
+	assert.equal(launched, 1);
+	const before = await memory.execute("recall-before", { action: "recall", scope: "project", query: "Node" }, undefined, undefined, ctx);
+	assert.match(before.content[0]!.text, /Node 18/);
+	await handler("review apply", ctx);
+	const after = await memory.execute("recall-after", { action: "recall", scope: "project", query: "Node" }, undefined, undefined, ctx);
+	assert.match(after.content[0]!.text, /Node 22/);
+	assert.equal(launched, 1, "approval does not call a model again");
+	assert.equal(m.messages.length, 0, "review never wakes the supervisor");
+	await m.handlers.get("session_shutdown")?.({}, ctx);
+});
+
 test("an inline flow blocked report offers the same backlog handoff as council and delegate", async () => {
 	const m = mockPi();
 	const status: string[] = [];
@@ -229,6 +332,34 @@ test("staged optimization plans are revoked across same-owner session reactivati
 	assert.equal(read.details.ok, true);
 	assert.match(read.content[0]?.text ?? "", /original verified fact/);
 	await m.handlers.get("session_shutdown")?.({}, ctx);
+});
+
+test("native branch lifecycle revokes generic staged optimization plans without changing session identity", async () => {
+	const cwd = join(dir, "optimizer-branch", "project");
+	const manager = SessionManager.inMemory(cwd);
+	const ctx = { ...ctxFor(cwd), sessionManager: manager };
+	const m = mockPi({}, () => manager);
+	createExtension(m.pi, { agentDir: join(dir, "optimizer-branch", "agent") });
+	await m.handlers.get("session_start")?.({}, ctx);
+	try {
+		const destination = manager.appendCustomEntry("destination", {});
+		manager.appendCustomEntry("origin", {});
+		const tool = m.tools.get("memory")!;
+		const saved = await tool.execute("save", { action: "remember", term: "long", scope: "persona", kind: "note", text: "original verified branch fact" }, undefined, undefined, ctx);
+		const inspected = await tool.execute("inspect", { action: "optimize", mode: "inspect", target: "persona" }, undefined, undefined, ctx);
+		const staged = await tool.execute("stage", { action: "optimize", mode: "stage", target: "persona", fingerprint: inspected.details.fingerprint, operations: [{ sourceIds: [saved.details.id], kind: "note", text: "reviewed branch replacement" }] }, undefined, undefined, ctx);
+		assert.equal(staged.details.ok, true);
+		const oldLeafId = manager.getLeafId(), id = manager.getSessionId();
+		manager.branch(destination);
+		await m.handlers.get("session_tree")?.({ oldLeafId, newLeafId: destination }, ctx);
+		assert.equal(manager.getSessionId(), id);
+		const result = await tool.execute("apply", { action: "optimize", mode: "apply", planId: staged.details.planId }, undefined, undefined, ctx);
+		assert.equal(result.details.ok, false, "generic plans must not survive native branch navigation");
+		assert.match(String(result.details.reason), /not found|expired|invalidated/i);
+		const read = await tool.execute("read", { action: "read", id: saved.details.id }, undefined, undefined, ctx);
+		assert.equal(read.details.ok, true);
+		assert.match(read.content[0]?.text ?? "", /original verified branch fact/);
+	} finally { await m.handlers.get("session_shutdown")?.({}, ctx); }
 });
 
 test("a missing or incompatible loaded Persona leaves Mind inert and preserves unrelated tools", async () => {
@@ -1165,14 +1296,14 @@ test("a memory whose TEXT quotes the empty-hint phrase is NOT mistaken for the a
 
 test("the native backlog wake renderer uses the loaded common frame without mutating data or waking the model", () => {
 	const m = mockPi();
-	const observed: Array<{ title: string; state: string; full: string; outputPad: number; hint: string }> = [];
+	const observed: Array<{ title: string; state: string; full: string; outputPad: number; hint: string; expansionKey?: object }> = [];
 	m.events.on("pi-persona:card-frame:v1", (request) => {
 		if (!request || typeof request !== "object" || !("respond" in request) || typeof request.respond !== "function") return;
 		request.respond({
 			version: 1,
 			provider: "pi-persona",
-			createCard: (presentation: { title: string; state: string; full: string }, context: { outputPad: number; detailHint: () => string }) => {
-				observed.push({ title: presentation.title, state: presentation.state, full: presentation.full, outputPad: context.outputPad, hint: context.detailHint() });
+			createCard: (presentation: { title: string; state: string; full: string }, context: { outputPad: number; detailHint: () => string; expansionKey?: object }) => {
+				observed.push({ title: presentation.title, state: presentation.state, full: presentation.full, outputPad: context.outputPad, hint: context.detailHint(), ...(context.expansionKey ? { expansionKey: context.expansionKey } : {}) });
 				return { render: () => [`shared-frame ${presentation.title}: ${presentation.full}`], invalidate() {} };
 			},
 		});
@@ -1181,11 +1312,12 @@ test("the native backlog wake renderer uses the loaded common frame without muta
 	const renderer = m.entryRenderers.get("pi-persona-mind-wake");
 	assert.ok(renderer);
 	const data = { content: "reminder remains a display-only entry" };
-	const component = renderer({ data }, { expanded: true, keyHint: (_id, description) => `F8 ${description}` }, {});
+	const entry = { data };
+	const component = renderer(entry, { expanded: true, keyHint: (_id, description) => `F8 ${description}` }, {});
 	assert.ok(component);
 	const output = component.render(100).join("\n");
 	assert.match(output, /shared-frame pi-persona-mind: reminder remains a display-only entry/);
-	assert.deepEqual(observed, [{ title: "pi-persona-mind", state: "neutral", full: data.content, outputPad: 1, hint: "F8 to expand" }]);
+	assert.deepEqual(observed, [{ title: "pi-persona-mind", state: "neutral", full: data.content, outputPad: 1, hint: "F8 to expand", expansionKey: entry }]);
 	assert.deepEqual(data, { content: "reminder remains a display-only entry" });
 	assert.equal(m.messages.length, 0);
 	assert.equal(m.messageOptions.length, 0);

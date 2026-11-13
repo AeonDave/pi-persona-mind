@@ -42,6 +42,7 @@ export function registerMindResultRenderer(pi: Pick<ExtensionAPI, "registerEntry
 			theme,
 			outputPad: cardUI.outputPad(),
 			detailHint: cardFrameDetailHint(keyHint),
+			expansionKey: entry,
 		});
 	});
 }

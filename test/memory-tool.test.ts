@@ -28,6 +28,7 @@ function makeToolHarness(activity?: MindActivityRunner) {
 	};
 	const state = { sessionCurrent: true, ownerGeneration: 0, holdInspection: false, releaseInspection: undefined as ((value: typeof inspection) => void) | undefined };
 	const mind = {
+		inspectionScope: () => ({ persona: "elite", projectRoot: "/work/project" }),
 		remember: async (input: unknown) => { calls.nativeRememberInputs.push(input); return { ok: true, entry: nativeEntry }; },
 		recall: async (_query: string, scope: string) => { calls.mindRecall.push(scope); return { hits: [nativeEntry], total: 1, withheldUnsafe: 0 }; },
 		readMemory: async (id: string, scope: string) => ({ ok: true, entries: [{ entry: { ...nativeEntry, id }, target: scope === "short" ? "project" : "persona" }], total: 1, withheld: 0 }),
@@ -86,6 +87,7 @@ test("save receipts promise retained retrieval rather than guaranteed context re
 	assert.match(text, /recall\/read/i);
 	assert.match(text, /ranked.*context/i);
 	assert.doesNotMatch(text, /will re-appear/i);
+	assert.deepEqual(result.details.recording, { version: 1, persona: "elite", projectRoot: "/work/project", target: "project-long" });
 	assert.doesNotMatch(JSON.stringify(h.tool), /Facts are re-injected.*each turn/);
 });
 

@@ -82,7 +82,8 @@ export class MemoryOptimizer {
 		return stored ? structuredClone(stored.plan) : { ok: false, reason: "plan not found or expired; inspect and stage again" };
 	}
 
-	async apply(planId: string): Promise<OptimizeApplied | OptimizeFailure> {
+	/** Parent-only synchronous evidence checks run again under the store's CAS lock. */
+	async apply(planId: string, assertEvidenceFresh?: () => void): Promise<OptimizeApplied | OptimizeFailure> {
 		this.expirePlans();
 		const staged = this.plans.get(planId);
 		if (!staged) return { ok: false, reason: "plan not found or expired; inspect and stage again" };
@@ -95,6 +96,7 @@ export class MemoryOptimizer {
 					if (staged.plan.changes.some((change) => change.before.some((entry) => isExpired(entry, this.now())))) throw new Error("a source expired since preview; inspect and stage again");
 				};
 				assertCurrent();
+				assertEvidenceFresh?.();
 				const store = this.options.stores[staged.plan.target];
 				if ((await store.inspectStrict()).fingerprint !== staged.plan.fingerprint) throw new StoreConflictError();
 				const history = this.historyStore(staged.plan.target);
@@ -106,7 +108,7 @@ export class MemoryOptimizer {
 				let callbackRejected = false;
 				try {
 					await store.compareAndUpdate(staged.plan.fingerprint, () => {
-						try { assertCurrent(); return structuredClone(staged.next); }
+						try { assertCurrent(); assertEvidenceFresh?.(); return structuredClone(staged.next); }
 						catch (error) { callbackRejected = true; throw error; }
 					});
 				} catch (error) {

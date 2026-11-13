@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { createEventBus, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text, type Component } from "@earendil-works/pi-tui";
 
-import { CARD_FRAME_EVENT, createMindCardUI, type CardFrameContext } from "../src/ui/card-frame.ts";
+import { CARD_FRAME_EVENT, createMindCardUI, type CardFrameContext, type CardFrameFactory } from "../src/ui/card-frame.ts";
 import { SESSION_NOTE_ENTRY_TYPE } from "../src/core/session-memory.ts";
 import { registerSessionNoteRenderer } from "../src/ui/session-note-card.ts";
 
@@ -51,6 +51,29 @@ test("session note card has a semantic title and expands to the full note with p
 	assert.match(expanded, /tail-marker/);
 	assert.match(expanded, /result:opaque-ref/);
 	assert.match(expanded, /origin session: session-42.*not auto-resolved/);
+});
+
+test("session-note renderer passes the original entry as the shared expansion key", () => {
+	const events = createEventBus();
+	let key: object | undefined;
+	events.on(CARD_FRAME_EVENT, (request: unknown) => {
+		if (!request || typeof request !== "object" || !("respond" in request) || typeof request.respond !== "function") return;
+		request.respond({ version: 1, provider: "pi-persona", createCard: ((_presentation, context) => {
+			key = context.expansionKey;
+			return new Text("ok", 0, 0);
+		}) satisfies CardFrameFactory });
+	});
+	let renderer: Renderer | undefined;
+	const pi = {
+		events,
+		getSettings: () => ({ outputPad: 1 }),
+		registerEntryRenderer(_type: string, callback: Renderer) { renderer = callback; },
+	} as unknown as Pick<ExtensionAPI, "events" | "getSettings" | "registerEntryRenderer">;
+	registerSessionNoteRenderer(pi, createMindCardUI(pi));
+	assert.ok(renderer);
+	const entry = { type: SESSION_NOTE_ENTRY_TYPE, data: { version: 1, op: "forget", id: "session:identity" } };
+	renderer(entry, { expanded: false, keyHint }, theme);
+	assert.equal(key, entry);
 });
 
 test("session note tombstones render as retired entries and malformed data stays harmless", () => {

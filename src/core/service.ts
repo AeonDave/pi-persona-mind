@@ -227,6 +227,11 @@ export class MindService {
 		return new MemoryOptimizer({ stores: this.memoryStores(), persona: this.scope.persona, now: this.now, mutationLock: this.memoryMutationLock });
 	}
 
+	/** Read-only identity snapshot for inspection and native recording receipts; no store paths or IO. */
+	inspectionScope(): Pick<Scope, "persona" | "projectRoot" | "homeWorkspace"> {
+		return { persona: this.scope.persona, projectRoot: this.scope.projectRoot, ...(this.scope.homeWorkspace ? { homeWorkspace: true as const } : {}) };
+	}
+
 	/** Explicit full retrieval; reads never refresh age/expiry or repair malformed stores. */
 	readMemory(id: string, scope: MemoryReadScope = "both"): Promise<MemoryReadResult> {
 		return readMemory(this.memoryStores(), id, scope, this.now());

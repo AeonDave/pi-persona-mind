@@ -3,7 +3,10 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { JsonStore } from "../src/core/store.ts";
+import { readFileSync } from "node:fs";
+import { JsonStore, withFileLock } from "../src/core/store.ts";
+import { MemoryOptimizer } from "../src/core/optimize-service.ts";
+import { makeMemory, validateShortMemory } from "../src/core/memory.ts";
 
 function store(path: string) {
 	return new JsonStore<{ id: string }>(path, { version: 1, validateEntry: (raw) => {
@@ -11,6 +14,85 @@ function store(path: string) {
 		return { id: (raw as { id: string }).id };
 	} });
 }
+
+async function optimizerFixture(run: (fixture: { optimizer: MemoryOptimizer; target: JsonStore<ReturnType<typeof makeMemory>>; evidencePath: string; planId: string }) => Promise<void>) {
+	const dir = await mkdtemp(join(tmpdir(), "mind-opt-evidence-"));
+	const now = Date.parse("2026-10-25T10:00:00Z");
+	const target = new JsonStore(join(dir, "memory.json"), { version: 1, validateEntry: validateShortMemory, now: () => now });
+	const optimizer = new MemoryOptimizer({ stores: { project: target, "project-long": target, persona: target, shared: target }, persona: "reviewer", now: () => now });
+	try {
+		const original = makeMemory({ term: "short", kind: "note", text: "original verified repository fact", persona: "reviewer" }, now);
+		await target.update(() => [original]);
+		const snapshot = await optimizer.inspect("project"); assert.ok(snapshot.ok);
+		const plan = await optimizer.preview({ fingerprint: snapshot.fingerprint, operations: [{ sourceIds: [original.id], kind: "note", text: "reviewed replacement repository fact" }] }); assert.ok(plan.ok);
+		const evidencePath = join(dir, "evidence.txt"); await writeFile(evidencePath, "current evidence");
+		await run({ optimizer, target, evidencePath, planId: plan.planId });
+	} finally { await rm(dir, { recursive: true, force: true }); }
+}
+
+test("apply freshness guard rejects before mutation and leaves staged recovery available", async () => optimizerFixture(async ({ optimizer, target, planId }) => {
+	const original = await readFile(target.filePath, "utf8");
+	let checked = 0;
+	const refused = await optimizer.apply(planId, () => { checked++; throw new Error("evidence no longer current"); });
+	assert.equal(refused.ok, false); if (!refused.ok) assert.match(refused.reason, /evidence no longer current/);
+	assert.equal(checked, 1); assert.equal(await readFile(target.filePath, "utf8"), original);
+	const history = await optimizer.history("project"); assert.ok(history.ok); assert.equal(history.receipts.length, 0);
+	assert.ok(optimizer.getPlan(planId).ok);
+	const recovered = await optimizer.apply(planId); assert.ok(recovered.ok); assert.ok(recovered.receiptId);
+	assert.ok((await optimizer.undo(recovered.receiptId, "project")).ok);
+	assert.equal((await target.load()).entries[0]?.text, "original verified repository fact");
+}));
+
+test("evidence changed while apply awaits the real store lock rejects its prepared receipt", async () => optimizerFixture(async ({ optimizer, target, evidencePath, planId }) => {
+	const original = await readFile(target.filePath, "utf8");
+	let unlock!: () => void; let locked!: () => void; let comparing!: () => void;
+	const released = new Promise<void>((resolve) => { unlock = resolve; });
+	const acquired = new Promise<void>((resolve) => { locked = resolve; });
+	const comparison = new Promise<void>((resolve) => { comparing = resolve; });
+	const lock = withFileLock(`${target.filePath}.lock`, async () => { locked(); await released; });
+	await acquired;
+	const compare = target.compareAndUpdate.bind(target);
+	target.compareAndUpdate = (fingerprint, mutate) => { comparing(); return compare(fingerprint, mutate); };
+	let checked = 0;
+	const pending = optimizer.apply(planId, () => {
+		checked++;
+		if (readFileSync(evidencePath, "utf8") !== "current evidence") throw new Error("evidence changed under store lock");
+	});
+	try {
+		await comparison; assert.equal(checked, 1, "precommit guard ran before waiting for the store lock");
+		await writeFile(evidencePath, "changed evidence");
+	} finally { unlock(); await lock; target.compareAndUpdate = compare; }
+	const refused = await pending;
+	assert.equal(refused.ok, false); if (!refused.ok) assert.match(refused.reason, /evidence changed under store lock/);
+	assert.equal(checked, 2, "guard rechecks inside the locked CAS callback");
+	assert.equal(await readFile(target.filePath, "utf8"), original);
+	const rejected = await optimizer.history("project"); assert.ok(rejected.ok);
+	assert.deepEqual(rejected.receipts.map((receipt) => receipt.state), ["rejected"]);
+	await writeFile(evidencePath, "current evidence");
+	const applied = await optimizer.apply(planId, () => assert.equal(readFileSync(evidencePath, "utf8"), "current evidence"));
+	assert.ok(applied.ok); assert.ok(applied.receiptId);
+	const committed = await optimizer.history("project"); assert.ok(committed.ok);
+	assert.deepEqual(committed.receipts.map((receipt) => receipt.state), ["applied", "rejected"]);
+	assert.ok((await optimizer.undo(applied.receiptId, "project")).ok);
+	assert.equal((await target.load()).entries[0]?.text, "original verified repository fact");
+}));
+
+test("an unchanged synchronous guard preserves apply, immutable plans, receipts and CAS", async () => optimizerFixture(async ({ optimizer, target, planId }) => {
+	const plan = optimizer.getPlan(planId); assert.ok(plan.ok);
+	plan.changes[0]!.after.text = "caller tampering";
+	let checked = 0;
+	const applied = await optimizer.apply(planId, () => { checked++; });
+	assert.ok(applied.ok); assert.equal(checked, 2); assert.ok(applied.receiptId);
+	assert.equal((await target.load()).entries[0]?.text, "reviewed replacement repository fact");
+	assert.equal((await optimizer.apply(planId, () => assert.fail("consumed plan must not call guard"))).ok, false);
+	assert.ok((await optimizer.undo(applied.receiptId, "project")).ok);
+	const snapshot = await optimizer.inspect("project"); assert.ok(snapshot.ok);
+	const next = await optimizer.preview({ fingerprint: snapshot.fingerprint, operations: [{ sourceIds: [snapshot.entries[0]!.id], kind: "note", text: "must not overwrite a concurrent fact" }] }); assert.ok(next.ok);
+	await target.update((entries) => [...entries, makeMemory({ term: "short", kind: "note", text: "concurrent fact", persona: "reviewer" }, Date.parse("2026-10-25T10:00:00Z"))]);
+	const concurrent = await readFile(target.filePath, "utf8");
+	assert.equal((await optimizer.apply(next.planId, () => {})).ok, false);
+	assert.equal(await readFile(target.filePath, "utf8"), concurrent);
+}));
 
 test("strict inspection never repairs corrupt or individually invalid stores", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "mind-opt-store-"));

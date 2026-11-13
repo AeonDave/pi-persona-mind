@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.9.0) - 2026-11-13
+
+- Require pi-persona 1.18.0 or later for this release. Mind custom entries use the shared
+  primary-click expansion contract, preserving state across ordinary renderer rebuilds.
+- Invalidate consolidation and staged plans on native branch navigation without treating ordinary
+  appended turns as owner changes. Old workers cannot apply or report on the new branch;
+  automatic maintenance retains its existing fresh-worker retry policy.
+- Join admitted knowledge-review application through approval, persistence, receipt finalization
+  and cleanup during shutdown. Revocation does not pretend to roll back already committed writes.
+- Add explicit consolidation and evidence-grounded knowledge-review actions to F10. Review selected
+  facts or bounded scope windows against parent-selected repository files and active-branch user-role
+  text on the session model; show cited findings before separately approved corrections.
+- Revalidate reviewed evidence inside guarded optimizer application and retain the existing CAS,
+  history and undo path. Knowledge review shares maintenance admission/accounting; retirement findings
+  remain recommendations, not deletions. Owner/input/model/branch changes cancel pending review work.
+
+- Add a read-only F10 memory inspector (`/mind browse`) with scoped facts, the last prepared Mind
+  context, and a bounded active-branch conversation timeline (`/mind timeline`). Search, paginated
+  lists and scrollable detail/source views do not start model calls or change storage.
+- Attribute new explicit save receipts to their accepting owner and target. Open only matching native
+  recording sources; keep legacy/free-text provenance literal and distinguish recordings from truth.
+  Session/branch/owner changes revoke open views and prepared-context snapshots.
+
 - Show the active worker as lowercase `mind`; successful automatic consolidation emits one informative
   toast instead of routine result cards. Proposal audits and durable undo history remain available;
   explicit reports and important warnings stay visible.

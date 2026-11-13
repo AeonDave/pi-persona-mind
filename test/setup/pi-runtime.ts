@@ -25,7 +25,7 @@ const companionFixture: ExtensionFactory = (pi) => {
   });
 };
 
-export async function runtimeHarness(root: string, extensionPath: string, factories: ExtensionFactory[] = [], options: { companion?: boolean; additionalExtensionPaths?: string[] } = {}) {
+export async function runtimeHarness(root: string, extensionPath: string | ExtensionFactory, factories: ExtensionFactory[] = [], options: { companion?: boolean; additionalExtensionPaths?: string[] } = {}) {
   assert.equal(VERSION, "1.5.2", "run against the supported current host");
   const cwd = join(root, "workspace");
   const agentDir = join(root, "agent");
@@ -41,8 +41,10 @@ export async function runtimeHarness(root: string, extensionPath: string, factor
   try {
     const settings = SettingsManager.inMemory({ retry: { enabled: false }, compaction: { enabled: false } });
     const eventBus = createEventBus();
-    const extensionFactories = [...factories, ...(options.companion === false ? [] : [companionFixture])];
-    const additionalExtensionPaths = [extensionPath, ...(options.additionalExtensionPaths ?? [])];
+    // Inline factories share imported class identities for deterministic persistence instrumentation;
+    // both forms still run through Pi's actual extension runner and session lifecycle.
+    const extensionFactories = [...factories, ...(options.companion === false ? [] : [companionFixture]), ...(typeof extensionPath === "function" ? [extensionPath] : [])];
+    const additionalExtensionPaths = [...(typeof extensionPath === "string" ? [extensionPath] : []), ...(options.additionalExtensionPaths ?? [])];
     const loader = new DefaultResourceLoader({
       cwd, agentDir, settingsManager: settings, eventBus,
       additionalExtensionPaths, extensionFactories,

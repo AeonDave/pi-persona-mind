@@ -189,6 +189,19 @@ test("each extension instance binds its own event bus and entry settings are rea
 	assert.deepEqual(defaultPads, [1]);
 });
 
+test("Mind result renderer passes the original entry as the shared expansion key", () => {
+	const bound = bind();
+	let key: object | undefined;
+	addProvider(bound.events, (_presentation, context) => {
+		key = context.expansionKey;
+		return new Text("ok", 0, 0);
+	});
+	registerMindResultRenderer(bound.pi as never, bound.ui);
+	const entry = { type: MIND_RESULT_ENTRY_TYPE, data: { title: "result", content: "body" } };
+	render(rendererFor(bound.renderers, MIND_RESULT_ENTRY_TYPE), entry);
+	assert.equal(key, entry);
+});
+
 test("shared renderer receives sanitized compact Unicode preview, original expansion, theme, and injected hint", () => {
 	const bound = bind(createEventBus(), { outputPad: 1 });
 	let captured: CardFramePresentation | undefined;

@@ -3,7 +3,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { MindService } from "../core/service.ts";
 import type { Scope } from "../core/scope.ts";
 import type { AutoOptimizeTarget } from "../core/auto-optimize.ts";
-import { AUTO_ATTEMPT_ENTRY, AutoOptimizeScheduler, type AutoAttempt, type AutoOptimizeReportContext } from "./auto-optimize.ts";
+import { AUTO_ATTEMPT_ENTRY, AutoOptimizeScheduler, type AutoAttempt, type AutoOptimizeReportContext, type ReviewReservation } from "./auto-optimize.ts";
 import { launchMindWorker } from "./mind-worker.ts";
 import { MIND_RESULT_ENTRY_TYPE } from "../ui/mind-result-card.ts";
 
@@ -42,6 +42,7 @@ export interface AutoOptimizeSession {
 	setEnabled(enabled: boolean): void;
 	targets(): readonly AutoOptimizeTarget[];
 	startExplicit(target?: AutoOptimizeTarget): boolean;
+	reserveReview(target: AutoOptimizeTarget): ReviewReservation | undefined;
 }
 
 export function installAutoOptimize(pi: ExtensionAPI, deps: Dependencies): AutoOptimizeSession {
@@ -113,6 +114,8 @@ export function installAutoOptimize(pi: ExtensionAPI, deps: Dependencies): AutoO
 	pi.on("input", () => { scheduler.interrupt(); });
 	pi.on("agent_start", () => { scheduler.interrupt(); });
 	pi.on("model_select", () => { scheduler.interrupt(); });
+	// Native /tree preserves the session manager/id/file but revokes work accepted on its old branch.
+	pi.on("session_tree", () => { scheduler.interrupt(); });
 	pi.on("ui_prompt_start", () => { scheduler.interrupt(); });
 	pi.on("turn_end", (event, ctx) => {
 		if (!safeAvailable(ctx) || event.message.role !== "assistant" || tokenEvents.has(event.messageEntryId)) return;
@@ -134,5 +137,6 @@ export function installAutoOptimize(pi: ExtensionAPI, deps: Dependencies): AutoO
 		setEnabled: (enabled) => scheduler.setEnabled(enabled),
 		targets: () => scheduler.targets(),
 		startExplicit: (target) => scheduler.startExplicit(target),
+		reserveReview: (target) => scheduler.reserveReview(target),
 	};
 }

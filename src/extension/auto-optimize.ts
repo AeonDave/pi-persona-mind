@@ -12,6 +12,13 @@ type Target = AutoOptimizeTarget;
 type Optimizer = Pick<MemoryOptimizer, "inspect" | "preview" | "apply" | "invalidate">;
 interface CoverageCursor { offset: number; withinPage: number }
 export interface AutoAttempt { digest: string; at: number; state: "started" | "settled"; target?: Target; explicit?: true }
+/** Parent-held single-flight lease spanning evidence, worker, preview and user apply. */
+export interface ReviewReservation {
+	current(): boolean;
+	launched(digest: string): void;
+	settled(): void;
+	release(): void;
+}
 export interface AutoOptimizeReportContext {
 	automatic: boolean;
 	target: Target;
@@ -49,6 +56,7 @@ export class AutoOptimizeScheduler {
 	private timer: (() => void) | undefined;
 	private timerGeneration = 0;
 	private running: { optimizer: Optimizer; cancel?: () => void; retryTarget?: Target; explicit?: boolean } | undefined;
+	private review: { target: Target; attempt?: { digest: string; at: number }; settled: boolean } | undefined;
 	private work: Promise<void> = Promise.resolve();
 	private last = "waiting for new memory";
 
@@ -77,7 +85,7 @@ export class AutoOptimizeScheduler {
 		}
 		this.last = this.retryTargets.size ? "interrupted review pending" : "waiting for new memory";
 	}
-	stop(): void { this.interrupt(); this.owner = undefined; this.pending.clear(); this.retryTargets.clear(); this.retryAttempts.clear(); this.cursors.clear(); this.inputTokens = 0; this.seen.clear(); this.lastAttempt = -Infinity; }
+	stop(): void { this.review = undefined; this.interrupt(); this.owner = undefined; this.pending.clear(); this.retryTargets.clear(); this.retryAttempts.clear(); this.cursors.clear(); this.inputTokens = 0; this.seen.clear(); this.lastAttempt = -Infinity; }
 	interrupt(): void {
 		this.timer?.(); this.timer = undefined; this.timerGeneration++; this.generation++;
 		if (this.enabled && !this.running?.explicit && this.running?.retryTarget) {
@@ -109,13 +117,14 @@ export class AutoOptimizeScheduler {
 			: this.pending.size === 0 ? this.lastAttempt === -Infinity ? "first review waits for new memory" : "no dirty memory; new memory is required"
 				: this.lastAttempt === -Infinity ? "first dirty review is ready after idle"
 					: `dirty review pending; ${remaining.toLocaleString("en-US")} main input tokens remain`;
-		return `${this.enabled ? "on" : "off"} · ${this.running ? "Mind worker active" : this.last} · ${gate} · ${this.inputTokens.toLocaleString("en-US")}/${AUTO_INPUT_TOKEN_THRESHOLD.toLocaleString("en-US")} main input tokens since last attempt`;
+		const activity = this.review ? `knowledge review ${this.review.attempt ? "active" : "reserved"} — ${this.review.target}` : this.running ? "Mind worker active" : this.last;
+		return `${this.enabled ? "on" : "off"} · ${activity} · ${gate} · ${this.inputTokens.toLocaleString("en-US")}/${AUTO_INPUT_TOKEN_THRESHOLD.toLocaleString("en-US")} main input tokens since last attempt`;
 	}
 	memoryAdded(target: Target): void { if (this.enabled && this.owner && this.allows(this.owner, target)) this.pending.add(target); }
 	tokensUsed(mainInputTokens: number): void { if (this.owner && Number.isSafeInteger(mainInputTokens) && mainInputTokens > 0) this.inputTokens = Math.min(AUTO_INPUT_TOKEN_THRESHOLD, this.inputTokens + mainInputTokens); }
 	settled(): void {
 		const owner = this.owner;
-		if (!this.enabled || !owner || !this.safeCurrent(owner) || !owner.idle() || this.running || this.timer || !this.pending.size) return;
+		if (!this.enabled || !owner || !this.safeCurrent(owner) || !owner.idle() || this.running || this.review || this.timer || !this.pending.size) return;
 		const tokenReady = this.lastAttempt === -Infinity || this.inputTokens >= AUTO_INPUT_TOKEN_THRESHOLD;
 		const eligiblePending = [...this.pending].some((target) => this.allows(owner, target) && (this.retryTargets.has(target) || tokenReady));
 		if (!eligiblePending) return;
@@ -124,16 +133,51 @@ export class AutoOptimizeScheduler {
 		this.timer = this.schedule(() => {
 			if (timerGeneration !== this.timerGeneration) return;
 			this.timer = undefined;
-			if (generation !== this.generation || this.running) return;
+			if (generation !== this.generation || this.running || this.review) return;
 			this.work = this.run().catch(() => { this.last = "inspection failed; no automatic retry"; });
 		}, Math.max(AUTO_IDLE_MS, this.lastAttempt + AUTO_COOLDOWN_MS - this.now()));
+	}
+	/** Reserve explicit review without spending an attempt or cancelling a real worker.
+	 * Lease identity, not scheduler generation, survives the review's own UI prompts.
+	 */
+	reserveReview(target: Target): ReviewReservation | undefined {
+		const owner = this.owner;
+		if (!owner || !this.safeCurrent(owner) || !this.safeIdle(owner) || !this.allows(owner, target) || this.running || this.review) return undefined;
+		this.timer?.(); this.timer = undefined; this.timerGeneration++;
+		const lease: NonNullable<AutoOptimizeScheduler["review"]> = { target, settled: false };
+		this.review = lease;
+		const current = () => this.review === lease && this.safeCurrent(owner) && this.safeIdle(owner) && this.allows(owner, target);
+		return {
+			current,
+			launched: (digest) => {
+				if (!current()) throw new Error("knowledge review reservation is no longer current or was released");
+				if (lease.attempt) throw new Error("knowledge review launch already recorded");
+				if (!/^[a-f0-9]{64}$/.test(digest)) throw new Error("knowledge review digest must be a SHA-256 lowercase hex string");
+				const at = this.now();
+				// Called only after actual Persona admission: reset even if recording fails.
+				lease.attempt = { digest, at };
+				this.lastAttempt = at; this.inputTokens = 0;
+				this.retryTargets.delete(target); this.retryAttempts.delete(target);
+				this.remember(owner, target, digest, "started", at, true);
+			},
+			settled: () => {
+				if (!current() || !lease.attempt || lease.settled) return;
+				this.remember(owner, target, lease.attempt.digest, "settled", lease.attempt.at, true);
+				lease.settled = true;
+			},
+			release: () => {
+				if (this.review !== lease) return;
+				this.review = undefined;
+				this.last = lease.settled ? "knowledge review settled" : "knowledge review released; no automatic retry";
+			},
+		};
 	}
 	/** Current writable tiers, in the order a bare explicit request will review. */
 	targets(): readonly Target[] { return this.owner ? [...new Set(this.owner.allowedTargets)].slice(0, 3) : []; }
 	/** Start one named pass, or one bounded sequential pass over every allowed nonshared tier. */
 	startExplicit(target?: Target): boolean {
 		const owner = this.owner;
-		if (!owner || !this.safeCurrent(owner) || !this.safeIdle(owner) || this.running || (target !== undefined && !this.allows(owner, target))) return false;
+		if (!owner || !this.safeCurrent(owner) || !this.safeIdle(owner) || this.running || this.review || (target !== undefined && !this.allows(owner, target))) return false;
 		const targets = target === undefined ? [...this.targets()] : [target];
 		if (targets.length === 0) return false;
 		this.timer?.(); this.timer = undefined; this.timerGeneration++;
@@ -166,7 +210,7 @@ export class AutoOptimizeScheduler {
 	}
 	private async run(explicitTargets?: readonly Target[], explicit = false, qualifyTargets = false): Promise<void> {
 		const owner = this.owner;
-		if (!owner || (!explicit && !this.enabled) || !this.safeCurrent(owner) || !this.safeIdle(owner) || this.running) return;
+		if (!owner || (!explicit && !this.enabled) || !this.safeCurrent(owner) || !this.safeIdle(owner) || this.running || this.review) return;
 		const generation = this.generation;
 		const disabledGeneration = this.disabledGeneration;
 		const current = () => generation === this.generation && (explicit || this.enabled) && this.safeIdle(owner) && this.safeCurrent(owner);

@@ -50,6 +50,7 @@ export function registerSessionNoteRenderer(pi: Pick<ExtensionAPI, "registerEntr
 			theme,
 			outputPad: cardUI.outputPad(),
 			detailHint: cardFrameDetailHint(keyHint),
+			expansionKey: entry,
 		}) : undefined;
 	});
 }

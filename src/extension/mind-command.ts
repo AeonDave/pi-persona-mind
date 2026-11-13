@@ -11,11 +11,19 @@ import { formatOptimizeApplied, formatOptimizeFailure, formatOptimizeHistory, fo
 import { isOptimizeTarget } from "../core/optimize.ts";
 import { runMindActivity } from "./activity.ts";
 import type { MindActivityRunner } from "./activity.ts";
+import type { InspectorTab } from "./inspector-data.ts";
+import type { ReviewTarget } from "../core/knowledge-review.ts";
+import type { createKnowledgeReview } from "./knowledge-review.ts";
 
 export type MindOptimizeTarget = "project" | "project-long" | "persona" | "shared";
 
 export type MindCommand =
 	| { type: "snapshot" }
+	| { type: "browse"; tab: InspectorTab }
+	| { type: "review"; target?: ReviewTarget }
+	| { type: "review-show" }
+	| { type: "review-apply" }
+	| { type: "review-discard" }
 	| { type: "help" }
 	| { type: "doctor" }
 	| { type: "reset" }
@@ -32,7 +40,7 @@ export type MindCommand =
 	| { type: "invalid"; message: string };
 
 const USAGE =
-	"usage: /persona-mind [help|doctor|session|reset [workspace]|migrate-persona|optimize [all|project|project-long|persona]|optimize inspect [project|project-long|persona|shared]|optimize show <planId>|optimize apply <planId>|optimize history [target]|optimize undo <receiptId> [target]|optimize auto [status|on|off]]";
+	"usage: /persona-mind [help|browse [memories|context|timeline]|timeline|review [project|project-long|persona|show|apply|discard]|doctor|session|reset [workspace]|migrate-persona|optimize [all|project|project-long|persona]|optimize inspect [project|project-long|persona|shared]|optimize show <planId>|optimize apply <planId>|optimize history [target]|optimize undo <receiptId> [target]|optimize auto [status|on|off]]";
 
 export interface MindCommandDeps {
 	agentDir: string;
@@ -40,6 +48,8 @@ export interface MindCommandDeps {
 	rawPersona(ctx: ExtensionContext): string | null;
 	getMind(ctx: ExtensionContext): MindService;
 	getSessionMemory(): SessionMemory;
+	openInspector?(ctx: ExtensionContext, tab: InspectorTab): Promise<void>;
+	knowledgeReview?: ReturnType<typeof createKnowledgeReview>;
 	getOptimizer(ctx: ExtensionContext): MemoryOptimizer;
 	activity?(ctx: ExtensionContext): MindActivityRunner | undefined;
 	autoOptimize?: { status(): string; setEnabled(enabled: boolean): void; targets?(): readonly Exclude<MindOptimizeTarget, "shared">[]; startExplicit?(target?: Exclude<MindOptimizeTarget, "shared">): boolean };
@@ -71,9 +81,28 @@ export function registerMindCommands(pi: ExtensionAPI, deps: MindCommandDeps): v
 			ctx.ui.notify(command.message, "warning");
 			return;
 		}
+		if (command.type === "review" || command.type === "review-show" || command.type === "review-apply" || command.type === "review-discard") {
+			if (deps.isDelegatedLeg || !deps.isCurrent(ctx) || !deps.knowledgeReview) { ctx.ui.notify("Knowledge review requires an active supervisor session.", "warning"); return; }
+			if (command.type === "review-show") await deps.knowledgeReview.show(ctx);
+			else if (command.type === "review-apply") await deps.knowledgeReview.apply(ctx);
+			else if (command.type === "review-discard") deps.knowledgeReview.discard(ctx);
+			else await deps.knowledgeReview.start(ctx, command.target ?? (deps.resolveScope(ctx).homeWorkspace ? "persona" : "project-long"));
+			return;
+		}
+		if (command.type === "browse") {
+			if (deps.isDelegatedLeg || !deps.isCurrent(ctx) || !deps.openInspector) {
+				ctx.ui.notify("Memory inspector requires an active supervisor session.", "warning");
+				return;
+			}
+			await deps.openInspector(ctx, command.tab);
+			return;
+		}
 		if (command.type === "help") {
 			const body = [
 				"/persona-mind — persona memory and active-session notes",
+				"F10 or /mind browse [memories|context|timeline] — memory inspector; a opens explicit consolidation/review actions; /mind timeline opens active-branch conversation history",
+				"/mind review [project|project-long|persona] — evidence-grounded knowledge review on the session model; stages corrections, never auto-applies",
+				"/mind review show|apply|discard — inspect the proposal, approve guarded corrections, or cancel/discard; retirement findings are recommendations only",
 				"/persona-mind doctor — inspect store health and migration warnings",
 				"/persona-mind session — list notes on this active session branch",
 				"/persona-mind reset [workspace] — clear this project's short-term memory and backlog",
@@ -329,6 +358,18 @@ export function parseMindCommand(args: string): MindCommand {
 	const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
 	if (parts.length === 0) return { type: "snapshot" };
 	if (parts.length === 1 && parts[0] === "help") return { type: "help" };
+	if (parts[0] === "review") {
+		if (parts.length === 1) return { type: "review" };
+		if (parts.length === 2 && (parts[1] === "project" || parts[1] === "project-long" || parts[1] === "persona")) return { type: "review", target: parts[1] };
+		if (parts.length === 2 && (parts[1] === "show" || parts[1] === "apply" || parts[1] === "discard")) return { type: `review-${parts[1]}` };
+		return { type: "invalid", message: "usage: /mind review [project|project-long|persona|show|apply|discard]. Shared and session notes are not model-review targets." };
+	}
+	if (parts.length === 1 && parts[0] === "timeline") return { type: "browse", tab: "timeline" };
+	if (parts[0] === "browse") {
+		if (parts.length === 1) return { type: "browse", tab: "memories" };
+		if (parts.length === 2 && (parts[1] === "memories" || parts[1] === "context" || parts[1] === "timeline")) return { type: "browse", tab: parts[1] };
+		return { type: "invalid", message: USAGE };
+	}
 	if (parts.length === 1 && parts[0] === "doctor") return { type: "doctor" };
 	if (parts.length === 1 && parts[0] === "session") return { type: "session" };
 	if (parts.length === 1 && parts[0] === "reset") return { type: "reset" };

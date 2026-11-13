@@ -147,7 +147,8 @@ Invalidation during an asynchronous preview read also refuses that preview; it c
 plan belonging to the invalidated owner after the read returns.
 Apply rechecks raw-byte fingerprint, lifetime, source expiry and owner invalidation under the store lock
 and Mind's mutation lock. Even a same-sequence external file replacement invalidates the fingerprint.
-Concurrent apply cannot commit twice. Session/scope changes discard plans; applying never spawns a model.
+Concurrent apply cannot commit twice. Session/scope changes and native branch navigation discard plans;
+appending ordinary turn entries does not invalidate an owner. Applying never spawns a model.
 
 Before replacement, persist a scoped before/after receipt to `<store>.optimize-history.json`, under
 its transaction lock and the memory mutation lock. Maximum 32 receipts / 2 MiB per target, plus the
@@ -198,8 +199,11 @@ bypasses the token gate; it still requires a later native settled event and cool
 alone never rearms it. Unexpected current-owner failures persist terminal suppression without advancing
 the page cursor; a warning asks for inspection when an apply may have completed. If persistence itself
 fails, durable retry suppression cannot be guaranteed and the failure remains visible.
-Incoming input, `agent_start`, off,
-session/persona/workspace changes and shutdown cancel and invalidate pending plans. Delegated legs
+Incoming input, `agent_start`, native branch navigation, off,
+session/persona/workspace changes and shutdown cancel and invalidate pending plans. Native branch
+navigation preserves session identity but interrupts the old consolidation generation: its worker cannot
+apply or report on the new branch. Explicit work never earns an automatic retry; automatic work retains
+the documented later-settled/cooldown retry policy through a fresh worker, not reuse of an old proposal. Delegated legs
 do not recursively schedule automatic workers. Shared memories are excluded.
 
 Persona hosts a real asynchronous Mind worker, visible in its standard agent view. The exact current
@@ -323,7 +327,10 @@ at each renderer invocation, without hard-importing an optional package or cachi
 reload. Missing, incompatible, ambiguous or throwing providers use a minimal sanitized full-text
 history fallback, not a second styled card engine. This port conveys no memory, scheduling or
 security authority. Presentation models carry title, semantic state, full body, width-aware preview,
-optional metadata and Markdown; the frame owns theme, truncation, expansion and padding.
+optional metadata and Markdown; the frame owns theme, truncation, expansion and padding. Custom-entry
+renderers pass their original stable entry object as optional `CardFrameContext.expansionKey`; the
+shared frame owns any click/keyboard synchronization, keyed weakly without retaining entry text. A
+missing key is presentation-only (native tool renderers retain their host-owned interaction shell).
 
 Entry cards read the current public `pi.getSettings().outputPad` (native 0/1, default 1) because entry
 render options omit it, and use host-provided expand hints. Native memory/backlog tool results retain
@@ -334,6 +341,94 @@ selected-window qualification and never imply every record was reviewed; expansi
 model/effort and terminal-reference provenance. Commands retain reports in custom-entry history;
 warnings/toasts stay short and are not duplicate durable cards. Display callbacks must still belong
 to their accepting session and scope after asynchronous reads.
+
+## Read-only memory inspector
+
+F10 and `/mind browse [memories|context|timeline]` open one native TUI inspector; `/mind timeline`
+selects its timeline tab. Existing bare `/mind` and `/mind session` reports remain unchanged. RPC,
+print and JSON modes do not open custom TUI. Delegated legs do not receive the shortcut or browse
+access. Entry points require compatible Persona and the actual current native session owner.
+
+The inspector is a query/view layer, not a new memory engine. Its explicit `a` action launcher closes
+the overlay before opening native action/approval dialogs. Consolidation calls the existing bounded
+explicit optimizer for the chosen nonshared scope; the launcher does not create a second merge path.
+Knowledge review is a separate proposal workflow described below. Browsing alone remains read-only. Durable browsing reuses strict optimizer
+inspection (including safe/owned admission and pagination); opening it never repairs, migrates, saves,
+schedules, or starts a model call. Session browsing reuses native note replay. Home suppresses project
+scopes. Searches are literal browsing filters, not a replacement for the runtime retrieval ranker.
+
+Source metadata (`source`, `derivedFrom`, `supersedes`) remains literal, never an instruction to open
+paths, URLs or private worker archives. Successful explicit `memory remember` results carry a versioned
+native `recording` descriptor with the accepting persona, repository identity and target. A recording
+link requires an exact matching successful tool call/result, current fact content and scope identity
+within the bounded active branch. Old receipts without that attribution cannot establish such a link.
+Session-note links refer to validated native save events. These are recording provenance, not evidence
+that the assertion is true, nor automatic citations of a preceding user message. No store schema,
+retention policy, cross-session access grant or independent transcript archive is introduced.
+
+The timeline is an on-demand view of at most 2,000 newest native active-branch entries, with 40 results
+per page and explicit older-entry omissions. It includes user/assistant text and validated session-note
+save/forget events, never reasoning, image bytes, arbitrary custom reports or tool-result bodies.
+Message details are bounded to 32,000 characters with clipping disclosed. Search counts describe only
+that bounded window, not the user's complete conversation history. Tombstones remain historical events.
+
+Context inspection holds only the last block prepared by Mind in memory, including session notes,
+capture hints and omission notices. It never reconstructs a supposedly historical selection from today's
+stores, and never claims to observe the provider payload. The existing UTF-8-bytes/3 planning estimator
+and injection policy remain unchanged. A new process has no prior prepared-context snapshot.
+
+Native session/branch changes, owner revocation and persona/project changes clear that snapshot and
+abort the open inspector. Every asynchronous page read checks the accepting owner before and after IO;
+revoked results cannot repaint a different owner. UI content is sanitized, width-bounded and navigable
+without executing links or sending model messages. The user can explicitly refresh the view.
+
+## Evidence-grounded knowledge review
+
+`/mind review [project|project-long|persona]` and F10's action menu run an explicit knowledge review.
+The default is durable project memory (persona at home). F10 can review a selected fact or a bounded
+scope window. Session/shared are not model-review write targets. The current Persona companion protocol
+admits only the exact active session model/thinking level; Mind does not infer a better model from names,
+change providers, or silently choose a fallback. The real visible `mind` worker still has no tools.
+
+The parent inspects safe, owned facts and admits at most six complete records within 12,000 JSON
+characters. The user explicitly selects up to six repository-relative text files. Trusted-workspace,
+containment, symlink, regular-file, size, secret and content checks gate reads; no recursive search,
+source-string path resolution, network access or private worker archive is used. Native user-role text
+is sampled only from a bounded active-branch window. A stored user role is not authenticated human
+intent: quotations, hypotheticals and programmatic messages must be critically assessed. Evidence
+snapshots carry IDs, labels, excerpts, hashes and coverage; omissions cannot establish absence.
+
+The task requires one classified finding per supplied fact: supported, proposed correction, conflict,
+insufficient evidence, or proposed retirement. The parent rejects unknown records/citations, duplicate
+findings, malformed fields and unsafe replacement text. Corrective operations preserve kind and scope;
+source lineage and bounded evidence references survive consolidation. These checks establish attribution
+and structural validity, not factual truth. Local repository evidence must not turn a repository-specific
+rule into a universal persona preference; age and latest mention alone are not obsolescence evidence.
+
+There is NO automatic application. A complete native proposal report shows reasons, cited evidence,
+coverage and before/after corrections. `/mind review show` reopens it; `/mind review apply` displays it
+and asks for explicit approval. The staged plan lives in a dedicated optimizer instance, not the generic
+memory-tool plan cache, so `/mind optimize apply` cannot bypass evidence validation. Approval reacquires
+maintenance admission, checks evidence freshness and applies through the same CAS/history/undo boundary.
+A synchronous parent evidence guard runs again inside the guarded store callback. This verifies source
+state at the check, not a transaction locking arbitrary repository files against external writers.
+
+Retirement is deliberately recommendation-only: the reviewer cannot delete a standalone memory.
+A deliberate scoped `memory forget` remains available for a separately judged retirement, with its
+existing semantics (not consolidation undo). No delete-shaped optimizer plan, new durable schema or
+unbounded history is introduced. `/mind review discard` cancels/discards pending work; an applied change
+requires the ordinary history/undo workflow.
+
+A parent review reservation prevents automatic and explicit consolidation from overlapping collection
+or worker execution. Only actual review launches reset automatic usage/cooldown accounting and persist
+explicit attempt markers; interruptions never create an automatic retry entitlement. Staging releases
+the worker reservation rather than holding it while waiting for a human. Apply must acquire a new one;
+concurrent writes or expired plans are refused. New input, agent/model/branch changes, owner revocation
+and shutdown cancel workers/dialogs and invalidate pending review plans. Shutdown joins admitted apply
+work through approval, guarded persistence, receipt finalization and lease cleanup. Revocation blocks new
+admission and guarded writes, but does not roll back an already committed replacement or relabel it as
+cancelled; its finalization is still awaited and stale completion UI is suppressed. Completion uses display-only
+native entries/toasts and never triggers a supervisor turn.
 
 ## Verification boundaries
 

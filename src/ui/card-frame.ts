@@ -26,6 +26,7 @@ export interface CardFrameContext {
 	theme: Theme;
 	outputPad: number;
 	detailHint: () => string;
+	expansionKey?: object;
 }
 
 export type CardFrameFactory = (presentation: CardFramePresentation, context: CardFrameContext) => Component;

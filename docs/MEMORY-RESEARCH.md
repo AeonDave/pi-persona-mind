@@ -80,6 +80,50 @@ implementation or published vector source. Record its provenance and limitations
 isolated memory contribution from the provider's total conversation usage, fabricate unavailable
 reference counts or automatically tune the production budget from a small fixture set.
 
+## Inspector architecture decision
+
+The memory inspector adds a read-only view over existing stores and the native active branch, rather
+than introducing an OptChat-style permanent transcript and summary tree. This preserves Mind's role as
+selective scoped memory and avoids a second retention policy, summarizer budget and source of truth.
+A separate archive could eventually make older cross-session episodes navigable, but would require an
+explicit access, deletion and retention design; an opaque source string is not that authorization.
+
+The boundaries are small: pure native-record projection and source matching, a strict-store/native-session
+query adapter, an owner-bound lifecycle controller, and a native TUI view. The context tab observes the
+existing prepared block rather than implementing its own retrieval or inferring selection from a changed
+store. Source opening is a drill-down into an attributed matching recording, not semantic verification.
+Legacy facts without attributable recordings remain readable but have no invented source link.
+
+Verification targets branch isolation, exact recording association, stale async completion, unavailable
+sources, bounded paging, malformed native data, terminal-control sanitization and narrow/short terminals.
+The native-session integration test proves the prepared block reaches the inspector and is revoked on
+branch navigation without a model wake or extra transcript append. It does not establish visual quality
+in every terminal or cross-session historical recall.
+
+## Evidence-review decision
+
+Consolidation and knowledge review have different authority. Consolidation combines compatible memory
+records; review evaluates a bounded, explicitly selected evidence packet and stages corrective proposals.
+Neither an LLM classification nor a valid citation certifies semantic truth. Repository observations do
+not establish universal preferences, and native user-role messages can be quoted or programmatic.
+
+The parent collects evidence and owns freshness checks; the worker has no tools. This is preferable here
+to a tool-enabled autonomous researcher: it keeps filesystem scope, secret filtering, provider usage and
+reproducible source snapshots under host control. The trade-off is limited evidence coverage and explicit
+file selection; missing or ambiguous support must remain insufficient rather than trigger a wider search.
+
+Review corrections use a separate staged optimizer instance and explicit approval, with existing CAS,
+receipts and undo. A synchronous evidence guard checks again at commit. Repository writers do not share
+that lock, so this is checked-snapshot freshness, not an atomic transaction over code and memory.
+Retirement remains advisory because existing receipts represent replacements, not arbitrary deletions;
+pretending an empty replacement is a reversible retirement would violate the storage contract.
+
+The current companion protocol admits only the exact session model. A different same-provider model
+would require an explicit versioned companion capability; inferring quality from a model name or bypassing
+the worker contract was rejected. The parent reservation is released once a proposal is staged, avoiding
+an indefinite maintenance lock while the user reads; apply reacquires admission and rejects changed sources
+or stores instead of assuming the old proposal is still valid.
+
 ## Review standard
 
 Preserve each verification command's own exit status, not a downstream formatter's status. Distinguish

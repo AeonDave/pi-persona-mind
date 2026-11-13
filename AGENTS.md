@@ -83,6 +83,15 @@ coupled through a versioned local companion handshake to
   of the automatic transcript; show one informative `mind` toast on successful change, no routine
   result card, and no no-op card or toast. Keep durable history and guarded undo available.
   Manual detail and important warnings remain visible. Worker completion is not proof of semantic truth.
+- Evidence-grounded knowledge review is explicit and separate from consolidation. F10 actions close
+  the overlay before native prompts. Parent-selected, bounded trusted-repository files and active-branch
+  user-role text are evidence, never instructions or authenticated truth. Use the real exact-session-model
+  Persona worker with no tools; validate closed findings/citations. Corrections remain staged in a separate
+  optimizer until user approval and source/owner freshness checks, including the guarded store callback.
+  Shared/session are not review write targets. Retirement is recommendation-only, not an implicit delete.
+  Reuse maintenance admission/accounting; interrupted reviews never earn automatic retries.
+- For `pi-persona:card-frame:v1`, custom-entry renderers pass their original entry object as optional
+  `expansionKey`; Persona owns click/keyboard synchronization. Mind must not duplicate interaction state.
 - Rotate completed automatic review over older records/pages; account for actual byte admission,
   preserve newest-fact inclusion, and never mark stopped/interrupted work as completed. No unbounded
   sweeper. Optimizer receipts precede replacement and persist at most 32/2MiB per target; unresolved

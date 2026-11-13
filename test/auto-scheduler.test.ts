@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { AutoOptimizeScheduler, AUTO_COOLDOWN_MS, AUTO_INPUT_TOKEN_THRESHOLD, formatAutoInputSkip, type AutoAttempt, type AutoOptimizeOwner } from "../src/extension/auto-optimize.ts";
 import { autoOptimizeTarget } from "../src/extension/auto-optimize-session.ts";
-import type { AutoOptimizeTarget } from "../src/core/auto-optimize.ts";
+import { selectAutoInput, type AutoOptimizeTarget } from "../src/core/auto-optimize.ts";
 import type { MindWorkerResult } from "../src/extension/mind-worker.ts";
 import { makeMemory, type MemoryEntry } from "../src/core/memory.ts";
 import type { OptimizeInspection, OptimizeTarget } from "../src/core/optimize.ts";
@@ -138,6 +138,105 @@ function fixture(options: {
 		finish: (output: string | MindWorkerResult) => finish?.(typeof output === "string" ? { ok: true, output, status: "done" } : output), pending: () => timers.length,
 	};
 }
+
+test("knowledge review reserves single-flight across UI interrupts without consuming an attempt", async () => {
+	const f = fixture();
+	f.scheduler.memoryAdded("project"); f.scheduler.settled();
+	const queued = f.takeTimerWork();
+	const lease = f.scheduler.reserveReview("persona"); assert.ok(lease);
+	assert.equal(lease.current(), true); assert.equal(f.pending(), 0);
+	assert.match(f.scheduler.status(), /knowledge review reserved/i);
+	assert.equal(f.scheduler.reserveReview("project"), undefined);
+	assert.equal(f.scheduler.startExplicit("project"), false);
+	queued?.(); f.scheduler.settled(); await f.scheduler.join();
+	assert.equal(f.launches(), 0); assert.equal(f.pending(), 0);
+	f.scheduler.interrupt(); // The adapter also interrupts for the review's own UI prompts.
+	assert.equal(lease.current(), true);
+	assert.deepEqual(f.attempts, []);
+	lease.settled(); lease.release();
+	assert.equal(lease.current(), false); assert.equal(f.pending(), 0, "release never schedules work");
+	f.scheduler.settled(); await f.fire();
+	assert.equal(f.launches(), 1, "reservation alone preserves first-attempt eligibility");
+	f.finish('{"operations":[]}'); await f.scheduler.join();
+});
+
+test("knowledge review admission requires current idle owner, allowed tier, and no scheduler worker", async () => {
+	const f = fixture({ allowedTargets: ["persona"] });
+	assert.equal(f.scheduler.reserveReview("project"), undefined);
+	f.setIdle(false); assert.equal(f.scheduler.reserveReview("persona"), undefined); f.setIdle(true);
+	f.scheduler.startExplicit("persona");
+	assert.equal(f.scheduler.reserveReview("persona"), undefined);
+	assert.equal(f.events.includes("cancel"), false, "reservation cannot cancel an actual worker");
+	await until(() => f.launches() === 1, "worker excluding reservation");
+	f.finish('{"operations":[]}'); await f.scheduler.join();
+	const lease = f.scheduler.reserveReview("persona"); assert.ok(lease);
+	f.setIdle(false); assert.equal(lease.current(), false); f.setIdle(true);
+	f.revoke(); assert.equal(lease.current(), false); lease.release();
+	assert.equal(f.scheduler.reserveReview("persona"), undefined);
+});
+
+test("knowledge review launch records explicit accounting and terminal settlement exactly once", () => {
+	const f = fixture(); f.scheduler.tokensUsed(AUTO_INPUT_TOKEN_THRESHOLD);
+	f.scheduler.memoryAdded("project");
+	const lease = f.scheduler.reserveReview("persona"); assert.ok(lease);
+	for (const digest of ["", "a".repeat(63), "G".repeat(64), "a".repeat(65)]) assert.throws(() => lease.launched(digest), /digest/i);
+	assert.deepEqual(f.attempts, []);
+	f.advance(123); const digest = "a".repeat(64);
+	lease.launched(digest);
+	assert.deepEqual(f.attempts, [{ digest, at: 1_000_123, state: "started", target: "persona", explicit: true }]);
+	assert.match(f.scheduler.status(), /knowledge review active/i);
+	assert.match(f.scheduler.status(), /0\/1,000,000 main input tokens/);
+	assert.throws(() => lease.launched(digest), /launch/i);
+	f.scheduler.interrupt(); assert.equal(lease.current(), true);
+	f.advance(100); lease.settled(); lease.settled();
+	assert.deepEqual(f.attempts[1], { digest, at: 1_000_123, state: "settled", target: "persona", explicit: true });
+	assert.equal(f.attempts.length, 2);
+	lease.release(); assert.equal(f.pending(), 0);
+	f.scheduler.settled(); assert.equal(f.pending(), 0);
+	f.scheduler.tokensUsed(AUTO_INPUT_TOKEN_THRESHOLD); f.scheduler.settled();
+	assert.deepEqual(f.delays(), [AUTO_COOLDOWN_MS - 100]);
+	f.scheduler.stop();
+});
+
+test("released or revoked knowledge reviews cannot settle, retry, or release a newer lease", () => {
+	const f = fixture();
+	const first = f.scheduler.reserveReview("persona"); assert.ok(first);
+	first.launched("b".repeat(64)); first.release(); first.settled();
+	assert.deepEqual(f.attempts.map((a) => a.state), ["started"]);
+	f.scheduler.activate(f.owner); f.scheduler.settled();
+	assert.equal(f.pending(), 0, "restored incomplete explicit work has no retry entitlement");
+	const second = f.scheduler.reserveReview("persona"); assert.ok(second);
+	first.release(); assert.equal(second.current(), true);
+	assert.throws(() => first.launched("c".repeat(64)), /current|released/i);
+	f.scheduler.stop(); assert.equal(second.current(), false);
+	f.scheduler.activate({ ...f.owner, key: "replacement", attempts: [] });
+	const third = f.scheduler.reserveReview("persona"); assert.ok(third);
+	second.release(); second.settled(); assert.equal(third.current(), true);
+	f.scheduler.activate(f.owner); assert.equal(third.current(), false);
+	third.release(); assert.equal(f.attempts.length, 1);
+});
+
+test("completed knowledge review suppresses its semantic digest across owner restore", async () => {
+	const f = fixture();
+	const inspected = await f.owner.optimizer().inspect("persona"); assert.ok(inspected.ok);
+	const input = selectAutoInput(inspected, f.owner.persona); assert.ok(input);
+	const lease = f.scheduler.reserveReview("persona"); assert.ok(lease);
+	lease.launched(input.digest); lease.settled(); lease.release();
+	f.scheduler.activate(f.owner); f.advance(); f.scheduler.tokensUsed(AUTO_INPUT_TOKEN_THRESHOLD);
+	f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire(); await f.scheduler.join();
+	assert.equal(f.launches(), 0);
+	assert.deepEqual(f.attempts.map((attempt) => attempt.state), ["started", "settled"]);
+	f.scheduler.stop(); assert.equal(f.scheduler.reserveReview("persona"), undefined);
+});
+
+test("knowledge review remains explicit with auto off and failed attempt persistence is surfaced", () => {
+	const f = fixture({ recordAttempt: () => { throw new Error("attempt append failed"); } });
+	f.scheduler.setEnabled(false);
+	const lease = f.scheduler.reserveReview("persona"); assert.ok(lease);
+	assert.throws(() => lease.launched("d".repeat(64)), /attempt append failed/);
+	lease.release(); f.scheduler.setEnabled(true); f.scheduler.settled();
+	assert.equal(f.pending(), 0); assert.deepEqual(f.attempts, []);
+});
 
 test("automatic singleton operation refuses the whole proposal before preview and settles quietly", async () => {
 	const f = fixture();

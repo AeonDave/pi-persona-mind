@@ -7,6 +7,18 @@ import { createMindActivityRunner, type MindActivityEvent } from "../src/extensi
 test("mind command parser accepts the snapshot, help, and existing explicit actions", () => {
 	assert.deepEqual(parseMindCommand(""), { type: "snapshot" });
 	assert.deepEqual(parseMindCommand("help"), { type: "help" });
+	assert.deepEqual(parseMindCommand("browse"), { type: "browse", tab: "memories" });
+	assert.deepEqual(parseMindCommand("browse context"), { type: "browse", tab: "context" });
+	assert.deepEqual(parseMindCommand("timeline"), { type: "browse", tab: "timeline" });
+	assert.equal(parseMindCommand("browse other").type, "invalid");
+	assert.equal(parseMindCommand("timeline extra").type, "invalid");
+	assert.deepEqual(parseMindCommand("review"), { type: "review" });
+	assert.deepEqual(parseMindCommand("review project-long"), { type: "review", target: "project-long" });
+	assert.deepEqual(parseMindCommand("review apply"), { type: "review-apply" });
+	assert.deepEqual(parseMindCommand("review show"), { type: "review-show" });
+	assert.deepEqual(parseMindCommand("review discard"), { type: "review-discard" });
+	assert.equal(parseMindCommand("review shared").type, "invalid");
+	assert.equal(parseMindCommand("review apply now").type, "invalid");
 	assert.deepEqual(parseMindCommand("doctor"), { type: "doctor" });
 	assert.deepEqual(parseMindCommand("reset"), { type: "reset" });
 	assert.deepEqual(parseMindCommand("reset workspace"), { type: "reset" });

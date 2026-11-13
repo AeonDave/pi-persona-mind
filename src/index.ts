@@ -33,6 +33,12 @@ import { createSessionMemory } from "./session-memory.ts";
 import { registerSessionNoteRenderer } from "./ui/session-note-card.ts";
 import type { MemoryOptimizer } from "./core/optimize-service.ts";
 import { registerMindCommands } from "./extension/mind-command.ts";
+import { createMemoryInspector } from "./extension/memory-inspector.ts";
+import { loadInspectorPage } from "./extension/inspector-data.ts";
+import { openMemoryInspector } from "./ui/memory-inspector.ts";
+import { createKnowledgeReview } from "./extension/knowledge-review.ts";
+import { launchMindWorker } from "./extension/mind-worker.ts";
+import { runMindInspectorActions } from "./extension/mind-actions.ts";
 import { MIND_RESULT_ENTRY_TYPE, registerMindResultRenderer } from "./ui/mind-result-card.ts";
 import { parsePersonaMemoryOwner, PERSONA_MEMORY_OWNER_CHANGED, personaGuardedTools, queryPersonaDependency, queryPersonaMemoryOwner } from "./extension/persona-dependency.ts";
 import { createMindActivityRunner } from "./extension/activity.ts";
@@ -344,6 +350,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			theme,
 			outputPad: mindCardUI.outputPad(),
 			detailHint: cardFrameDetailHint(keyHint),
+			expansionKey: entry,
 		});
 	});
 
@@ -529,6 +536,27 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	// the markers, only a compatible, enabled supervisor may use the full mind.
 	const isDelegatedLeg = process.env.PI_PERSONA_LEG === "1" || process.env.PI_PERSONA_CHILD === "1";
 	const autoOptimize = installAutoOptimize(pi, { isDelegatedLeg, available, captureOwner: captureMemoryOwner, scope: resolveMindScope, persona: rawMindPersona, mind: getMind });
+	const knowledgeReview = createKnowledgeReview({
+		captureOwner: captureMemoryOwner,
+		mind: getMind,
+		reserve: (target) => autoOptimize.reserveReview(target),
+		launch: (ctx, task) => launchMindWorker(pi, ctx.sessionManager.getSessionId(), rawMindPersona(ctx), task),
+		appendResult: (ctx, title, body) => {
+			if (!available(ctx) || !sessionMemory.isCurrent(ctx)) throw new Error("knowledge review owner is unavailable");
+			pi.appendEntry(MIND_RESULT_ENTRY_TYPE, { title, content: body });
+		},
+	});
+	const inspector = createMemoryInspector({
+		unavailableReason: (ctx) => unavailableReason(ctx) ?? (isDelegatedLeg || !sessionMemory.isCurrent(ctx) ? "Memory inspector requires an active supervisor session owner." : undefined),
+		captureOwner: captureMemoryOwner,
+		load: (ctx, request) => loadInspectorPage(ctx, getMind(ctx), sessionMemory, request),
+		show: openMemoryInspector,
+		actions: (ctx, request, current) => runMindInspectorActions(ctx, request, current, { consolidate: (target) => autoOptimize.startExplicit(target), review: knowledgeReview }),
+	});
+	if (!isDelegatedLeg) pi.registerShortcut("f10", { description: "Inspect memory, sources and timeline", handler: (ctx) => inspector.open(ctx) });
+	pi.on("session_tree", () => { discardOptimizer(); inspector.invalidate(); knowledgeReview.interrupt(); });
+	pi.on("agent_start", () => knowledgeReview.interrupt());
+	pi.on("model_select", () => knowledgeReview.interrupt());
 
 	// Withhold the write tools from a worker: a leg reading/writing the supervisor persona's LTM/STM/
 	// backlog is exactly the bleed we prevent. It still INHERITS the lean block below (read-only, curated).
@@ -573,6 +601,8 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		if (ctx && currentSessionContext && ctx.sessionManager !== currentSessionContext.sessionManager) return;
 		if (personaUnavailable) return;
 		personaUnavailable = true;
+		knowledgeReview.interrupt();
+		inspector.invalidate();
 		autoOptimize.revoke();
 		discardOptimizer();
 		sessionMemory.deactivate();
@@ -715,6 +745,8 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			return;
 		}
 		if (activeScopeKey === nextKey) return;
+		knowledgeReview.interrupt();
+		inspector.invalidate();
 		discardOptimizer();
 		clearTimers();
 		releaseWakeOwner();
@@ -800,6 +832,8 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	// persists every turn while the mind stays empty (that would be the nag we avoid).
 	let emptyAnnounced = false;
 	const resetSessionTransientState = (): number => {
+		knowledgeReview.interrupt();
+		inspector.invalidate();
 		sessionLifecycleGeneration++;
 		captureInputGeneration++;
 		pendingCaptureNotice = undefined;
@@ -889,6 +923,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	// explicit persist-intent is safe to commit deterministically before the model runs. Everything
 	// softer remains a model-visible candidate governed by the standing tool guideline.
 	pi.on("input", async (event, ctx) => {
+		knowledgeReview.interrupt();
 		if (!available(ctx)) return;
 		const lifecycleGeneration = sessionLifecycleGeneration;
 		const inputGeneration = ++captureInputGeneration;
@@ -1036,6 +1071,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 				}
 			}
 		}
+		const inspectorCurrent = inspector.captureContext(ctx);
 		let block = "";
 		const query = directInputPrompt ?? latestDirectInputPrompt ?? "";
 		const sessionBlock = isDelegatedLeg ? "" : sessionMemory.injection(ctx, { query, maxTokens: 600 });
@@ -1057,6 +1093,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 			else emptyAnnounced = true;
 		}
 		const injected = [block, sessionBlock, cueHint].filter(Boolean).join("\n\n");
+		if (!isDelegatedLeg) inspector.recordContext(ctx, injected, inspectorCurrent);
 		if (injected) return { systemPrompt: `${event.systemPrompt}\n\n${injected}` };
 		return;
 	});
@@ -1175,6 +1212,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		if (!ctx) return;
 		const changed = parsePersonaMemoryOwner(value, sessionIdOf(ctx));
 		if (!changed) return;
+		knowledgeReview.interrupt();
 		if (!changed.ready) { onPersonaUnavailable(); return; }
 		if (!available(ctx)) return;
 		autoOptimize.activate(ctx);
@@ -1188,7 +1226,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		})().catch((error: unknown) => { if (generation === sessionLifecycleGeneration && available(ctx)) surfaceWarning(ctx, `could not activate Persona memory owner: ${error instanceof Error ? error.message : String(error)}`); });
 	});
 
-	pi.on("session_shutdown", (_event, ctx) => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		currentSessionContext = undefined;
 		discardOptimizer();
 		sessionMemory.deactivate();
@@ -1201,11 +1239,14 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		wakeGeneration++;
 		clearTimers();
 		releaseWakeOwner();
+		await knowledgeReview.join();
 	});
 
 	registerMindCommands(pi, {
 		agentDir, resolveScope: resolveMindScope, rawPersona: rawMindPersona, getMind,
 		getSessionMemory: () => sessionMemory, getOptimizer, ensureLegacyMigrated, surfaceWarning,
+		openInspector: (ctx, tab) => inspector.open(ctx, tab),
+		knowledgeReview,
 		migrationStatus,
 		unavailableReason,
 		activity: getActivity,

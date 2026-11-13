@@ -272,6 +272,8 @@ async function runMemoryAction(mind: MindService, params: MemoryToolParams, ctx:
 				id: r.entry.id,
 				ok: true,
 				scope: destination,
+				// Native receipt metadata, not model-supplied source authority or a new archive.
+				recording: { version: 1, persona: mind.inspectionScope().persona, projectRoot: mind.inspectionScope().projectRoot, target: params.term === "short" ? "project" : destination === "project" ? "project-long" : destination },
 				summary: `${destination} · ${r.entry.expiresAt ? "working" : "durable"} saved — ${compactMemoryText(r.entry.text, 80)}`,
 			})
 			: say(`Not stored: ${r.reason}`, { ok: false, reason: r.reason });
