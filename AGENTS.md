@@ -107,3 +107,12 @@ coupled through a versioned local companion handshake to
 
 `npm run typecheck` clean, `npm test` green, full `npm audit --audit-level=low`, and package dry-run
 inspection. Re-run after final edits. Keep published files explicit; no tests, drafts or local artifacts.
+
+### Accepted platform diagnostics
+
+- Windows runs have zero expected skips. On other platforms, only the two Windows recovery-gate
+  sharing-violation cases in `test/store.test.ts` are intentionally skipped: they exercise the
+  Windows-specific `EPERM` handling, not the POSIX path. Report them as untested, never passed.
+- Evidence symlink-boundary tests are required on every platform. Windows test accounts need
+  Developer Mode or `SeCreateSymbolicLinkPrivilege`; missing support fails rather than silently
+  dropping those security checks. No other conditional skips are accepted.
