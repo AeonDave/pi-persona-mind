@@ -1,10 +1,10 @@
 /** Pure selection and strict proposal contracts for Mind's bounded background reviewer. */
 import { createHash } from "node:crypto";
 import {
-	isMemoryId, MEMORY_KINDS, MAX_MEMORY_TEXT_CHARS, validateLongMemory, validateShortMemory,
+	isMemoryId, isSafeMemoryContent, MEMORY_KINDS, MAX_MEMORY_TEXT_CHARS, validateLongMemory, validateShortMemory,
 	type MemoryEntry, type MemoryKind,
 } from "./memory.ts";
-import { safeOptimizeMemory, type OptimizeInspection, type OptimizeOperation } from "./optimize.ts";
+import type { OptimizeInspection, OptimizeOperation } from "./optimize.ts";
 
 export type AutoOptimizeTarget = "project" | "project-long" | "persona";
 
@@ -185,7 +185,7 @@ function validateInput(input: AutoOptimizeInput): MemoryEntry[] | undefined {
 	let personaOwner: string | undefined;
 	for (const raw of input.entries) {
 		const entry = input.target === "project" ? validateShortMemory(raw) : validateLongMemory(raw);
-		if (!entry || !safeOptimizeMemory(entry) || !isMemoryId(entry.id) || ids.has(entry.id)) return undefined;
+		if (!entry || !isSafeMemoryContent(entry) || !isMemoryId(entry.id) || ids.has(entry.id)) return undefined;
 		if (input.target === "project" || input.target === "project-long") {
 			if (typeof entry.persona !== "string" || entry.persona.length === 0) return undefined;
 			if (projectOwner !== undefined && projectOwner !== entry.persona) return undefined;
@@ -208,7 +208,7 @@ function eligibleEntries(inspection: OptimizeInspection, persona: string): Memor
 	const occurrences = new Map<string, MemoryEntry[]>();
 	for (const raw of inspection.entries) {
 		const entry = inspection.target === "project" ? validateShortMemory(raw) : validateLongMemory(raw);
-		if (!entry || !safeOptimizeMemory(entry)) continue;
+		if (!entry || !isSafeMemoryContent(entry)) continue;
 		if (inspection.target === "project" && entry.persona !== persona) continue;
 		if (inspection.target === "project-long" && entry.persona !== persona) continue;
 		// Persona LTM is scoped by the store path; reject a contradictory embedded owner marker while

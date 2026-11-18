@@ -1,7 +1,7 @@
 <h1 align="center">pi-persona-mind</h1>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v0.9.0/assets/banner.png" alt="pi-persona-mind — durable memory for Pi">
+  <img src="https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v0.9.1/assets/banner.png" alt="pi-persona-mind — durable memory for Pi">
 </p>
 
 [![CI](https://github.com/AeonDave/pi-persona-mind/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/AeonDave/pi-persona-mind/actions/workflows/test.yml)
@@ -12,10 +12,21 @@
 and deferred work without turning every conversation into permanent memory.
 Mind complements Pi's native conversation history and compaction; it does not replace them.
 
+| What you need | What Mind provides |
+|---|---|
+| Continue a long project | Durable repository decisions, scoped preferences and session notes that survive compaction |
+| Keep context focused | Bounded retrieval by words, tags and paths, with explicit full-record reads |
+| See what the agent remembers | **F10**: saved facts, prepared context and an active-branch timeline |
+| Maintain a growing archive | Bounded consolidation, evidence-grounded review, change history and guarded undo |
+
+Memory is stored in local files and Pi's native session history. Recall and browsing need no model
+call. [Automatic consolidation](#quiet-automatic-maintenance) is on by default; it and explicit
+knowledge reviews use the current session model and incur model usage.
+
 ## Quick start
 
-Mind 0.9.0 requires **Pi 1.5.2**, **Node.js 22.19.0+**, and
-[**pi-persona 1.18.0+**](https://github.com/AeonDave/pi-persona) loaded in the same instance.
+Mind 0.9.1 requires **Pi 1.5.2**, **Node.js 22.19.0+**, and
+[**pi-persona 1.18.1+**](https://github.com/AeonDave/pi-persona) loaded in the same instance.
 
 ```bash
 pi install npm:@aeondave/pi-persona
@@ -46,33 +57,30 @@ Press **F10** to inspect what Mind has saved and prepared. Use **`/mind`** for a
 
 Choose the lifetime and scope that match your intent:
 
-- **Session notes** hold temporary decisions on the active native branch. They survive compaction
-  and resume when session history persists, but do not follow a new session or delegated workers.
-  A non-persistent Pi session keeps them in memory only.
-- **Project working memory** holds short-lived repository context, expiring after 48 hours by default.
-- **Durable project memory** keeps repository decisions until changed or forgotten.
-- **Persona memory** keeps preferences and lessons across projects for the same persona;
-  **shared memory** is deliberately available across personas. Both are durable.
-- **Backlog** tracks deferred project work and reminders, with a 48-hour default expiry. Reminders
-  are display-only: they do not wake the model, and live delivery requires Pi to remain open.
+| Memory | Where it belongs | Lifetime |
+|---|---|---|
+| Session notes | The active native session branch | Survive compaction and persisted resume; stay out of new sessions and workers |
+| Project working memory | Temporary repository context | 48 hours by default |
+| Durable project memory | Repository decisions | Until changed or forgotten |
+| Persona memory | One persona across projects | Until changed or forgotten |
+| Shared memory | Deliberately shared across personas | Until changed or forgotten |
+| Backlog | Deferred project work and reminders | 48 hours by default; later reminders extend expiry |
 
-The agent can choose scope from your intent; API callers must explicitly select `project`, `persona`
-or `shared` for a durable save. Strong direct-user cues may also be captured automatically, but
+The agent chooses scope from your intent; durable saves require an explicit `project`, `persona`
+or `shared` destination. Strong direct-user cues may be captured automatically, but
 **automatic capture creates provisional session notes only**, even for “remember” or “from now on”.
 Broader retention requires a separate deliberate `memory` call with an explicit durable scope.
-Project injection and reminders are suppressed in the home directory.
 
-Session notes belong to Pi's native history: forgetting one adds a branch-local tombstone rather than
-erasing earlier transcript bytes. Delegated legs receive a lean memory selection, but not session
-notes or memory/backlog write tools. See [lifetimes and scope](docs/DESIGN.md#four-lifetimes) for
-storage, ownership and expiry details.
+Reminders notify you while Pi is open; they do not wake the model. Delegated workers receive a lean
+memory selection, without session notes or memory/backlog write tools. Home-directory sessions skip
+project injection and reminders. See [lifetimes and scope](docs/DESIGN.md#four-lifetimes) and
+[session notes](docs/DESIGN.md#session-notes) for persistence, branch-local forgetting and expiry.
 
 ## Retrieval and inspection
 
-Mind selects a bounded amount of context each turn using lexical matching over words, tags and
-paths. It does not inject the whole store, and matching can miss paraphrases or conflicting facts.
-Use explicit `memory recall` and `memory read` when you need to find or read a complete record.
-The shared context budget is a planning estimate, not a provider billing counter.
+Mind selects relevant excerpts each turn within one shared context budget. Words, tags and paths
+drive retrieval; lexical matching can miss paraphrases or conflicting facts. Use `memory recall`
+to search and `memory read` to inspect a complete record. The budget is an estimate, not a billing counter.
 
 **F10** toggles the read-only inspector in the interactive TUI:
 
@@ -80,32 +88,29 @@ The shared context budget is a planning estimate, not a provider billing counter
 - **Context** shows the last block prepared by Mind, including omissions—not the final provider payload.
 - **Timeline** shows bounded user/assistant text and session-note events on the active branch.
 
-Open a record for detail; where available, open its matching recording source with **s**. A recording
-shows where a fact was saved, **not that it is true**. Mind does not turn arbitrary source strings
-into file, URL or private-worker-archive links. Timeline and source lookup are bounded to the active
-branch, not a searchable archive of every past session.
+Open a record for detail and press **s** for its recording source, when available. Recording provenance
+shows how a fact was saved; it does not verify the assertion. Timeline and source lookup cover a
+bounded active-branch window.
 
-Normal browsing and retrieval do **not** call a model. In Memories, **a** opens explicit maintenance
-actions; `/mind browse`, `/mind browse context` and `/mind timeline` are command alternatives.
-Navigation hints appear in the inspector. See the [inspector design](docs/DESIGN.md#read-only-memory-inspector)
-for keys, coverage and limits.
+In Memories, **a** opens maintenance actions; `/mind browse`, `/mind browse context` and `/mind timeline`
+are command alternatives. Browsing alone is read-only and makes no model calls.
+
+F10 shares Persona's F9 window frame and theme. **PageUp/PageDown** follow visible rows, narrow
+windows keep the selection visible, and **?** opens help. See the
+[inspector design](docs/DESIGN.md#read-only-memory-inspector) for navigation, sources and coverage.
 
 ## Maintain knowledge deliberately
 
-**Consolidation** merges compatible saved facts within a scope. It uses a bounded model review,
-validates proposed replacements and retains history for guarded undo; it does not check repository
-truth. Run `/mind optimize` for one bounded window per eligible nonshared tier, or select a tier.
-Inspect previous changes with `/mind optimize history` and use `/mind optimize undo` with a receipt ID.
-Shared memory is excluded from model-driven optimization.
+**Consolidation** merges compatible saved facts and applies validated changes. `/mind optimize`
+reviews one bounded window per allowed project/persona tier; `/mind optimize project-long` selects
+durable project memory alone. Inspect changes with `/mind optimize history`; `/mind optimize undo`
+restores affected facts only when its conflict checks pass. This reorganizes saved knowledge; it does
+not verify it against your repository. [Consolidation and undo details →](docs/DESIGN.md#explicit-consolidation)
 
-History and undo are bounded, and undo checks for conflicting changes before restoring affected facts.
-They are not an unlimited rollback of arbitrary edits. Inspect the result rather than assuming a
-reviewed window represents the whole store.
-
-**Knowledge review** is separate: choose a fact or bounded scope window, provide selected repository
-files, and review against those files and bounded active-branch user-role text. Repository evidence
-requires project trust. The worker can propose corrections, conflicts, insufficient-evidence findings
-or retirement recommendations; it cannot establish truth or automatically apply them.
+**Knowledge review** runs in the interactive terminal and checks selected facts against repository
+files you choose and bounded active-branch user-role text. Repository evidence requires project trust.
+The worker proposes corrections, conflicts, insufficient-evidence findings or retirement
+recommendations for your review.
 
 1. Choose **F10 → Memories → a**, or run `/mind review project-long` (also `project` or `persona`).
 2. Select evidence and confirm the model call. Inspect the proposal with `/mind review show`.
@@ -113,20 +118,18 @@ or retirement recommendations; it cannot establish truth or automatically apply 
    Application rechecks evidence and memory freshness. Retirement is a recommendation; forgetting a
    fact is a separate deliberate action.
 
-Both workflows use a **visible Persona-hosted Mind worker on the current session model**. They make
-model calls and may incur provider costs; the companion contract does not select a different model or
-fallback for Mind. Choose a model with `/model` before starting if needed. New input or changes to the
-model, branch, session or owner invalidate pending review work. Session notes and shared memory are
-not knowledge-review write targets.
+Both workflows use a **visible Persona-hosted Mind worker on the current session model** and incur
+model usage. Choose a model with `/model` before starting. New input or model, branch, session and
+owner changes invalidate pending review work. Shared memory and session notes are excluded from
+these model-driven mutations. Reviews and undo history are bounded; a reviewed window is not a
+whole-archive audit or a guarantee of truth.
 
 ### Quiet automatic maintenance
 
 Automatic consolidation is on by default. After eligible saves, it waits for the foreground to become
-idle and respects usage, cooldown and ownership gates. It operates on bounded windows, not the entire
-archive, and consolidates compatible facts rather than silently deleting old durable knowledge.
-A real worker is visible in Persona; successful changes get a small notification, while routine no-ops
-stay quiet. Failures and important warnings remain visible. Model output and validation are not a
-semantic-correctness guarantee.
+idle and respects usage, cooldown and ownership limits. A real worker is visible in Persona;
+successful changes produce one small **mind** notification, while routine no-ops stay quiet.
+Failures and important warnings remain visible, and applied changes retain history for guarded undo.
 
 Use `/mind optimize auto status`, `/mind optimize auto off` or `/mind optimize auto on` for the current
 session. `PI_PERSONA_MIND_OPTIMIZE=off` disables automatic optimization at startup. Capture can be set
@@ -137,5 +140,6 @@ See [automatic review](docs/DESIGN.md#automatic-semantic-review) for admission a
 
 - [Design: lifetimes, storage, limits, commands and safeguards](docs/DESIGN.md)
 - [Evidence-grounded review and approval](docs/DESIGN.md#evidence-grounded-knowledge-review)
+- [Storage recovery and concurrent writes](docs/DESIGN.md#durable-files-and-recovery)
 - [Architecture decisions and evaluation boundaries](docs/MEMORY-RESEARCH.md)
 - [Release history](CHANGELOG.md) · [MIT license](LICENSE)

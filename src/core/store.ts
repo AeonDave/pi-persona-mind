@@ -788,7 +788,9 @@ export class JsonStore<E> {
 		if (lockToken === undefined) {
 			const peek = await this.tryBak();
 			if (!peek) return null;
-			return withFileLock(`${this.filePath}.lock`, async (token) => this.recoverFromBak(reason, token));
+			// Missing was only an optimistic observation: a writer may repair and commit
+			// while this reader waits. Re-read live state under its lock before restoring.
+			return withFileLock(`${this.filePath}.lock`, async (token) => this.loadInternal(token));
 		}
 		const bak = await this.tryBak();
 		if (!bak) return null;

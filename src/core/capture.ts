@@ -58,7 +58,14 @@ const DECISION_ACTION = /\b(?:decided|chosen|chose|adopted|established|made|set|
 const REPORTED_DECISION = /^\s*(?:i\s+(?:saw|noticed|read|heard|observed|found|learned)\b|ho\s+(?:visto|notato|letto|sentito|osservato|scoperto|appreso)\b|mi\s+sono\s+accort[oa]\b)/i;
 
 function isDirectDurableDecision(sentence: string): boolean {
-	return !REPORTED_DECISION.test(sentence) && DIRECT_DECISION_OWNER.test(sentence) && DECISION_ACTION.test(sentence) && DURABLE_WORD.test(sentence) && DECISION_WORD.test(sentence);
+	if (REPORTED_DECISION.test(sentence) || !DIRECT_DECISION_OWNER.test(sentence) || !DURABLE_WORD.test(sentence) || !DECISION_WORD.test(sentence)) return false;
+	const action = DECISION_ACTION.exec(sentence);
+	if (action === null) return false;
+	const colon = sentence.indexOf(":");
+	// Reject negation anywhere in a premise that extraction would discard. Otherwise inspect
+	// only before the adoption verb: a negative fact remains eligible and keeps its wording.
+	const premiseEnd = colon >= 0 && sentence.slice(colon + 1).trim() ? colon : action.index;
+	return !/\b(?:never|not|non|mai)\b|n['’]t\b/i.test(sentence.slice(0, premiseEnd));
 }
 
 /** Split into sentences on ., !, ?, newline — coarse but enough to isolate the cued clause. */
@@ -110,7 +117,8 @@ function candidateFor(sentence: string): { text: string; explicit: boolean } {
 		const text = afterColon || direct;
 		return { text, explicit: /[\p{L}\p{N}]/u.test(text) };
 	}
-	const withoutAlways = direct.replace(/^\s*(?:always|never)\s+/i, "");
+	// "Always remember" reinforces consent; stripping "never" would reverse a refusal.
+	const withoutAlways = direct.replace(/^\s*always\s+/i, "");
 	for (const prefix of CUE_PREFIXES) {
 		const match = prefix.re.exec(direct) ?? (withoutAlways !== direct ? prefix.re.exec(withoutAlways) : null);
 		const candidate = match?.[1]?.trim();

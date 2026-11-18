@@ -720,3 +720,43 @@ test("load recovers from .bak when the live file is missing, and restores live",
 	);
 	assert.ok(existsSync(p), "live is restored from the backup so the next read is not another silent empty");
 });
+
+test("missing-live recovery preserves a newer commit made while its reader waits for the store lock", { timeout: 10_000 }, async (t) => {
+	const p = join(dir, "missing-live-concurrent-commit.json");
+	const store = itemStore(p);
+	await store.update(() => [{ id: "old", n: 1 }]);
+	await store.update((entries) => [...entries, { id: "previous", n: 2 }]);
+	const backup = readFileSync(`${p}.bak`, "utf8");
+	const committed = { ...JSON.parse(backup), sequence: 2, entries: [{ id: "old", n: 1 }, { id: "new-committed", n: 3 }] };
+	let releasePeek!: () => void;
+	const peeked = new Promise<void>((resolve) => { releasePeek = resolve; });
+	const originalLstat = fsPromises.lstat;
+	let backupStats = 0;
+	t.mock.method(fsPromises, "lstat", async (...args: Parameters<typeof fsPromises.lstat>) => {
+		const result = await originalLstat(...args);
+		// The bounded backup read checks its path both before and after reading. This barrier
+		// observes that optimistic peek without changing filesystem results or lock semantics.
+		if (args[0] === `${p}.bak` && ++backupStats === 2) releasePeek();
+		return result;
+	});
+	syncBuiltinESMExports();
+	let loading: Promise<Awaited<ReturnType<typeof store.load>>> | undefined;
+	try {
+		await withFileLock(`${p}.lock`, async () => {
+			await rm(p);
+			loading = store.load();
+			await peeked;
+			// A competing owner repairs and commits while the reader is still waiting. It
+			// follows the same lock and atomic-write boundary as a normal store update.
+			await atomicWriteFile(p, `${JSON.stringify(committed)}\n`);
+		});
+		const read = await loading!;
+		assert.deepEqual(read.entries, committed.entries, "the reader must re-read live state after acquiring the lock");
+		assert.equal(read.sequence, committed.sequence);
+		assert.deepEqual(JSON.parse(readFileSync(p, "utf8")), committed, "recovery must not overwrite the newer committed fact");
+		assert.equal(readFileSync(`${p}.bak`, "utf8"), backup, "the original recoverable backup remains intact");
+	} finally {
+		t.mock.restoreAll(); syncBuiltinESMExports();
+		await loading?.catch(() => {});
+	}
+});

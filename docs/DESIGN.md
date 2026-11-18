@@ -17,7 +17,7 @@ patch an installed host.
 Mind requires a loaded compatible pi-persona through its versioned local companion handshake.
 Missing/incompatible presence leaves tools inactive and suppresses capture, storage/import,
 injection and reminders. A settings file or installed npm package is not proof of an active
-companion. Mind 0.8.7 requires Persona 1.17.5 or later for these paired contracts. Its optional npm
+companion. Mind 0.9.1 requires Persona 1.18.1 or later for these paired contracts. Its optional npm
 peer declares that requirement without auto-installing or activating another extension.
 
 The node-only core has no Pi imports. The factory wires native Pi hooks, tools, scope, scheduling
@@ -28,7 +28,7 @@ Command parsing/presentation lives outside the factory. Important seams:
 |---|---|
 | core/service.ts | Scope-bound memory/backlog operations, mutation ordering |
 | core/store.ts | Atomic writes, exclusive ownership, recovery, strict snapshots and CAS |
-| core/memory.ts, backlog.ts | Validated facts and deferred-work state |
+| core/memory.ts, backlog.ts | Validated facts, shared persisted-content guard and deferred-work state |
 | core/scope.ts, mind-settings.ts | Project identity, safe paths and canonical Mind preferences |
 | extension/persona-dependency.ts | Loaded capability and actual memory-owner contracts |
 | core/migrate.ts | Bounded, non-destructive import of previous memory layouts |
@@ -251,6 +251,9 @@ Stores carry version, sequence, updatedAt and entries. Mutations use same-direct
 fsync, atomic rename, exclusive lockfiles and ownership checks. Directory fsync is best-effort on
 Windows. A live/foreign/malformed lock holder is never stolen merely for being old. Corruption is
 recovered or quarantined with diagnostics, never silently treated as an empty valid store.
+Backup recovery re-reads the live file after acquiring its exclusive lock: a writer that committed
+while recovery waited takes precedence over the previously observed backup. Recovery never overwrites
+that new live state or replaces a healthy backup with the damaged/missing state it is repairing.
 Windows sharing conflicts during recovery-gate acquisition return to the existing bounded lock
 wait; they never authorize entering the protected callback or deleting another recovery gate.
 Ordinary memory stores default to 10,000 entries and 4 MiB; writes over capacity fail without truncating
@@ -277,6 +280,9 @@ disk cleanup. Progress is informational, shown once per import and cleared when 
 Expiry cleanup operates on the current entries under the mutation lock. Never compute a retained
 backlog snapshot before acquiring the write lock: a concurrent add would otherwise be erased.
 Promotion writes LTM before removing STM, so interruption leaves a duplicate rather than data loss.
+Promotion rechecks persisted source text, tags, origin and persona through the same content guard
+used by full reads, consolidation and undo. An unsafe out-of-band record stays in its original tier;
+it is not copied to durable/shared memory or removed from working memory.
 Backlog cleanup retains active items and bounded terminal history.
 
 ## Capture, injection and UI
@@ -301,8 +307,13 @@ no durable store was written, and invites a separate deliberate scoped memory ca
 matches actual user intent; it does not forbid deliberate durable curation. A session append failure
 has no durable fallback. Prompt mode remains nudge-only and off disables detection/capture. Quoted,
 fenced, peer, worker, extension-follow-up and unattributed content are not direct-user capture input.
+Leading negation such as “Never remember that …” is not stripped into a positive capture request.
+Decision extraction also rejects negation in a premise it would discard before `:`. Negative wording
+inside an affirmative fact (“Remember that I never …” or “We decided …: never …”) remains valid.
 No-cue input skips migration waits. Lifecycle/current-input/owner generations prevent stale capture
 notices; accepted notes stay with the original native owner and are never copied to a replacement session.
+Asynchronous status reads use that same owner guard: results and failures from a previous owner
+cannot replace the current owner's counts or display a stale storage warning after shutdown.
 
 Normal injection uses entry caps (8 persona/shared LTM, 4 project LTM, 5 STM, 6 backlog), plus a
 combined 2,400-token planning estimate across all memory blocks, including session notes (up to 600),
@@ -319,7 +330,9 @@ Bound and clear relay state at settlement.
 
 Wakes are display-only appendEntry plus a short toast, never sendUserMessage/triggerTurn. Acknowledged
 due reminders are not replayed. Newly due reminders are armed immediately and cancel on closure.
-Keep pending/delivered deadline identity across maintenance re-arms.
+Keep pending/delivered deadline identity across maintenance re-arms. Persistence acknowledges only
+the exact `(id, dueAtEpochMs)` shown to the user, compared under the backlog write lock; an old
+acknowledgement cannot consume a concurrent renewal. It clears that deadline, not the backlog item.
 
 Standalone cards use Persona's single `createCardFrame` implementation through the synchronous local
 `pi-persona:card-frame:v1` presentation query. Mind mirrors the small structural contract and queries
@@ -348,6 +361,15 @@ F10 and `/mind browse [memories|context|timeline]` open one native TUI inspector
 selects its timeline tab. Existing bare `/mind` and `/mind session` reports remain unchanged. RPC,
 print and JSON modes do not open custom TUI. Delegated legs do not receive the shortcut or browse
 access. Entry points require compatible Persona and the actual current native session owner.
+
+F10 obtains Persona's stateless frame through the synchronous local
+`pi-persona:inspector-frame:v1` query when opening. Both inspectors use the same width, row
+allocation, gutters and theme `border` role. Mind mirrors only the structural service contract,
+not a second painter; if the service is unavailable, opening reports a compatible-Persona/reload
+diagnostic while memory operations remain unchanged. Selection, tabs, sources, data admission and
+lifecycle remain Mind-owned. Page movement uses the actual rendered list/detail/source/help
+capacity, and narrow layouts shorten controls before hiding the selected record. The native search
+Input receives focus only during search.
 
 The inspector is a query/view layer, not a new memory engine. Its explicit `a` action launcher closes
 the overlay before opening native action/approval dialogs. Consolidation calls the existing bounded

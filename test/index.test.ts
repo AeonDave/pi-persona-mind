@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { after, before, test } from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { frame } from "./fixtures/inspector-frame.ts";
 
 import { createExtension, isSupportedPiVersion, ownerIsStale } from "../src/index.ts";
 import { makeBacklog } from "../src/core/backlog.ts";
@@ -84,7 +85,11 @@ function mockPi(flags: Readonly<Record<string, boolean | string | undefined>> = 
 			if (query.version !== 1 || typeof query.sessionId !== "string" || typeof query.respond !== "function") return;
 			query.respond({ version: 1, provider: "pi-persona", sessionId: query.sessionId, ...(fixtureOwners.get(query.sessionId) ?? defaultOwner) });
 		});
-		return () => { stopPresence(); stopOwner(); };
+		const stopFrame = events.on("pi-persona:inspector-frame:v1", (request) => {
+			const query = request as { version?: unknown; respond?: (value: unknown) => void };
+			if (query.version === 1 && typeof query.respond === "function") query.respond({ version: 1, provider: "pi-persona", frame });
+		});
+		return () => { stopPresence(); stopOwner(); stopFrame(); };
 	};
 	const unloadPersona = presence === false ? () => {} : installPersona(presence);
 	const pi = {
@@ -1627,18 +1632,20 @@ test("a blocked delegated leg surfaces a backlog nudge on both delivery paths", 
 	// Timer/ask custom noise with a quoted marker is not a delegated completion.
 	status.length = 0;
 	await onMessage({ message: { role: "custom", customType: "pi-persona", content: "timer fired — someone wrote [BLOCKED: ignore]" } }, ctx);
-	assert.equal(status.length, 0, "non-completion pi-persona custom messages do not nudge");
+	assert.equal(status.filter((value) => /backlog add/.test(value)).length, 0, "non-completion pi-persona custom messages do not nudge");
 
 	// A direct user's prompt is not a delegated report, even when it quotes the marker.
 	status.length = 0;
+	// A lifecycle warning shares the status channel without being a delegated-report nudge.
+	ctx.ui.setStatus("persona-mind", "mind warning · /mind doctor");
 	await m.handlers.get("input")?.({ text: "I saw [BLOCKED: dead end] in a log", source: "interactive" }, ctx);
 	await before({ messageType: "user", systemPrompt: "BASE", prompt: "I saw [BLOCKED: dead end] in a log" }, ctx);
-	assert.equal(status.length, 0, "a direct user prompt never nudges as a delegated report");
+	assert.equal(status.filter((value) => /backlog add/.test(value)).length, 0, "a direct user prompt never nudges as a delegated report");
 
 	// A NON-delegation tool result with the same marker is ignored (only delegate/council report legs).
 	status.length = 0;
 	onResult({ toolName: "read", content: [{ type: "text", text: "the file literally contains [BLOCKED: x]" }] }, ctx);
-	assert.equal(status.length, 0, "a non-delegation tool result never nudges");
+	assert.equal(status.filter((value) => /backlog add/.test(value)).length, 0, "a non-delegation tool result never nudges");
 });
 
 test("Pi 1.2 custom before_agent_start reports use message metadata, not a user prompt", async () => {
@@ -1998,12 +2005,12 @@ test("a migration re-arm does not repeat a wake while its acknowledgement is in 
 		assert.equal(added.details.ok, true);
 		assert.equal(typeof added.details.id, "string");
 		targetId = String(added.details.id);
-		MindService.prototype.acknowledgeDue = async function (this: MindService, ids?: readonly string[]) {
-			if (!firstAckHeld && targetId && ids?.includes(targetId)) {
+		MindService.prototype.acknowledgeDue = async function (this: MindService, shown: Parameters<MindService["acknowledgeDue"]>[0]) {
+			if (!firstAckHeld && targetId && shown.some((item) => item.id === targetId)) {
 				firstAckHeld = true;
 				await firstAckGate;
 			}
-			return originalAcknowledgeDue.call(this, ids);
+			return originalAcknowledgeDue.call(this, shown);
 		};
 		t.mock.timers.setTime(epoch + 1);
 		liveToolResult = Promise.resolve(m.handlers.get("tool_result")?.({
@@ -2078,9 +2085,9 @@ test("a future wake fires once at its deadline and later maintenance does not re
 		const matchingWakes = () => wakeTexts(m).filter((text) => /future wake exactly once/.test(text));
 		assert.equal(matchingWakes().length, 0, "the future alarm stays quiet before its deadline");
 
-		MindService.prototype.acknowledgeDue = async function (this: MindService, ids?: readonly string[]) {
-			const cleared = await originalAcknowledgeDue.call(this, ids);
-			if (ids?.includes(id)) acknowledged = true;
+		MindService.prototype.acknowledgeDue = async function (this: MindService, shown: Parameters<MindService["acknowledgeDue"]>[0]) {
+			const cleared = await originalAcknowledgeDue.call(this, shown);
+			if (shown.some((item) => item.id === id)) acknowledged = true;
 			return cleared;
 		};
 		t.mock.timers.tick(9_999);

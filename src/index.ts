@@ -36,6 +36,7 @@ import { registerMindCommands } from "./extension/mind-command.ts";
 import { createMemoryInspector } from "./extension/memory-inspector.ts";
 import { loadInspectorPage } from "./extension/inspector-data.ts";
 import { openMemoryInspector } from "./ui/memory-inspector.ts";
+import { queryInspectorFrame } from "./ui/inspector-frame.ts";
 import { createKnowledgeReview } from "./extension/knowledge-review.ts";
 import { launchMindWorker } from "./extension/mind-worker.ts";
 import { runMindInspectorActions } from "./extension/mind-actions.ts";
@@ -550,7 +551,10 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		unavailableReason: (ctx) => unavailableReason(ctx) ?? (isDelegatedLeg || !sessionMemory.isCurrent(ctx) ? "Memory inspector requires an active supervisor session owner." : undefined),
 		captureOwner: captureMemoryOwner,
 		load: (ctx, request) => loadInspectorPage(ctx, getMind(ctx), sessionMemory, request),
-		show: openMemoryInspector,
+		show: (ctx, options) => {
+			const frame = queryInspectorFrame(pi.events);
+			return openMemoryInspector(ctx, { ...options, ...(frame ? { frame } : {}) });
+		},
 		actions: (ctx, request, current) => runMindInspectorActions(ctx, request, current, { consolidate: (target) => autoOptimize.startExplicit(target), review: knowledgeReview }),
 	});
 	if (!isDelegatedLeg) pi.registerShortcut("f10", { description: "Inspect memory, sources and timeline", handler: (ctx) => inspector.open(ctx) });
@@ -678,7 +682,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 					ctx,
 					`${headline}\n${list}${more}\nReview when ready — stale leads auto-remove after ~48h; keep durable facts in long-term memory.`,
 				);
-				await mind.acknowledgeDue(due.map((item) => item.id));
+				await mind.acknowledgeDue(due.map((item) => ({ id: item.id, dueAtEpochMs: item.dueAtEpochMs! })));
 			} catch {
 				/* raced shutdown */
 			}
@@ -718,7 +722,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 							ctx,
 							`backlog due — ${compactMemoryText(live.text, MAX_WAKE_TEXT_CHARS)} (id ${live.id}). Review when ready.`,
 						);
-						await mind.acknowledgeDue([live.id]);
+						await mind.acknowledgeDue([{ id: live.id, dueAtEpochMs: live.dueAtEpochMs }]);
 					} catch (err) {
 						if (wakeCurrent(generation, nextOwnerPath)) surfaceWarning(ctx, `could not re-check due backlog item ${item.id}: ${err instanceof Error ? err.message : String(err)}`);
 					}
@@ -760,8 +764,11 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	};
 
 	const refreshStatus = async (ctx: ExtensionContext): Promise<void> => {
+		let ownerCurrent = (): boolean => false;
 		try {
+			ownerCurrent = captureMemoryOwner(ctx);
 			const s = await getMind(ctx).summary();
+			if (!ownerCurrent()) return;
 			if (warningStatusActive) {
 				setStatus(ctx, "mind warning · /mind doctor", "warning");
 				return;
@@ -770,7 +777,7 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		const label = `mind ${s.ltm}L·${s.projectLtm}P·${s.stm}S · backlog ${s.backlogOpen}`;
 			setStatus(ctx, label);
 		} catch (err) {
-			surfaceWarning(ctx, `could not refresh memory status: ${err instanceof Error ? err.message : String(err)}`);
+			if (ownerCurrent()) surfaceWarning(ctx, `could not refresh memory status: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	};
 

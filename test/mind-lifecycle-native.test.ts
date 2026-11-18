@@ -20,6 +20,62 @@ function deferred<T>() {
 	return { promise, resolve };
 }
 
+for (const lifecycle of ["persona", "shutdown"] as const) for (const outcome of ["resolved", "rejected"] as const) {
+	test(`native ${lifecycle} change suppresses a ${outcome} status read from the previous owner`, { timeout: 20_000 }, async (t) => {
+		const root = await mkdtemp(join(tmpdir(), "mind-status-lifecycle-"));
+		const entered = deferred<void>(), release = deferred<void>(), betaStatus = deferred<void>();
+		let persona = "alpha";
+		const companion: ExtensionFactory = (pi) => {
+			pi.events.on("pi-persona:companion:v1", (raw: unknown) => {
+				const query = raw as { respond(value: unknown): void };
+				query.respond({ version: 1, provider: "pi-persona", role: "supervisor", capabilities: { memory: 1, activity: 1 } });
+			});
+			pi.events.on("pi-persona:memory-owner:v1", (raw: unknown) => {
+				const query = raw as { sessionId: string; respond(value: unknown): void };
+				query.respond({ version: 1, provider: "pi-persona", sessionId: query.sessionId, ready: true, persona });
+			});
+		};
+		const h = await runtimeHarness(root, (pi) => createExtension(pi), [companion], { companion: false });
+		let pending: Promise<unknown> | undefined;
+		try {
+			const setStatus = h.ui.setStatus;
+			let betaStatuses = 0;
+			// Reconciliation refreshes before and after migration; await both so migration's
+			// progress label cannot mask a stale numeric status from the held read.
+			h.ui.setStatus = (key, text) => { setStatus(key, text); if (text === "mind 2L·0P·0S · backlog 0" && ++betaStatuses >= 2) betaStatus.resolve(); };
+			await h.bind();
+			for (const [name, texts] of [["alpha", ["Alpha stored fact."]], ["beta", ["Beta first fact.", "Beta second fact."]]] as const) {
+				const mind = new MindService(resolveScope(h.agentDir, h.cwd, { persona: name }));
+				for (const text of texts) assert.ok((await mind.remember({ term: "long", scope: "persona", kind: "note", text })).ok);
+			}
+			const summary = MindService.prototype.summary;
+			let held = false;
+			t.mock.method(MindService.prototype, "summary", async function(this: MindService) {
+				const result = await summary.call(this);
+				if (!held && this.inspectionScope().persona === "alpha") {
+					held = true; entered.resolve(); await release.promise;
+					if (outcome === "rejected") throw new Error("old owner summary read failed");
+				}
+				return result;
+			});
+			pending = h.session.extensionRunner!.emitToolResult({ type: "tool_result", toolName: "memory", toolCallId: "old-owner-read", input: { action: "recall" }, content: [], details: { ok: true }, isError: false });
+			await entered.promise;
+			if (lifecycle === "persona") {
+				persona = "beta";
+				h.eventBus.emit("pi-persona:memory-owner-changed:v1", { version: 1, provider: "pi-persona", sessionId: h.session.sessionManager.getSessionId(), ready: true, persona });
+				await betaStatus.promise;
+			} else await h.session.extensionRunner!.emit({ type: "session_shutdown", reason: "quit" });
+			const statuses = h.statuses.length, notifications = h.notifications.length;
+			release.resolve(); await pending;
+			assert.ok(!h.statuses.slice(statuses).some((text) => text.includes("1L") || text.includes("warning")), "an old read cannot replace the current owner's count or warning state");
+			assert.equal(h.notifications.length, notifications, "an old read failure cannot notify the current owner");
+			if (lifecycle === "shutdown") assert.equal(h.statuses.length, statuses, "shutdown suppresses all late status writes");
+		} finally {
+			release.resolve(); await pending?.catch(() => {}); t.mock.restoreAll(); await h.dispose(); await rm(root, { recursive: true, force: true });
+		}
+	});
+}
+
 for (const automatic of [false, true]) test(`native branch navigation cancels held ${automatic ? "automatic" : "explicit"} consolidation in the same session`, { timeout: 20_000 }, async (t) => {
 	const root = await mkdtemp(join(tmpdir(), "mind-branch-lifecycle-"));
 	const admitted = deferred<string>(), retry = deferred<string>();

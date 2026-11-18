@@ -1,8 +1,12 @@
-/** Manual provider smoke. The mind-auto-fixture provider supplies offline pipeline evidence only. */
+/**
+ * Manual provider smoke. The mind-auto-fixture provider supplies offline pipeline evidence only.
+ * Set LIVE_PROVIDER_EXTENSION to an absolute entry for extension-provided models.
+ * Credentials, model configuration and provider state stay in a disposable profile.
+ */
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
@@ -14,6 +18,8 @@ if (!modelRef?.includes("/") || !["inproc", "child"].includes(engine) || !parent
 }
 const automatic = mode === "--auto";
 const offline = modelRef.startsWith("mind-auto-fixture/");
+const providerExtension = process.env.LIVE_PROVIDER_EXTENSION?.trim();
+if (providerExtension && !isAbsolute(providerExtension)) throw new Error("LIVE_PROVIDER_EXTENSION must be an absolute extension entry path");
 const { effortSigla } = await import(pathToFileURL(join(dirname(resolve(parentEntry)), "core", "leg-thinking.ts")).href);
 const originalAgentDir = getAgentDir();
 const originalEnv = { ...process.env };
@@ -50,8 +56,13 @@ try {
 	// Persona normally runs inside Pi's CLI and re-invokes that entry for child workers. This SDK
 	// harness supplies that same entry so child mode launches Pi, not this qualification script.
 	process.argv = [process.execPath, fileURLToPath(new URL("./cli.js", import.meta.resolve("@earendil-works/pi-coding-agent")))];
-	for (const key of Object.keys(process.env)) if (/^PI_PERSONA_/i.test(key)) delete process.env[key];
+	for (const key of Object.keys(process.env)) if (/^PI_PERSONA_/i.test(key) || /^PI_CLAUDE_NATIVE_DEBUG$/i.test(key)) delete process.env[key];
 	process.env.PI_AGENT_DIR = agentDir;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	process.env.PI_CLAUDE_NATIVE_STATE_DIR = join(agentDir, "claude-native");
+	process.env.PI_CLAUDE_NATIVE_FINGERPRINT = join(agentDir, "claude-native", "fingerprint.json");
+	process.env.PI_CLAUDE_NATIVE_MODELS_CACHE = join(agentDir, "claude-native", "models.json");
+	process.env.PI_CLAUDE_NATIVE_LIVE_DISCOVERY = "0";
 	process.env.PI_PERSONA_ENGINE = engine;
 	process.env.PI_PERSONA_AGENT_MAX_MS = "120000";
 	await mkdir(join(agentDir, "persona", "agents"), { recursive: true });
@@ -63,6 +74,9 @@ try {
 	if (!offline) try {
 		const credentials = JSON.parse(await readFile(join(originalAgentDir, "auth.json"), "utf8"));
 		if (Object.hasOwn(credentials, provider)) await writeFile(join(agentDir, "auth.json"), JSON.stringify({ [provider]: credentials[provider] }), { mode: 0o600 });
+	} catch (error) { if (error?.code !== "ENOENT") throw error; }
+	if (!offline) try {
+		await writeFile(join(agentDir, "models.json"), await readFile(join(originalAgentDir, "models.json")), { mode: 0o600 });
 	} catch (error) { if (error?.code !== "ENOENT") throw error; }
 	if (offline) await writeFile(fixtureEntry, `import { fauxProvider, fauxAssistantMessage } from ${JSON.stringify(import.meta.resolve("@earendil-works/pi-ai"))};
 export function createFixture() {
@@ -98,7 +112,7 @@ export function createFixture() {
 }
 export default function(pi) { pi.registerProvider(createFixture().provider); }
 `);
-	const extensionPaths = [...(offline ? [fixtureEntry] : []), mindEntry, resolve(parentEntry)];
+	const extensionPaths = [...(providerExtension ? [providerExtension] : []), ...(offline ? [fixtureEntry] : []), mindEntry, resolve(parentEntry)];
 	await writeFile(join(agentDir, "settings.json"), JSON.stringify({ extensions: extensionPaths }));
 	await writeFile(join(agentDir, "persona", "settings.json"), JSON.stringify({ version: 1, preferences: { persist: false }, personas: {}, lastPersona: null, selectionRevision: 0 }));
 	for (const persona of ["alpha", "beta"]) await writeFile(join(agentDir, "persona", "agents", `${persona}.md`), `---\nname: ${persona}\nlabel: ${persona}\npersona: true\n---\nAn isolated memory qualification persona.\n`);
@@ -109,13 +123,11 @@ export default function(pi) { pi.registerProvider(createFixture().provider); }
 	await loader.reload();
 	assert.deepEqual(loader.getExtensions().errors, []);
 	const runtime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"),
-		modelsPath: offline ? null : join(originalAgentDir, "models.json"), modelsStorePath: join(root, "models-cache.json"), refreshOnCreate: false, allowModelNetwork: false });
+		modelsPath: offline ? null : join(agentDir, "models.json"), modelsStorePath: join(root, "models-cache.json"), refreshOnCreate: false, allowModelNetwork: false });
 	if (offline) {
 		runtime.registerNativeProvider((await import(pathToFileURL(fixtureEntry).href)).createFixture().provider);
 		await runtime.setRuntimeApiKey(provider, "synthetic-qualification-key-never-transmitted");
 	}
-	const model = runtime.getModel(provider, modelRef.slice(split + 1));
-	assert.ok(model, "Requested model is absent from the configured catalog");
 	const setupProvider = fauxProvider({ provider: "owner-smoke-setup", models: [{ id: "offline" }] });
 	setupProvider.setResponses([fauxAssistantMessage("INITIALIZED")]);
 	runtime.registerNativeProvider(setupProvider.provider);
@@ -124,6 +136,9 @@ export default function(pi) { pi.registerProvider(createFixture().provider); }
 		modelRuntime: runtime, model: setupProvider.getModel(), sessionManager: automatic ? SessionManager.create(cwd, join(root, "sessions")) : SessionManager.inMemory(cwd) });
 	session = created.session;
 	await session.bindExtensions(automatic ? { mode: "rpc", uiContext: rpcUi } : { mode: "print" });
+	// Extension providers join the runtime during session creation/binding, not loader.reload().
+	const model = runtime.getModel(provider, modelRef.slice(split + 1));
+	assert.ok(model, "Requested model is absent after extension binding; configure LIVE_PROVIDER_EXTENSION for extension-provided models");
 	// Pi's executeTool pipeline requires an assistant message; setup stays offline. The delegated
 	// worker below is provider-pinned and makes the real request being qualified.
 	await session.prompt("Initialize this isolated qualification session.");

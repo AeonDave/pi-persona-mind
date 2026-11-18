@@ -1,21 +1,28 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Text, visibleWidth } from "@earendil-works/pi-tui";
+import { Text, visibleWidth, getKeybindings, KeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import type { InspectorPage, InspectorRequest } from "../src/extension/inspector-data.ts";
-import { createMemoryInspectorComponent, memoryInspectorViewportRows, openMemoryInspector } from "../src/ui/memory-inspector.ts";
+import { createMemoryInspectorComponent, openMemoryInspector } from "../src/ui/memory-inspector.ts";
+
+import { frame } from "./fixtures/inspector-frame.ts";
 
 const theme = { fg: (_name: string, text: string) => text, bold: (text: string) => text };
 function harness(load: (request: InspectorRequest) => Promise<InspectorPage>, isCurrent = () => true, signal?: AbortSignal, renderTheme = theme, bindings?: { getKeys(action: string): string[]; matches(data: string, action: string): boolean }) {
   let doneCount = 0;
   const tui = { terminal: { rows: 24 }, requestRender() {} };
-  const kb = { getKeys: (action: string) => ({ "tui.select.up": ["up"], "tui.select.down": ["down"], "tui.select.confirm": ["enter"], "tui.select.cancel": ["escape"], "tui.select.pageUp": ["pageUp"], "tui.select.pageDown": ["pageDown"] }[action] ?? []), matches: (data: string, action: string) => ({
+  const kb = { getKeys: (action: string) => ({ "tui.select.up": ["up"], "tui.select.down": ["down"], "tui.select.confirm": ["enter"], "tui.input.submit": ["enter"], "tui.select.cancel": ["escape"], "tui.select.pageUp": ["pageUp"], "tui.select.pageDown": ["pageDown"] }[action] ?? []), matches: (data: string, action: string) => ({
     "tui.select.up": data === "UP", "tui.select.down": data === "DOWN",
-    "tui.select.confirm": data === "ENTER", "tui.select.cancel": data === "ESC",
+    "tui.input.submit": data === "\r", "tui.select.confirm": data === "ENTER", "tui.select.cancel": data === "ESC" || data === "\u001b",
     "tui.select.pageUp": data === "PGUP", "tui.select.pageDown": data === "PGDN",
     "tui.altScreen.pageUp": data === "ALT_PGUP", "tui.altScreen.pageDown": data === "ALT_PGDN",
   }[action] ?? false) };
-  const component = createMemoryInspectorComponent(tui as never, renderTheme as never, (bindings ?? kb) as never, () => { doneCount++; }, { load, isCurrent, ...(signal ? { signal } : {}) });
-  return { component, doneCount: () => doneCount, key: (s: string) => component.handleInput(s), resize: (rows: number) => { tui.terminal.rows = rows; }, render: (w = 80, rows?: number) => component.render(w, rows).join("\n") };
+  const component = createMemoryInspectorComponent(tui as never, renderTheme as never, (bindings ?? kb) as never, () => { doneCount++; }, { frame, load, isCurrent, ...(signal ? { signal } : {}) });
+  return { component, doneCount: () => doneCount, key: (s: string) => {
+    // Semantic test aliases remain outside the native editor. Real editor keys exercise
+    // Pi's own keybindings and bracketed-paste handling.
+    const searching = (component as unknown as { searching: boolean }).searching;
+    component.handleInput(searching && s === "ENTER" ? "\r" : searching && s === "ESC" ? "\u001b" : s);
+  }, resize: (rows: number) => { tui.terminal.rows = rows; }, render: (w = 80, rows?: number) => component.render(w, rows).join("\n") };
 }
 const page = (items: InspectorPage["items"], offset = 0, nextOffset?: number): InspectorPage => ({ items, total: 0, offset, ...(nextOffset === undefined ? {} : { nextOffset }), notice: "" });
 const tick = () => new Promise((resolve) => setImmediate(resolve));
@@ -31,6 +38,122 @@ test("cycles tabs, lists items, and opens then restores read-only detail", async
   assert.match(h.render(), /full body/);
   h.key("ESC");
   assert.match(h.render(), /Alpha/);
+});
+
+test("page navigation advances by visible rows without skipping unread records or text", async () => {
+  const items = Array.from({ length: 100 }, (_, i) => ({ id: String(i), title: `record-${i}`, body: Array.from({ length: 100 }, (_, j) => `line-${j}`).join("\n") }));
+  const h = harness(async () => page(items));
+  await tick();
+  const indexes = (output: string, prefix: string) => [...output.matchAll(new RegExp(`${prefix}-(\\d+)`, "g"))].map((match) => Number(match[1]));
+  for (const mode of ["list", "detail"] as const) {
+    if (mode === "detail") h.key("ENTER");
+    const prefix = mode === "list" ? "record" : "line";
+    const before = indexes(h.render(80, 21), prefix);
+    h.key("PGDN");
+    const after = indexes(h.render(80, 21), prefix);
+    assert.ok(after[0]! <= before.at(-1)! + 1, `${mode} skipped rows: ${before} -> ${after}`);
+    assert.ok(after.at(-1)! > before.at(-1)!, `${mode} did not advance`);
+  }
+});
+
+test("narrow list preserves the selected record before optional navigation chrome", async () => {
+  const h = harness(async () => page([{ id: "one", title: "DATA", body: "body" }]));
+  await tick();
+  for (const width of [10, 14, 18, 24]) for (const rows of [1, 3, 21]) assert.match(h.render(width, rows), /▸/, `selection missing at ${width}x${rows}`);
+});
+
+test("tiny detail/source/help and search reserve content before chrome", async () => {
+  for (const mode of ["detail", "source", "help", "search"]) {
+    const h = harness(async () => page([{ id: "one", title: "Record", body: "VALUE", source: { title: "Source", body: "VALUE" } }]));
+    await tick();
+    h.component.focused = true;
+    h.key(mode === "detail" ? "ENTER" : mode === "source" ? "s" : mode === "help" ? "?" : "/");
+    if (mode === "search") h.key("V");
+    for (const width of [10, 16, 30]) for (const rows of [3, 5, 7, 12]) {
+      const output = h.render(width, rows);
+      assert.match(output, mode === "help" ? /N/ : /V/, `${mode} hides its content at ${width}x${rows}`);
+    }
+    h.component.dispose();
+  }
+});
+
+test("only an active search receives native input focus", async () => {
+  const h = harness(async () => page([]));
+  await tick();
+  const input = (h.component as unknown as { searchInput: { focused: boolean } }).searchInput;
+  h.component.focused = true;
+  assert.equal(input.focused, false);
+  h.key("/"); assert.equal(input.focused, true);
+  h.key("ESC"); assert.equal(input.focused, false);
+});
+
+test("native search owns split bracketed paste before submit or cancel commands", async () => {
+  const requests: InspectorRequest[] = [];
+  const h = harness(async (request) => { requests.push(request); return page([]); }, () => true, undefined, theme, getKeybindings());
+  await tick();
+  h.component.focused = true;
+  h.key("/");
+  for (const chunk of ["\u001b[200~alpha", "\r", "\u001b", "beta\u001b[201~"]) h.component.handleInput(chunk);
+  await tick();
+  assert.equal(requests.length, 1, "paste content must neither submit nor reload");
+  assert.equal((h.component as unknown as { searchInput: { focused: boolean } }).searchInput.focused, true, "pasted Escape must not cancel search");
+  h.component.handleInput("\r");
+  await tick();
+  assert.equal(requests.length, 2);
+  assert.match(requests.at(-1)!.query, /alpha.*beta/);
+});
+
+test("search uses injected native submit/cancel bindings and restores the global manager", async () => {
+  const global = getKeybindings();
+  const bindings = new KeybindingsManager(TUI_KEYBINDINGS, { "tui.input.submit": "ctrl+g", "tui.select.cancel": "ctrl+q" });
+  const requests: InspectorRequest[] = [];
+  const h = harness(async (request) => { requests.push(request); return page([]); }, () => true, undefined, theme, bindings);
+  await tick(); h.component.focused = true; h.key("/"); h.key("query");
+  assert.match(h.render(), /Ctrl\+G apply.*Ctrl\+Q cancel/);
+  h.component.handleInput("\x07");
+  await tick();
+  assert.equal(requests.at(-1)!.query, "query");
+  assert.equal(getKeybindings(), global);
+  h.key("/"); h.component.handleInput("\x11");
+  assert.equal((h.component as unknown as { searchInput: { focused: boolean } }).searchInput.focused, false);
+  assert.equal(getKeybindings(), global);
+});
+
+test("search strips pasted terminal controls before rendering the native editor", async () => {
+  const h = harness(async () => page([]), () => true, undefined, theme, getKeybindings());
+  await tick(); h.component.focused = true; h.key("/");
+  h.component.handleInput("\u001b[200~safe\u001b]0;SPOOFED_TITLE\u0007\u001b[2Jvalue\u001b[201~");
+  const output = h.render(80, 21);
+  assert.doesNotMatch(output, /SPOOFED_TITLE|\u001b\]0;|\u001b\[2J/);
+  assert.match(output, /safevalue/);
+});
+
+test("paging detail, source and help visits every line across narrow and resized viewports", async () => {
+  const numbered = Array.from({ length: 60 }, (_, i) => `evidence-${i}`).join("\n");
+  for (const mode of ["detail", "source", "help"]) {
+    const h = harness(async () => ({ ...page([{ id: "one", title: "Evidence", body: numbered, source: { title: "Source", body: numbered } }]), notice: numbered }));
+    await tick();
+    h.key(mode === "detail" ? "ENTER" : mode === "source" ? "s" : "?");
+    const seen = new Set<number>();
+    for (let step = 0; step < 180; step++) {
+      const output = h.render(step < 20 ? 40 : 60, step < 20 ? 14 : 18);
+      for (const match of output.matchAll(/evidence-(\d+)/g)) seen.add(Number(match[1]));
+      h.key("PGDN");
+    }
+    assert.equal(seen.size, 60, `${mode} lost evidence during paging`);
+    h.component.dispose();
+  }
+});
+
+test("missing frame service refuses only the inspector before opening or loading", async () => {
+  const notifications: string[] = [];
+  let loads = 0;
+  let opens = 0;
+  await openMemoryInspector({ mode: "tui", ui: { notify: (message: string) => notifications.push(message), custom: async () => { opens++; } } } as never,
+    { load: async () => { loads++; return page([]); }, isCurrent: () => true });
+  assert.equal(loads, 0);
+  assert.equal(opens, 0);
+  assert.match(notifications[0]!, /reload a compatible pi-persona/i);
 });
 
 test("source navigation, control/ANSI sanitization, and Unicode width are safe", async () => {
@@ -167,7 +290,7 @@ test("list status shows counts, empty state, flattened notice and detailed cover
   assert.doesNotMatch(output, /second line/);
   h.key("?");
   let help = h.render(80, 12);
-  for (let i = 0; i < 4; i++) { h.key("PGDN"); help += h.render(80, 12); }
+  for (let i = 0; i < 30; i++) { h.key("PGDN"); help += h.render(80, 12); }
   assert.match(help, /second line with complete explanation/);
 });
 
@@ -201,7 +324,7 @@ test("multiline titles flatten and overlay viewport height matches host maxHeigh
   assert.doesNotMatch(h.render(), /First\nSecond/);
   assert.match(h.render(), /First Second/);
   for (const terminalRows of [1, 2, 3, 24, 60]) {
-    const viewportRows = memoryInspectorViewportRows(terminalRows);
+    const viewportRows = frame.viewportRows(terminalRows);
     assert.equal(viewportRows, Math.max(1, Math.min(Math.floor(terminalRows * 0.9), terminalRows - 2)));
     assert.ok(viewportRows <= terminalRows);
   }
@@ -214,7 +337,7 @@ test("coverage help starts at the top and scrolls through the complete multiline
   await tick(); h.key("ENTER"); h.key("PGDN"); h.render(80, 24);
   h.key("ESC"); h.key("?");
   assert.match(h.render(80, 24), /Navigation:/);
-  for (let i = 0; i < 6; i++) h.key("PGDN");
+  for (let i = 0; i < 20; i++) { h.key("PGDN"); h.render(80, 24); }
   assert.match(h.render(80, 24), /coverage detail 99/);
 });
 
@@ -277,17 +400,17 @@ test("action payload tracks actual list/detail selection and is unavailable with
   h.key("ENTER");
   const enabled = createMemoryInspectorComponent(
     { terminal: { rows: 24 }, requestRender() {} } as never, theme as never,
-    { getKeys: (action: string) => ({ "tui.select.up": ["up"], "tui.select.down": ["down"], "tui.select.confirm": ["enter"], "tui.select.cancel": ["escape"] }[action] ?? []), matches: (data: string, action: string) => ({ "tui.select.up": data === "UP", "tui.select.down": data === "DOWN", "tui.select.confirm": data === "ENTER", "tui.select.cancel": data === "ESC" }[action] ?? false) } as never,
-    () => {}, { load: async (request) => ({ ...page([{ id: "first-id", title: "First label", body: "first" }, { id: "second-id", title: "Second label", body: "second" }], request.offset, request.offset === 0 ? 20 : undefined) }), isCurrent: () => true, onAction: async () => {} },
+    { getKeys: (action: string) => ({ "tui.select.up": ["up"], "tui.select.down": ["down"], "tui.select.confirm": ["enter"], "tui.input.submit": ["enter"], "tui.select.cancel": ["escape"] }[action] ?? []), matches: (data: string, action: string) => ({ "tui.select.up": data === "UP", "tui.select.down": data === "DOWN", "tui.input.submit": data === "\r", "tui.select.confirm": data === "ENTER", "tui.select.cancel": data === "ESC" || data === "\u001b" }[action] ?? false) } as never,
+    () => {}, { frame, load: async (request) => ({ ...page([{ id: "first-id", title: "First label", body: "first" }, { id: "second-id", title: "Second label", body: "second" }], request.offset, request.offset === 0 ? 20 : undefined) }), isCurrent: () => true, onAction: async () => {} },
   );
-  await tick(); enabled.handleInput("/"); for (const char of "needle") enabled.handleInput(char); enabled.handleInput("ENTER"); await tick();
+  await tick(); enabled.handleInput("/"); for (const char of "needle") enabled.handleInput(char); enabled.handleInput("\r"); await tick();
   enabled.handleInput("\u001b[C"); await tick(); enabled.handleInput("n"); await tick();
   enabled.handleInput("DOWN"); enabled.handleInput("a");
   assert.deepEqual(enabled.takeAction(), { tab: "memories", scope: "project", query: "needle", offset: 20, selectedId: "second-id" });
   const otherTab = createMemoryInspectorComponent(
     { terminal: { rows: 24 }, requestRender() {} } as never, theme as never,
-    { getKeys: (action: string) => ({ "tui.select.up": ["up"], "tui.select.down": ["down"], "tui.select.confirm": ["enter"], "tui.select.cancel": ["escape"] }[action] ?? []), matches: (data: string, action: string) => ({ "tui.select.cancel": data === "ESC" }[action] ?? false) } as never,
-    () => {}, { load: async (request) => page([{ id: "context-id", title: "Context row", body: "body" }]), isCurrent: () => true, initialTab: "context", onAction: async () => {} },
+    { getKeys: (action: string) => ({ "tui.select.up": ["up"], "tui.select.down": ["down"], "tui.select.confirm": ["enter"], "tui.input.submit": ["enter"], "tui.select.cancel": ["escape"] }[action] ?? []), matches: (data: string, action: string) => ({ "tui.select.cancel": data === "ESC" || data === "\u001b" }[action] ?? false) } as never,
+    () => {}, { frame, load: async (request) => page([{ id: "context-id", title: "Context row", body: "body" }]), isCurrent: () => true, initialTab: "context", onAction: async () => {} },
   );
   await tick(); otherTab.handleInput("a");
   assert.equal(otherTab.takeAction(), undefined, "context and timeline tabs never expose the mutation launcher");
@@ -296,8 +419,8 @@ test("action payload tracks actual list/detail selection and is unavailable with
   assert.doesNotMatch(otherTab.render(100, 12).join("\n"), /a actions/);
   const detail = createMemoryInspectorComponent(
     { terminal: { rows: 24 }, requestRender() {} } as never, theme as never,
-    { getKeys: (action: string) => ({ "tui.select.up": ["up"], "tui.select.down": ["down"], "tui.select.confirm": ["enter"], "tui.select.cancel": ["escape"] }[action] ?? []), matches: (data: string, action: string) => ({ "tui.select.confirm": data === "ENTER" }[action] ?? false) } as never,
-    () => {}, { load: async () => page([{ id: "record-id", title: "Not the ID", body: "detail" }]), isCurrent: () => true, onAction: async () => {} },
+    { getKeys: (action: string) => ({ "tui.select.up": ["up"], "tui.select.down": ["down"], "tui.select.confirm": ["enter"], "tui.input.submit": ["enter"], "tui.select.cancel": ["escape"] }[action] ?? []), matches: (data: string, action: string) => ({ "tui.input.submit": data === "\r", "tui.select.confirm": data === "ENTER" }[action] ?? false) } as never,
+    () => {}, { frame, load: async () => page([{ id: "record-id", title: "Not the ID", body: "detail" }]), isCurrent: () => true, onAction: async () => {} },
   );
   await tick(); detail.handleInput("ENTER"); detail.handleInput("a");
   assert.deepEqual(detail.takeAction(), { tab: "memories", scope: "session", query: "", offset: 0, selectedId: "record-id" });
@@ -331,7 +454,7 @@ test("theme accents header, active tab and selected row; metadata is dim and err
   assert.match(empty.render(80, 12), /DIM\(Coverage notice/);
   const compact = harness(async () => page([{ id: "compact", title: "Compact row", body: "body" }]), () => true, undefined, spy);
   await tick();
-  assert.match(compact.render(80, 3), /ACCENT\(BOLD\(Session\)\)/, "active scope survives the narrow-height fallback");
+  assert.match(compact.render(80, 3), /Compact row/, "selected record wins the single content row");
   compact.key("/"); for (const char of "needle") compact.key(char);
   assert.match(compact.render(80, 7), /needle/, "compact search keeps its input visible");
 });
@@ -357,8 +480,9 @@ test("navigation labels fit, reverse tabs work, source return paths and help pre
     assert.ok(list.includes(hint), `missing ${hint}`);
     assert.ok(mediumList.includes(hint), `80x12 layout clipped ${hint}`);
   }
-  h.key("\\t"); await tick();
-  h.key("\\u001b[Z"); await tick();
+  h.key("\t"); await tick();
+  assert.match(h.render(), /\[Context\]/);
+  h.key("\u001b[Z"); await tick();
   assert.match(h.render(), /Memories/);
   h.key("ENTER");
   h.key("DOWN");
@@ -423,10 +547,11 @@ test("native wrapper waits for custom overlay resolution and suppresses stale or
     let doneCalled = false;
     const events: string[] = [];
     const ctx = { mode: "tui", ui: { custom: async (factory: (tui: unknown, theme: unknown, kb: unknown, done: () => void) => { handleInput(data: string): void }, _options: unknown) => {
-      component = factory({ terminal: { rows: 24 }, requestRender() {} }, theme, { matches: (data: string, action: string) => ({ "tui.select.cancel": data === "ESC" }[action] ?? false) }, () => { doneCalled = true; events.push("closed"); });
+      component = factory({ terminal: { rows: 24 }, requestRender() {} }, theme, { matches: (data: string, action: string) => ({ "tui.select.cancel": data === "ESC" || data === "\u001b" }[action] ?? false) }, () => { doneCalled = true; events.push("closed"); });
       await new Promise<void>((resolve) => { resolveCustom = resolve; });
     } } };
     const opened = openMemoryInspector(ctx as never, {
+      frame,
       load: async () => page([{ id: "actual-id", title: "label", body: "body" }]),
       isCurrent: () => current,
       ...(abort ? { signal: controller.signal } : {}),
@@ -454,7 +579,7 @@ test("open inspector configures a live overlay with the identical allocated row 
     ui: {
       custom: async (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: () => void) => typeof component, options: typeof receivedOptions) => {
         receivedOptions = options;
-        component = factory(tui, theme, { getKeys: (action: string) => ({ "tui.select.up": ["up"], "tui.select.down": ["down"], "tui.select.confirm": ["enter"], "tui.select.cancel": ["escape"] }[action] ?? []), matches: () => false }, () => {});
+        component = factory(tui, theme, { getKeys: (action: string) => ({ "tui.select.up": ["up"], "tui.select.down": ["down"], "tui.select.confirm": ["enter"], "tui.input.submit": ["enter"], "tui.select.cancel": ["escape"] }[action] ?? []), matches: () => false }, () => {});
         const overlay = receivedOptions?.overlayOptions?.();
         assert.equal(receivedOptions?.overlay, true);
         assert.equal(overlay?.width, "90%");
@@ -462,13 +587,13 @@ test("open inspector configures a live overlay with the identical allocated row 
         for (const terminalRows of [1, 2, 3, 30, 60]) {
           tui.terminal.rows = terminalRows;
           const layout: { width?: unknown; maxHeight?: number; margin?: number } | undefined = receivedOptions?.overlayOptions?.();
-          assert.equal(layout?.maxHeight, memoryInspectorViewportRows(terminalRows));
+          assert.equal(layout?.maxHeight, frame.viewportRows(terminalRows));
           assert.ok(component !== undefined);
           assert.ok(component.render(80).length <= (layout?.maxHeight ?? 0));
         }
       },
     },
   };
-  await openMemoryInspector(ctx as never, { load: async () => page([]), isCurrent: () => true });
+  await openMemoryInspector(ctx as never, { frame, load: async () => page([]), isCurrent: () => true });
   component?.dispose?.();
 });

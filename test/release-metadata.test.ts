@@ -47,7 +47,7 @@ test("the public npm package has consistent identity, companion requirements and
 	assert.equal(manifest.license, "MIT");
 	assert.equal(manifest.publishConfig.access, "public");
 	assert.equal(manifest.repository.url, "git+https://github.com/AeonDave/pi-persona-mind.git");
-	assert.equal(manifest.peerDependencies["@aeondave/pi-persona"], ">=1.18.0");
+	assert.equal(manifest.peerDependencies["@aeondave/pi-persona"], ">=1.18.1");
 	assert.equal(lock.packages[""].peerDependencies["@aeondave/pi-persona"], manifest.peerDependencies["@aeondave/pi-persona"]);
 	assert.equal(manifest.peerDependenciesMeta["@aeondave/pi-persona"].optional, true);
 	assert.equal(manifest.dependencies?.["@aeondave/pi-persona"], undefined, "installing Mind must not bundle another Persona runtime");

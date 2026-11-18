@@ -42,6 +42,24 @@ test("ignores ordinary messages with no durable cue", () => {
 	assert.equal(detectCaptureCue(""), null);
 });
 
+test("a negated persistence request is never promoted to automatic capture", () => {
+	for (const text of ["Never remember that I prefer Python.", "Never keep in mind that I prefer Python."]) {
+		const cue = detectCaptureCue(text);
+		assert.ok(cue, text);
+		assert.equal(cue.strong, false, text);
+		assert.equal(cue.candidate, text, "the negation remains part of the candidate");
+	}
+	for (const [text, candidate] of [
+		["Remember that I never use Python.", "I never use Python."],
+		["Always remember that I never use Python.", "I never use Python."],
+	] as const) {
+		const cue = detectCaptureCue(text);
+		assert.ok(cue, text);
+		assert.equal(cue.strong, true, text);
+		assert.equal(cue.candidate, candidate);
+	}
+});
+
 test("the snippet is the relevant sentence, length-capped", () => {
 	const long = `unrelated preamble. remember that ${"x".repeat(400)} matters. trailing stuff.`;
 	const cue = detectCaptureCue(long);
@@ -108,6 +126,32 @@ test("mentioning a durable convention is not mistaken for making a decision", ()
 		const cue = detectCaptureCue(text);
 		assert.ok(cue, "the phrase may remain a review candidate");
 		assert.equal(cue.strong, false, "an observation about a decision is not an automatic durable decision");
+	}
+});
+
+test("a negated decision is not captured as an adopted convention", () => {
+	for (const text of [
+		"We never adopted a permanent convention: use Python.",
+		"We have not adopted a permanent convention: use Python.",
+		"We haven't adopted a permanent convention: use Python.",
+		"We decided not to adopt a permanent convention: use Python.",
+		"Abbiamo deciso di non adottare una convenzione permanente: usare Python.",
+	]) {
+		const cue = detectCaptureCue(text);
+		assert.ok(cue, text);
+		assert.equal(cue.strong, false, text);
+		assert.equal(cue.candidate, text, "negated adoption must not become a positive fact after the colon");
+	}
+	for (const [text, candidate] of [
+		["We decided on a permanent convention: never use Python.", "never use Python."],
+		["We adopted a permanent convention to never use Python.", "We adopted a permanent convention to never use Python."],
+		["We decided not to adopt a permanent convention.", "We decided not to adopt a permanent convention."],
+		["Abbiamo adottato una convenzione permanente: non usare Python.", "non usare Python."],
+	] as const) {
+		const cue = detectCaptureCue(text);
+		assert.ok(cue, text);
+		assert.equal(cue.strong, true, text);
+		assert.equal(cue.candidate, candidate, "the adopted fact may itself contain a negation");
 	}
 });
 

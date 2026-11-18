@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.9.1) - 2026-11-18
+
+- Require pi-persona 1.18.1 or later for the shared F9/F10 inspector frame.
+
+- Recheck the live memory file under the recovery lock before restoring a backup, preserving facts
+  committed by another writer while recovery was waiting.
+- Preserve negated capture requests: “Never remember that …” no longer creates a positive session
+  note; negated decision premises are retained instead of discarded before `:`. Affirmative requests
+  whose fact contains negative wording, such as “Remember that I never …”, remain valid.
+- Acknowledge backlog reminders by both ID and the displayed deadline, preserving concurrent
+  rescheduling instead of silently consuming the new reminder.
+- Recheck persisted memory content before promotion through the shared content guard. Unsafe
+  out-of-band records cannot move into durable/shared memory, and refusal preserves both stores.
+- Suppress late status counts and storage warnings after persona changes or shutdown, using the
+  same accepting-owner guard as other asynchronous memory operations.
+- Simplify the README around memory lifetimes, retrieval, F10 and deliberate maintenance, with
+  technical details linked to the design contract.
+- Share Persona's F9 window frame in F10, including responsive dimensions, gutters and theme
+  border. Page navigation follows the visible content without gaps; narrow windows preserve the
+  selected record and search focus belongs only to the active native input.
+
 ## [0.9.0](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.9.0) - 2026-11-13
 
 - Require pi-persona 1.18.0 or later for this release. Mind custom entries use the shared

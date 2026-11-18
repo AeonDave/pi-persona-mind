@@ -1,6 +1,6 @@
 /** Bounded write-ahead before images. Missing/corrupt history is never repaired to empty. */
-import { isExpired, memoryContentKey, validateMemory, type MemoryEntry } from "./memory.ts";
-import { isOptimizeTarget, MAX_OPTIMIZE_OPERATIONS, MAX_OPTIMIZE_SOURCES, samePersistedMemory, safeOptimizeMemory, type OptimizeChange, type OptimizeFailure, type OptimizeTarget } from "./optimize.ts";
+import { isExpired, isSafeMemoryContent, memoryContentKey, validateMemory, type MemoryEntry } from "./memory.ts";
+import { isOptimizeTarget, MAX_OPTIMIZE_OPERATIONS, MAX_OPTIMIZE_SOURCES, samePersistedMemory, type OptimizeChange, type OptimizeFailure, type OptimizeTarget } from "./optimize.ts";
 import { JsonStore, withFileLock } from "./store.ts";
 
 export const MAX_OPTIMIZE_HISTORY = 32;
@@ -84,7 +84,7 @@ export function restoreReceipt(entries: readonly MemoryEntry[], receipt: Optimiz
 	if (receipt.state === "undone" || receipt.state === "rejected") return { ok: false, reason: "receipt was already undone or its replacement was rejected" };
 	const before = receipt.changes.flatMap((change) => change.before);
 	const after = receipt.changes.map((change) => change.after);
-	if ([...before, ...after].some((entry) => !safeOptimizeMemory(entry))) return { ok: false, reason: "receipt contains unsafe memory content" };
+	if ([...before, ...after].some((entry) => !isSafeMemoryContent(entry))) return { ok: false, reason: "receipt contains unsafe memory content" };
 	if ((receipt.target === "project" || receipt.target === "project-long") && [...before, ...after].some((entry) => entry.persona !== persona)) return { ok: false, reason: "receipt contains foreign or unowned project facts" };
 	if ([...before, ...after].some((entry) => isExpired(entry, now))) return { ok: false, reason: "receipt contains expired sources; undo cannot revive expired memory" };
 	const selected = new Set<MemoryEntry>();

@@ -11,6 +11,7 @@
 
 import { compatibleContentIds, contentId } from "./ids.ts";
 import { rankMemoryEntries } from "./retrieval.ts";
+import { scanContent } from "./scanner.ts";
 
 export const MEMORY_KINDS = ["objective", "invariant", "preference", "convention", "gotcha", "rationale", "note"] as const;
 export type MemoryKind = (typeof MEMORY_KINDS)[number];
@@ -72,6 +73,11 @@ export interface MemoryEntry {
 	source?: string;
 	/** Optional ids of the entries this fact was distilled from (an intra-store citation graph). */
 	derivedFrom?: string[];
+}
+
+/** All persisted model-visible fields are untrusted, including tags and human-citable origins. */
+export function isSafeMemoryContent(entry: MemoryEntry): boolean {
+	return [entry.text, ...entry.tags, entry.source ?? "", entry.persona ?? ""].every((text) => scanContent(text).ok);
 }
 
 export interface MemoryInput {

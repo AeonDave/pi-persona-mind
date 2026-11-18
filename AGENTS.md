@@ -93,6 +93,10 @@ coupled through a versioned local companion handshake to
   Reuse maintenance admission/accounting; interrupted reviews never earn automatic retries.
 - For `pi-persona:card-frame:v1`, custom-entry renderers pass their original entry object as optional
   `expansionKey`; Persona owns click/keyboard synchronization. Mind must not duplicate interaction state.
+- F10 queries `pi-persona:inspector-frame:v1` on opening and uses Persona's geometry/painter;
+  do not duplicate its frame or fall back to another styling implementation. Missing service affects
+  only opening the inspector. Page keys use actual rendered content capacity; native search Input
+  receives focus only while searching. Keep owner revocation and close-before-action safeguards.
 - Rotate completed automatic review over older records/pages; account for actual byte admission,
   preserve newest-fact inclusion, and never mark stopped/interrupted work as completed. No unbounded
   sweeper. Optimizer receipts precede replacement and persist at most 32/2MiB per target; unresolved

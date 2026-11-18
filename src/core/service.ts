@@ -18,7 +18,7 @@ import { readMemory, memoryTargets, type MemoryReadResult, type MemoryReadScope 
 import { MemoryOptimizer } from "./optimize-service.ts";
 import { samePersistedMemory } from "./optimize.ts";
 import type { MemoryEntry, MemoryInput, MemoryKind } from "./memory.ts";
-import { clampRecallMax, isExpired, isMemoryId, makeMemory, memoryContentKey, memoryIdMatches, promoteToLong, pruneExpired, recall, sameMemoryContent, supersedeTargets, upsertMemory, validateLongMemory, validateShortMemory, MAX_MEMORY_DERIVED_IDS, MAX_MEMORY_ID_CHARS, MAX_MEMORY_SOURCE_CHARS, MAX_MEMORY_TAGS, MAX_MEMORY_TAG_CHARS, MAX_MEMORY_TEXT_CHARS } from "./memory.ts";
+import { clampRecallMax, isExpired, isMemoryId, isSafeMemoryContent, makeMemory, memoryContentKey, memoryIdMatches, promoteToLong, pruneExpired, recall, sameMemoryContent, supersedeTargets, upsertMemory, validateLongMemory, validateShortMemory, MAX_MEMORY_DERIVED_IDS, MAX_MEMORY_ID_CHARS, MAX_MEMORY_SOURCE_CHARS, MAX_MEMORY_TAGS, MAX_MEMORY_TAG_CHARS, MAX_MEMORY_TEXT_CHARS } from "./memory.ts";
 import { scanContent } from "./scanner.ts";
 import { memoryMutationLockPath, type Scope } from "./scope.ts";
 import { JsonStore, type JsonStoreOptions, withFileLock } from "./store.ts";
@@ -290,7 +290,7 @@ export class MindService {
 					// Same contract as `forget`: a handle that addresses more than one fact retires none of
 					// them, and the caller is told so rather than silently getting a partial write. Read under
 					// the mutation lock every writer holds, so the answer cannot go stale before the update.
-					// The pool is the one `forget` resolves against — ALL THREE memory tiers, not just the one
+					// The pool is the one `forget` resolves against — all durable/working stores, not just the one
 					// being written: a v1 comma-joined id can name a durable fact in `shared` and another in
 					// `ltm`, and a per-store check would still let the write destroy whichever copy sits in the
 					// target tier while the delete path refuses the identical handle.
@@ -323,6 +323,7 @@ export class MindService {
 				if (matches.length !== 1) return { ok: false, reason: "source missing or ambiguous" } as const;
 				const found = matches[0]!;
 				if (isExpired(found, this.now()) || found.persona !== this.scope.persona) return { ok: false, reason: "source expired or belongs to another persona" } as const;
+				if (!isSafeMemoryContent(found)) return { ok: false, reason: "source contains unsafe memory content; promotion refused" } as const;
 				const promoted = promoteToLong(found, this.now());
 				if (target === "project") promoted.persona = this.scope.persona;
 				const destination = target === "project" ? this.projectLtm : target === "shared" ? this.shared : this.ltm;
@@ -562,15 +563,16 @@ export class MindService {
 		return { stmRemoved, backlogRemoved };
 	}
 
-	/** Clear dueAt on still-open items after a wake was shown, so the alarm does not re-nag. */
-	async acknowledgeDue(ids?: readonly string[]): Promise<number> {
-		const wanted = ids && ids.length > 0 ? new Set(ids) : undefined;
+	/** Acknowledge only the shown deadline; a concurrent renewal must keep its new alarm. */
+	async acknowledgeDue(shown: readonly { id: string; dueAtEpochMs: number }[]): Promise<number> {
+		if (shown.length === 0) return 0;
+		const wanted = new Map(shown.map((item) => [item.id, item.dueAtEpochMs]));
 		let cleared = 0;
 		try {
 			await this.backlog.update((es) =>
 				es.map((e) => {
 					if (e.dueAtEpochMs === undefined) return e;
-					if (wanted && !wanted.has(e.id)) return e;
+					if (wanted.get(e.id) !== e.dueAtEpochMs) return e;
 					if (e.state !== "open" && e.state !== "taken") return e;
 					cleared++;
 					const next = { ...e };

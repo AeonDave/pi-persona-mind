@@ -64,6 +64,9 @@ test("native automatic optimization coalesces saves, preserves history and appli
 	try {
 		h = await runtimeHarness(root, entry, [worker.factory]);
 		await h.bind();
+		// Lifecycle diagnostics share this UI channel but are not optimization toasts.
+		// Inject one explicitly so the assertion remains deterministic on fast hosts too.
+		h.ui.notify("[pi-persona-mind] memory injection exceeded 750ms and was skipped for this turn", "warning");
 		h.session.setActiveToolsByName(["memory"]);
 		h.faux.setResponses([
 			fauxAssistantMessage(notes.map((text) => fauxToolCall("memory", { action: "remember", term: "long", scope: "persona", kind: "convention", text })), { stopReason: "toolUse" }),
@@ -94,7 +97,7 @@ test("native automatic optimization coalesces saves, preserves history and appli
 		const history = await new MindService(scope).createOptimizer().history("persona");
 		assert.equal(history.ok, true);
 		if (history.ok) assert.equal(history.receipts.filter((receipt) => receipt.state === "applied").length, 1, "one durable applied receipt remains available for history and undo");
-		assert.deepEqual(h.notifications, ["mind · persona · 1 replacement applied"], "automatic success has exactly one informative toast");
+		assert.deepEqual(h.notifications.filter((message) => message.startsWith("mind · ")), ["mind · persona · 1 replacement applied"], "automatic success has exactly one optimization toast, with no duplicate, attention or update toast");
 		assert.equal(h.faux.state.callCount, 2, "maintenance never wakes the main model");
 	} finally { await h?.dispose(); await rm(root, { recursive: true, force: true }); }
 });

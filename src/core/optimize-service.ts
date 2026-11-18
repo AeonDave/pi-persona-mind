@@ -1,10 +1,10 @@
 /** Session-local staged plans over strict one-file memory snapshots. No model calls or hidden jobs. */
 import { randomUUID } from "node:crypto";
-import { isExpired, MAX_RECALL_QUERY_CHARS, type MemoryEntry } from "./memory.ts";
+import { isExpired, isSafeMemoryContent, MAX_RECALL_QUERY_CHARS, type MemoryEntry } from "./memory.ts";
 import { MAX_OPTIMIZE_HISTORY, MAX_OPTIMIZE_HISTORY_BYTES, OptimizeHistoryStore, restoreReceipt, type OptimizeHistory, type OptimizeReceipt, type OptimizeUndone } from "./optimize-history.ts";
 import {
 	isOptimizeTarget, MAX_OPTIMIZE_ENTRIES, MAX_OPTIMIZE_PLANS, OPTIMIZE_PLAN_TTL_MS,
-	optimizeCandidates, planConsolidation, safeOptimizeMemory,
+	optimizeCandidates, planConsolidation,
 	type OptimizeApplied, type OptimizeFailure, type OptimizeInspection, type OptimizeInspectOptions,
 	type OptimizePlan, type OptimizePreviewInput, type OptimizeTarget,
 } from "./optimize.ts";
@@ -48,7 +48,7 @@ export class MemoryOptimizer {
 			const snapshot = await this.options.stores[target].inspectStrict();
 			const active = snapshot.store.entries.filter((entry) => !isExpired(entry, this.now()));
 			const query = options.query?.trim().toLowerCase();
-			const eligible = active.filter((entry) => safeOptimizeMemory(entry) && (!query || `${entry.text} ${entry.tags.join(" ")}`.toLowerCase().includes(query)));
+			const eligible = active.filter((entry) => isSafeMemoryContent(entry) && (!query || `${entry.text} ${entry.tags.join(" ")}`.toLowerCase().includes(query)));
 			const max = options.max === undefined || !Number.isFinite(options.max) ? 20 : Math.max(1, Math.min(MAX_OPTIMIZE_ENTRIES, Math.floor(options.max)));
 			const entries = eligible.slice().sort((a, b) => Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt) || a.id.localeCompare(b.id)).slice(offset, offset + max);
 			const nextOffset = offset + entries.length;
@@ -133,7 +133,7 @@ export class MemoryOptimizer {
 		try {
 			const storePath = this.options.stores[target].filePath;
 			const all = (await this.historyStore(target).read()).filter((receipt) => receipt.target === target && receipt.storePath === storePath && receipt.persona === this.options.persona);
-			const safe = all.filter((receipt) => receipt.changes.every((change) => [...change.before, change.after].every(safeOptimizeMemory)));
+			const safe = all.filter((receipt) => receipt.changes.every((change) => [...change.before, change.after].every(isSafeMemoryContent)));
 			const receipts = safe.slice().reverse().slice(0, Math.min(MAX_OPTIMIZE_HISTORY, Math.floor(max)));
 			return { ok: true, target, receipts, retained: all.length, omitted: safe.length - receipts.length, withheldUnsafe: all.length - safe.length, limit: MAX_OPTIMIZE_HISTORY, maxBytes: MAX_OPTIMIZE_HISTORY_BYTES };
 		} catch (error) { return failure(error); }

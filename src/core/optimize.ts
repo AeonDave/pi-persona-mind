@@ -1,10 +1,9 @@
 /** Explicit memory consolidation rules. Similarity discovers candidates; it never authorizes edits. */
 import {
-	isExpired, isMemoryId, makeMemory, memoryContentKey, MEMORY_KINDS,
+	isExpired, isMemoryId, isSafeMemoryContent, makeMemory, memoryContentKey, MEMORY_KINDS,
 	MAX_MEMORY_DERIVED_IDS, MAX_MEMORY_SOURCE_CHARS, MAX_MEMORY_TAGS, MAX_MEMORY_TAG_CHARS, MAX_MEMORY_TEXT_CHARS,
 	validateMemory, type MemoryEntry, type MemoryKind,
 } from "./memory.ts";
-import { scanContent } from "./scanner.ts";
 
 export type OptimizeTarget = "project" | "project-long" | "persona" | "shared";
 export interface OptimizeOperation { sourceIds: string[]; kind: MemoryKind; text: string; tags?: string[]; source?: string }
@@ -33,11 +32,6 @@ export const OPTIMIZE_PLAN_TTL_MS = 10 * 60_000;
 
 export function isOptimizeTarget(value: unknown): value is OptimizeTarget {
 	return value === "project" || value === "project-long" || value === "persona" || value === "shared";
-}
-
-/** All persisted model-visible fields are untrusted, including tags and human-citable origins. */
-export function safeOptimizeMemory(entry: MemoryEntry): boolean {
-	return [entry.text, ...entry.tags, entry.source ?? "", entry.persona ?? ""].every((text) => scanContent(text).ok);
 }
 
 function terms(text: string): Set<string> {
@@ -90,7 +84,7 @@ export function planConsolidation(entries: readonly MemoryEntry[], operations: r
 			if (selected.has(entry)) return { ok: false, reason: "source IDs overlap within or between operations" };
 			if (isExpired(entry, now)) return { ok: false, reason: `source ${id} expired; inspect again` };
 			if ((target === "project" || target === "project-long") && entry.persona !== persona) return { ok: false, reason: `source ${id} belongs to a different or unowned persona` };
-			if (!safeOptimizeMemory(entry)) return { ok: false, reason: `source ${id} contains unsafe stored content` };
+			if (!isSafeMemoryContent(entry)) return { ok: false, reason: `source ${id} contains unsafe stored content` };
 			selected.add(entry); before.push(entry);
 		}
 		if (before.some((entry) => entry.persona !== before[0]!.persona)) return { ok: false, reason: "consolidation cannot mix persona ownership markers" };
@@ -118,7 +112,7 @@ export function planConsolidation(entries: readonly MemoryEntry[], operations: r
 		if ((after.source?.length ?? 0) > MAX_MEMORY_SOURCE_CHARS) return { ok: false, reason: "combined source provenance exceeds memory bounds; split the operation" };
 		const normalizedAfter = validateMemory(after);
 		if (!normalizedAfter) return { ok: false, reason: "replacement metadata exceeds memory schema bounds" };
-		if (!safeOptimizeMemory(normalizedAfter)) return { ok: false, reason: "replacement content, tags or source rejected by content scanner" };
+		if (!isSafeMemoryContent(normalizedAfter)) return { ok: false, reason: "replacement content, tags or source rejected by content scanner" };
 		changes.push({ before, after: normalizedAfter });
 	}
 	const effectiveChanges = changes.filter((change) => change.before.length !== 1 || !samePersistedMemory(change.before[0]!, change.after));
