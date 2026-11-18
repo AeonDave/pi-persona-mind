@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.9.2](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.9.2) - 2026-11-18
+
+- F10 divides its title, content and keys with the same rules as F9, and its key legend uses the
+  same glyphs for the plain keys (`↑↓`, `⏎`, `esc`). The margin above and below the content comes
+  from the shared inspector frame of pi-persona 1.19.0; with 1.18.1 the window keeps its previous
+  height.
+
 ## [0.9.1](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.9.1) - 2026-11-18
 
 - Require pi-persona 1.18.1 or later for the shared F9/F10 inspector frame.

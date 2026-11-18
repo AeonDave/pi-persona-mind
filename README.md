@@ -1,7 +1,7 @@
 <h1 align="center">pi-persona-mind</h1>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v0.9.1/assets/banner.png" alt="pi-persona-mind — durable memory for Pi">
+  <img src="https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v0.9.2/assets/banner.png" alt="pi-persona-mind — durable memory for Pi">
 </p>
 
 [![CI](https://github.com/AeonDave/pi-persona-mind/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/AeonDave/pi-persona-mind/actions/workflows/test.yml)
@@ -25,7 +25,7 @@ knowledge reviews use the current session model and incur model usage.
 
 ## Quick start
 
-Mind 0.9.1 requires **Pi 1.5.2**, **Node.js 22.19.0+**, and
+Mind 0.9.2 requires **Pi 1.5.2**, **Node.js 22.19.0+**, and
 [**pi-persona 1.18.1+**](https://github.com/AeonDave/pi-persona) loaded in the same instance.
 
 ```bash

@@ -364,12 +364,13 @@ test("F10 matches F9 content gutters and separates header, records and navigatio
   const h = harness(async () => ({ ...page([{ id: "spacing", title: "First record", body: "Full record text", source: { title: "Recorded source", body: "Original source text" } }]), total: 1, notice: "Bounded coverage" }));
   await tick();
   const blank = (line: string | undefined) => /^│ +│$/.test(line ?? "");
+  const rule = (line: string | undefined) => /^│  ─+  │$/.test(line ?? "");
   const frame = () => {
     const rows = h.component.render(80, 24);
     for (const row of rows.slice(1, -1)) assert.match(row, /^│  .*  │$/, "F9 Text padding plus frame padding gives two-column gutters");
     for (const row of rows) assert.equal(visibleWidth(row), 80);
     assert.ok(rows.length <= 24);
-    assert.ok(blank(rows[2]), "one blank row after the title, as in F9");
+    assert.ok(rule(rows[2]), "one rule after the title, as in F9");
     return rows;
   };
   const list = frame();
@@ -378,12 +379,12 @@ test("F10 matches F9 content gutters and separates header, records and navigatio
   const selected = list.findIndex((row) => row.includes("▸ First record"));
   assert.ok(blank(list[selected - 1]), "separate the metadata header from records");
   const listFooter = list.findIndex((row) => row.includes("Tab / Shift+Tab tabs"));
-  assert.ok(blank(list[listFooter - 1]), "separate records from navigation");
+  assert.ok(rule(list[listFooter - 1]), "a rule separates records from navigation, as in F9");
   for (const key of ["ENTER", "s", "?"]) {
     h.key(key);
     const rows = frame();
-    const footer = rows.findIndex((row) => row.includes("Up/Down scroll"));
-    assert.ok(blank(rows[footer - 1]), "detail, source and help keep a footer gutter");
+    const footer = rows.findIndex((row) => row.includes("↑↓ scroll"));
+    assert.ok(rule(rows[footer - 1]), "detail, source and help keep a ruled footer");
   }
 });
 
@@ -436,7 +437,7 @@ test("theme accents header, active tab and selected row; metadata is dim and err
   assert.match(output, /ACCENT\(BOLD\(Memory inspector\)\)/);
   assert.match(output, /ACCENT\(.*Memories.*\)/);
   assert.match(output, /ACCENT\(▸ Selected/);
-  assert.match(output, /DIM\(.*Up\/Down select/);
+  assert.match(output, /DIM\(.*↑↓ select/);
   assert.match(output, /ACCENT\(BOLD\(Session\)\)/, "active scope is accent and bold inside the full scope strip");
   assert.ok(output.includes("DIM(  [source])"));
   const missing = harness(async () => page([{ id: "missing", title: "Missing source", body: "record" }]), () => true, undefined, spy);
@@ -466,7 +467,7 @@ test("mid-detail scroll shows both range indicators and keeps the complete back/
   const output = h.render(80, 12);
   assert.match(output, /▲ .*lines above/);
   assert.match(output, /▼ .*lines below/);
-  assert.match(output, /Esc back · F10 close/);
+  assert.match(output, /esc back · F10 close/);
   assert.ok(output.split("\n").length <= 12);
 });
 
@@ -476,7 +477,7 @@ test("navigation labels fit, reverse tabs work, source return paths and help pre
   await tick();
   const list = h.render(80, 24);
   const mediumList = h.render(80, 12);
-  for (const hint of ["Tab", "Shift+Tab", "Memories", "Context", "Timeline", "Up/Down select", "Enter open", "Esc/F10 close", "←/→ scope", "/ search", "s source", "n/p result pages", "Tab switch clears search"]) {
+  for (const hint of ["Tab", "Shift+Tab", "Memories", "Context", "Timeline", "↑↓ select", "⏎ open", "esc/F10 close", "←/→ scope", "/ search", "s source", "n/p result pages", "Tab switch clears search"]) {
     assert.ok(list.includes(hint), `missing ${hint}`);
     assert.ok(mediumList.includes(hint), `80x12 layout clipped ${hint}`);
   }

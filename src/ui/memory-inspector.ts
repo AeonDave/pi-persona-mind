@@ -242,17 +242,21 @@ export class MemoryInspectorComponent implements Component, Focusable {
     const accent = (value: string) => t.fg("accent", fit(value));
     const key = (action: "tui.select.up" | "tui.select.down" | "tui.select.confirm" | "tui.input.submit" | "tui.select.cancel" | "tui.select.pageUp" | "tui.select.pageDown") => {
       const names = this.keybindings.getKeys(action);
-      return names.length ? names.map((name) => name.replace(/^pageUp$/i, "PgUp").replace(/^pageDown$/i, "PgDn").replace(/^escape$/i, "Esc").replace(/^return$/i, "Enter").replace(/(^|[+])([a-z])/g, (_match, prefix: string, letter: string) => `${prefix}${letter.toUpperCase()}`)).join("/") : "unbound";
+      // Plain Enter/Escape use the F9 legend's glyphs; a chorded or remapped key keeps its name.
+      return names.length ? names.map((name) => /^(?:enter|return)$/i.test(name) ? "⏎" : /^escape$/i.test(name) ? "esc" : name.replace(/^pageUp$/i, "PgUp").replace(/^pageDown$/i, "PgDn").replace(/^escape$/i, "Esc").replace(/^return$/i, "Enter").replace(/(^|[+])([a-z])/g, (_match, prefix: string, letter: string) => `${prefix}${letter.toUpperCase()}`)).join("/") : "unbound";
     };
     const pair = (left: "tui.select.up" | "tui.select.down" | "tui.select.pageUp" | "tui.select.pageDown", right: "tui.select.up" | "tui.select.down" | "tui.select.pageUp" | "tui.select.pageDown") => {
       const first = key(left);
       const second = key(right);
+      if (first === "Up" && second === "Down") return "↑↓";
       return first === "unbound" || second === "unbound" ? "unbound" : `${first}/${second}`;
     };
     const selected = this.page?.items[this.selected];
     const status = this.loading ? dim("Loading…") : this.error ? t.fg("error", fit(oneLine(this.error))) : undefined;
     const result: string[] = [];
     const footer = (parts: string[]) => wrapTextWithAnsi(parts.join(" · "), safeWidth).map(dim);
+    // Title, content and keys are divided the way F9 divides them.
+    const rule = () => dim("─".repeat(safeWidth));
     if (this.view === "list") {
       this.listCapacity = 1;
       const compactItems = this.page?.items ?? [];
@@ -261,10 +265,10 @@ export class MemoryInspectorComponent implements Component, Focusable {
       if (this.searching) {
         this.searchInput.focused = this.focused;
         if (rows >= 3) result.push(accent(t.bold("Memory inspector")));
-        if (rows >= 7) result.push("");
+        if (rows >= 7) result.push(rule());
         if (rows >= 4) result.push(this.tab === "memories" ? `${dim("Scope: ")}${activeScope}` : activeScope);
         result.push(this.searchInput.render(safeWidth)[0] ?? "/");
-        if (rows >= 7) result.push("");
+        if (rows >= 7) result.push(rule());
         if (rows >= 2) result.push(dim(`${key("tui.input.submit")} apply · ${key("tui.select.cancel")} cancel`));
         return result.slice(0, rows).map(fit);
       }
@@ -310,10 +314,10 @@ export class MemoryInspectorComponent implements Component, Focusable {
       if (this.page?.nextOffset !== undefined || this.offsets.length > 1) optional.push("n/p result pages");
       let footers = [footer(["Tab / Shift+Tab tabs", ...optional.slice(0, 2)]), footer([`${pair("tui.select.up", "tui.select.down")} select`, `${key("tui.select.confirm")} open`, ...optional.slice(2, 4)]), footer(["? help", `${key("tui.select.cancel")}/F10 close`, ...optional.slice(4)])].flat();
       if (rows - result.length - footers.length < 1) footers = [dim(`? help · ${key("tui.select.cancel")}/F10 close`)];
-      // Spend whitespace only when at least one record still fits. Match F9's
-      // title/content/footer separation rather than crowding the frame chrome.
+      // Spend separator rows only when at least one record still fits. Match F9's
+      // title/content/keys division rather than crowding the frame chrome.
       const spaced = rows - result.length - footers.length >= 4;
-      if (spaced) { result.splice(1, 0, ""); result.push(""); }
+      if (spaced) { result.splice(1, 0, rule()); result.push(""); }
       const capacity = Math.max(0, rows - result.length - footers.length - Number(spaced));
       this.listCapacity = Math.max(1, capacity);
       const maxStart = Math.max(0, items.length - capacity);
@@ -327,7 +331,7 @@ export class MemoryInspectorComponent implements Component, Focusable {
         const rendered = i === this.selected ? `${accent(line)}${marker ? dim(marker) : ""}` : `${fit(line)}${marker ? dim(marker) : ""}`;
         result.push(truncateToWidth(rendered, safeWidth));
       }
-      if (spaced) result.push("");
+      if (spaced) result.push(rule());
       result.push(...footers);
     } else {
       let breadcrumb: string;
@@ -392,7 +396,7 @@ export class MemoryInspectorComponent implements Component, Focusable {
         footers = rows - result.length - indicatorRows >= 2 ? [dim(`${key("tui.select.cancel")} back · F10 close`)] : [];
       }
       const spaced = rows - result.length - footers.length - indicatorRows >= 3;
-      if (spaced) result.push("");
+      if (spaced) result.push(rule());
       const capacity = Math.max(0, rows - result.length - footers.length - indicatorRows - Number(spaced));
       this.detailCapacity = Math.max(1, capacity);
       const maxStart = Math.max(0, displayWrapped.length - capacity);
@@ -401,7 +405,7 @@ export class MemoryInspectorComponent implements Component, Focusable {
       if (indicatorRows && start > 0) result.push(dim(`▲ ${start} lines above`));
       result.push(...displayWrapped.slice(start, start + capacity).map((line, index) => start + index === missingSourceIndex ? t.fg("warning", fit(line)) : this.view === "help" ? dim(line) : fit(line)));
       if (indicatorRows && start + capacity < displayWrapped.length) result.push(dim(`▼ ${displayWrapped.length - start - capacity} lines below`));
-      if (spaced) result.push("");
+      if (spaced) result.push(rule());
       result.push(...footers);
     }
     return result.slice(0, rows).map(fit);
