@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Offline qualification against an explicitly installed Pi 1.5.2 host.
+ * Offline qualification against an explicitly installed Pi 1.6.0 host.
  * All profiles, sessions, fixtures, and writes are isolated under a fresh OS-temp root.
  *
  * Usage:
@@ -24,7 +24,7 @@ if (!hostArg || !isAbsolute(hostArg)) {
 const hostRoot = resolve(hostArg);
 const hostPackage = JSON.parse(await readFile(join(hostRoot, "package.json"), "utf8"));
 assert.equal(hostPackage.name, "@earendil-works/pi-coding-agent");
-assert.equal(hostPackage.version, "1.5.2", `Expected Pi 1.5.2, found ${hostPackage.version}`);
+assert.equal(hostPackage.version, "1.6.0", `Expected Pi 1.6.0, found ${hostPackage.version}`);
 assert.equal(typeof hostPackage.main, "string", "The selected host must declare its SDK entry");
 const hostEntryURL = pathToFileURL(join(hostRoot, hostPackage.main)).href;
 
@@ -52,7 +52,7 @@ const personaDir = join(agentDir, "persona", "agents");
 const projectDir = join(workspace, ".pi");
 const projectAgentsDir = join(projectDir, "agents");
 const extensionPaths = [mindEntry, ...(parentEntry ? [parentEntry] : [])];
-const hostProbeEntry = join(tempRoot, "pi152-host-identity-probe.ts");
+const hostProbeEntry = join(tempRoot, "pi160-host-identity-probe.ts");
 const loaderExtensionPaths = [...extensionPaths, hostProbeEntry];
 let session;
 let fetchBefore;
@@ -188,7 +188,7 @@ try {
 
 	const host = await import(hostEntryURL);
 	const faux = await import("@earendil-works/pi-ai/providers/faux");
-	assert.equal(host.VERSION, "1.5.2");
+	assert.equal(host.VERSION, "1.6.0");
 
 	const settingsManager = host.SettingsManager.inMemory({ retry: { enabled: false }, compaction: { enabled: false } });
 	const resourceLoader = new host.DefaultResourceLoader({
@@ -246,12 +246,12 @@ try {
 	const identityProbe = sessionManager.getEntries().find((entry) => entry.type === "custom" && entry.customType === "mind-host-identity-probe");
 	assert.ok(identityProbe, "The installed host loader did not execute the identity probe extension");
 	const identityProbeJson = JSON.stringify(identityProbe).replaceAll("\\\\", "/");
-	mustContain(identityProbeJson, '"version":"1.5.2"', "installed-host extension import probe");
+	mustContain(identityProbeJson, '"version":"1.6.0"', "installed-host extension import probe");
 	mustContain(identityProbeJson, agentDir.replaceAll("\\", "/"), "installed-host extension profile probe");
 
 	const hasParent = Boolean(parentEntry);
 	const activeTools = ["memory", "backlog", ...(hasParent ? ["delegate"] : [])];
-	assert.ok(activeTools.every((name) => session.getAllTools().some((tool) => tool.name === name)), "Expected Mind/parent tools did not register in Pi 1.5.2");
+	assert.ok(activeTools.every((name) => session.getAllTools().some((tool) => tool.name === name)), "Expected Mind/parent tools did not register in Pi 1.6.0");
 	session.setActiveToolsByName(activeTools);
 
 	// Activate alpha through the real parent command so Mind follows the actual marker contract.
@@ -432,8 +432,8 @@ try {
 	assert.equal(fetchRequests, 0, "Outbound fetch tripwire fired");
 	report.status = "PASS";
 	report.checks = {
-		installedPi152Loader: true,
-		installedExtensionApiVersion: "1.5.2",
+		installedPi160Loader: true,
+		installedExtensionApiVersion: "1.6.0",
 		directHumanMemoryInjected: true,
 		customReportNoContamination: true,
 		blockedHintOccurrences: blockedHints.length,

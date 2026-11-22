@@ -21,34 +21,58 @@ export interface RetrievalRank<T> {
 	textTerms: string[];
 	tagTerms: string[];
 	pathMatches: string[];
+	/** Matched query terms that used a weaker identifier/vowel-accent bridge. */
+	normalizedTerms: string[];
 }
 
 function compareStrings(a: string, b: string): number {
 	return a < b ? -1 : a > b ? 1 : 0;
 }
 
-const TOKEN_SEGMENTS = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+|[\p{L}\p{N}]+/gu;
-const EAST_ASIAN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+const TOKEN_SEGMENTS = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+|[vV]?\d+(?:\.\d+)+(?:-[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)*)?(?:\+[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)*)?|[\p{L}\p{N}]+/gu;
+const EAST_ASIAN_START = /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+const LATIN = /^\p{Script=Latin}+$/u;
 
 function words(value: string): string[] {
-	const segments = value.toLowerCase().match(TOKEN_SEGMENTS) ?? [];
-	return segments.flatMap((segment) => {
+	const segments = value.normalize("NFC").match(TOKEN_SEGMENTS) ?? [];
+	const result: string[] = [];
+	for (const segment of segments) {
+		if (!EAST_ASIAN_START.test(segment)) { result.push(segment); continue; }
 		const chars = [...segment];
-		if (chars.length < 2 || !EAST_ASIAN.test(chars[0] ?? "")) return [segment];
-		const bigrams: string[] = [];
-		for (let index = 0; index < chars.length - 1; index++) bigrams.push(`${chars[index]}${chars[index + 1]}`);
-		return bigrams;
-	});
+		if (chars.length < 2) { result.push(segment); continue; }
+		for (let index = 0; index < chars.length - 1; index++) result.push(`${chars[index]}${chars[index + 1]}`);
+	}
+	return result;
 }
 
-function queryTerms(query: string): string[] {
+/** Fold vowel diacritics only: consonants such as ñ stay distinct (año must not match ano). */
+function foldVowels(value: string): string {
+	if (/^[\x00-\x7f]*$/.test(value)) return value;
+	return value.normalize("NFD").replace(/([aeiouy])[\u0300-\u036f]+/g, "$1").normalize("NFC");
+}
+
+function components(word: string): string[] {
+	// Numeric identifiers/hashes/versions are exact atoms, never word-expansion sources.
+	if (/\p{N}/u.test(word) || /^[a-f\d]{8,}$/i.test(word)) return [word.toLowerCase()];
+	if (/^[\x00-\x7f]*$/.test(word)) {
+		return word.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/([A-Z])([A-Z][a-z])/g, "$1 $2").toLowerCase().split(" ");
+	}
+	return word.replace(/(\p{Ll})(\p{Lu})/gu, (match, a: string, b: string) => LATIN.test(match) ? `${a} ${b}` : match)
+		.replace(/(\p{Lu})(\p{Lu}\p{Ll})/gu, (match, a: string, b: string) => LATIN.test(match) ? `${a} ${b}` : match)
+		.split(" ").map((part) => foldVowels(part.toLowerCase()));
+}
+
+interface QueryTerm { original: string; components: readonly string[] }
+
+function queryTerms(query: string): QueryTerm[] {
 	const seen = new Set<string>();
-	const result: string[] = [];
-	for (const term of words(query.slice(0, QUERY_MAX_CHARS))) {
+	const result: QueryTerm[] = [];
+	for (const word of words(query.slice(0, QUERY_MAX_CHARS))) {
+		const term = word.toLowerCase();
 		if (STOP_WORDS.has(term) && !NEGATION_AND_EXCEPTION.has(term)) continue;
 		if (seen.has(term)) continue;
 		seen.add(term);
-		result.push(term);
+		result.push({ original: term, components: components(word) });
 	}
 	return result;
 }
@@ -64,16 +88,40 @@ function entryPathMatches(entry: RetrievalSource, paths: readonly string[]): str
 	return paths.filter((path) => content.includes(path));
 }
 
-function rankItem<T extends RetrievalSource>(entry: T, terms: readonly string[], paths: readonly string[]): RetrievalRank<T> {
-	const textWords = new Set(words(entry.text));
-	const tagWords = new Set((entry.tags ?? []).flatMap(words));
-	const textTerms = terms.filter((term) => textWords.has(term));
-	const tagTerms = terms.filter((term) => !textWords.has(term) && tagWords.has(term));
+function vocabulary(value: string): { exact: ReadonlySet<string>; normalized: ReadonlySet<string> } {
+	const exact = new Set<string>();
+	const normalized = new Set<string>();
+	for (const word of new Set(words(value))) {
+		exact.add(word.toLowerCase());
+		for (const part of components(word)) normalized.add(part);
+	}
+	return { exact, normalized };
+}
+
+function rankItem<T extends RetrievalSource>(entry: T, terms: readonly QueryTerm[], paths: readonly string[]): RetrievalRank<T> {
+	if (terms.length === 0) {
+		const pathMatches = entryPathMatches(entry, paths);
+		return { entry, score: pathMatches.length * 12, textTerms: [], tagTerms: [], pathMatches, normalizedTerms: [] };
+	}
+	const textWords = vocabulary(entry.text);
+	const tagWords = vocabulary((entry.tags ?? []).join(" "));
+	const textTerms: string[] = [];
+	const tagTerms: string[] = [];
+	const normalizedTerms: string[] = [];
+	let lexicalScore = 0;
+	for (const { original, components: parts } of terms) {
+		const negation = NEGATION_AND_EXCEPTION.has(original);
+		if (textWords.exact.has(original)) { textTerms.push(original); lexicalScore += negation ? 4 : 3; }
+		else if (tagWords.exact.has(original)) { tagTerms.push(original); lexicalScore += negation ? 3 : 2; }
+		else if (parts.every((part) => textWords.normalized.has(part))) {
+			textTerms.push(original); normalizedTerms.push(original); lexicalScore += 1;
+		} else if (parts.every((part) => tagWords.normalized.has(part))) {
+			tagTerms.push(original); normalizedTerms.push(original); lexicalScore += 0.75;
+		}
+	}
 	const pathMatches = entryPathMatches(entry, paths);
-	const textScore = textTerms.reduce((sum, term) => sum + (NEGATION_AND_EXCEPTION.has(term) ? 4 : 3), 0);
-	const tagScore = tagTerms.reduce((sum, term) => sum + (NEGATION_AND_EXCEPTION.has(term) ? 3 : 2), 0);
-	const score = textScore + tagScore + pathMatches.length * 12;
-	return { entry, score, textTerms, tagTerms, pathMatches };
+	const score = lexicalScore + pathMatches.length * 12;
+	return { entry, score, textTerms, tagTerms, pathMatches, normalizedTerms };
 }
 
 /** Rank generic text/tag entries; optional ties are resolved by the supplied domain comparator. */

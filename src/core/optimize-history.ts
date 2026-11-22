@@ -1,13 +1,12 @@
 /** Bounded write-ahead before images. Missing/corrupt history is never repaired to empty. */
 import { isExpired, isSafeMemoryContent, memoryContentKey, validateMemory, type MemoryEntry } from "./memory.ts";
 import { isOptimizeTarget, MAX_OPTIMIZE_OPERATIONS, MAX_OPTIMIZE_SOURCES, samePersistedMemory, type OptimizeChange, type OptimizeFailure, type OptimizeTarget } from "./optimize.ts";
-import { JsonStore, withFileLock } from "./store.ts";
+import { JsonStore, StoreConflictError, withFileLock } from "./store.ts";
 
 export const MAX_OPTIMIZE_HISTORY = 32;
 export const MAX_OPTIMIZE_HISTORY_BYTES = 2 * 1024 * 1024;
-export interface OptimizeReceipt {
+interface ReceiptBase {
 	receiptId: string;
-	planId: string;
 	target: OptimizeTarget;
 	persona: string;
 	createdAt: string;
@@ -16,18 +15,29 @@ export interface OptimizeReceipt {
 	storePath: string;
 	changes: OptimizeChange[];
 }
+/** Missing origin is the existing persisted optimizer contract, never an ordinary replacement. */
+export type OptimizeReceipt = ReceiptBase & (
+	| { origin?: "optimization"; planId: string }
+	| { origin: "replacement"; planId?: never }
+);
 export interface OptimizeHistory {
 	ok: true; target: OptimizeTarget; receipts: OptimizeReceipt[]; retained: number; omitted: number;
 	limit: number; maxBytes: number; withheldUnsafe: number;
 }
 export interface OptimizeUndone { ok: true; receiptId: string; target: OptimizeTarget; restored: number; warning?: string }
+export interface OptimizeReceiptDetail { ok: true; target: OptimizeTarget; receipt: OptimizeReceipt }
 
 function validateReceipt(raw: unknown): OptimizeReceipt | null {
 	if (!raw || typeof raw !== "object") return null;
 	const value = raw as Partial<OptimizeReceipt>;
-	if (![value.receiptId, value.planId].every((id) => typeof id === "string" && /^[\da-f-]{36}$/i.test(id))) return null;
+	const validId = (id: unknown) => typeof id === "string" && /^[\da-f-]{36}$/i.test(id);
+	if (!validId(value.receiptId)) return null;
+	if (value.origin === "replacement" ? value.planId !== undefined : !validId(value.planId) || value.origin !== undefined && value.origin !== "optimization") return null;
 	if (!isOptimizeTarget(value.target) || typeof value.persona !== "string" || !value.persona || value.persona.length > 128) return null;
-	if (typeof value.createdAt !== "string" || !Number.isFinite(Date.parse(value.createdAt))) return null;
+	// Writers use Date.toISOString(). Bound before parsing so metadata cannot expand discovery output.
+	if (typeof value.createdAt !== "string" || value.createdAt.length > 27) return null;
+	const createdAt = Date.parse(value.createdAt);
+	if (!Number.isFinite(createdAt) || new Date(createdAt).toISOString() !== value.createdAt) return null;
 	if (!["prepared", "applied", "undone", "rejected"].includes(value.state ?? "")) return null;
 	if (typeof value.storePath !== "string" || value.storePath.length > 32_768 || !value.storePath) return null;
 	if (!Array.isArray(value.changes) || !value.changes.length || value.changes.length > MAX_OPTIMIZE_OPERATIONS) return null;
@@ -45,8 +55,9 @@ function validateReceipt(raw: unknown): OptimizeReceipt | null {
 		if (!after || replacementIds.has(after.id)) return null;
 		replacementIds.add(after.id); changes.push({ before, after });
 	}
-	return { receiptId: value.receiptId!, planId: value.planId!, target: value.target, persona: value.persona, createdAt: value.createdAt,
+	const receipt: ReceiptBase = { receiptId: value.receiptId!, target: value.target, persona: value.persona, createdAt: value.createdAt,
 		state: value.state!, storePath: value.storePath, changes };
+	return value.origin === "replacement" ? { ...receipt, origin: "replacement" } : { ...receipt, origin: "optimization", planId: value.planId! };
 }
 
 /** Strict CAS avoids JsonStore.update's recovery semantics, which are unsuitable for recovery logs. */
@@ -76,11 +87,42 @@ export class OptimizeHistoryStore {
 		if (!snapshot.store.entries.some((receipt) => receipt.receiptId === receiptId)) throw new Error("optimizer recovery receipt disappeared; history requires repair");
 		await this.store.compareAndUpdate(snapshot.fingerprint, (entries) => entries.map((receipt) => receipt.receiptId === receiptId ? { ...receipt, state } : receipt));
 	}
+
+	/** Caller owns the memory transaction lock. Both writers share this write-ahead/CAS protocol. */
+	async commit(store: JsonStore<MemoryEntry>, fingerprint: string, receipt: OptimizeReceipt | undefined,
+		mutate: (entries: MemoryEntry[]) => MemoryEntry[], assertCurrent: () => void = () => {}): Promise<{ entries: MemoryEntry[]; warning?: string }> {
+		return this.exclusive(async () => {
+			assertCurrent();
+			if ((await store.inspectStrict()).fingerprint !== fingerprint) throw new StoreConflictError();
+			if (receipt) await this.prepare(receipt);
+			let callbackRejected = false;
+			let entries: MemoryEntry[];
+			try {
+				entries = (await store.compareAndUpdate(fingerprint, (current) => {
+					try { assertCurrent(); return mutate(current); }
+					catch (error) { callbackRejected = true; throw error; }
+				})).entries;
+			} catch (error) {
+				// Generic IO errors can follow rename: never discard the only before image.
+				if (receipt) {
+					if (callbackRejected || error instanceof StoreConflictError) await this.settle(receipt.receiptId, "rejected").catch(() => {});
+					else throw new Error(`memory replacement outcome uncertain; durable receipt ${receipt.receiptId} remains prepared: ${error instanceof Error ? error.message : "storage failure"}`);
+				}
+				throw error;
+			}
+			if (receipt) {
+				try { await this.settle(receipt.receiptId, "applied"); }
+				catch { return { entries, warning: "replacement committed; durable receipt remains prepared because history finalization failed" }; }
+			}
+			return { entries };
+		});
+	}
 }
 
 /** Revert only exact affected rows, never a whole historical snapshot. */
 export function restoreReceipt(entries: readonly MemoryEntry[], receipt: OptimizeReceipt, persona: string, now: number): { ok: true; entries: MemoryEntry[]; restored: number } | OptimizeFailure {
 	if (receipt.persona !== persona) return { ok: false, reason: "receipt belongs to a different persona owner" };
+	if (receipt.origin === "replacement") return { ok: false, reason: "ordinary replacement history is read-only; optimizer undo is unavailable for this receipt" };
 	if (receipt.state === "undone" || receipt.state === "rejected") return { ok: false, reason: "receipt was already undone or its replacement was rejected" };
 	const before = receipt.changes.flatMap((change) => change.before);
 	const after = receipt.changes.map((change) => change.after);

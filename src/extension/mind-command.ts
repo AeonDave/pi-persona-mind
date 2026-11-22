@@ -7,13 +7,17 @@ import type { Scope } from "../core/scope.ts";
 import type { MindService } from "../core/service.ts";
 import type { SessionMemory } from "../session-memory.ts";
 import type { MemoryOptimizer } from "../core/optimize-service.ts";
-import { formatOptimizeApplied, formatOptimizeFailure, formatOptimizeHistory, formatOptimizeInspection, formatOptimizePlan, formatOptimizeUndone } from "../tools/memory-optimize.ts";
+import { formatOptimizeApplied, formatOptimizeFailure, formatOptimizeInspection, formatOptimizePlan, formatOptimizeUndone } from "../tools/memory-optimize.ts";
 import { isOptimizeTarget } from "../core/optimize.ts";
 import { runMindActivity } from "./activity.ts";
 import type { MindActivityRunner } from "./activity.ts";
 import type { InspectorTab } from "./inspector-data.ts";
 import type { ReviewTarget } from "../core/knowledge-review.ts";
 import type { createKnowledgeReview } from "./knowledge-review.ts";
+import type { HandoffInput } from "../core/handoff.ts";
+import { runHandoff } from "./handoff.ts";
+import { formatHandoffResult, validateHandoffInput } from "../tools/memory-handoff.ts";
+import { formatMemoryHistory, runMemoryHistory } from "../tools/memory-history.ts";
 
 export type MindOptimizeTarget = "project" | "project-long" | "persona" | "shared";
 
@@ -29,6 +33,8 @@ export type MindCommand =
 	| { type: "reset" }
 	| { type: "migrate-persona" }
 	| { type: "session" }
+	| { type: "handoff"; input: HandoffInput }
+	| { type: "history"; target?: MindOptimizeTarget; receiptId?: string; offset?: number }
 	| { type: "optimize-run"; target?: Exclude<MindOptimizeTarget, "shared"> }
 	| { type: "optimize-shared-refused" }
 	| { type: "optimize-inspect"; target: MindOptimizeTarget }
@@ -40,7 +46,7 @@ export type MindCommand =
 	| { type: "invalid"; message: string };
 
 const USAGE =
-	"usage: /persona-mind [help|browse [memories|context|timeline]|timeline|review [project|project-long|persona|show|apply|discard]|doctor|session|reset [workspace]|migrate-persona|optimize [all|project|project-long|persona]|optimize inspect [project|project-long|persona|shared]|optimize show <planId>|optimize apply <planId>|optimize history [target]|optimize undo <receiptId> [target]|optimize auto [status|on|off]]";
+	"usage: /persona-mind [help|browse|review|doctor|session|handoff list|show <id>|complete <id> <revision> <resolution>|forget <id> <revision>|history [target]|history show <receiptId> <target> [offset]|reset|migrate-persona|optimize]";
 
 export interface MindCommandDeps {
 	agentDir: string;
@@ -105,6 +111,8 @@ export function registerMindCommands(pi: ExtensionAPI, deps: MindCommandDeps): v
 				"/mind review show|apply|discard — inspect the proposal, approve guarded corrections, or cancel/discard; retirement findings are recommendations only",
 				"/persona-mind doctor — inspect store health and migration warnings",
 				"/persona-mind session — list notes on this active session branch",
+				"/mind handoff list|show <id>|complete <id> <revision> <resolution>|forget <id> <revision> — explicit project handoffs; save through memory action=handoff",
+				"/mind history [target] | history show <receiptId> <target> [offset] — inspect retained memory receipts",
 				"/persona-mind reset [workspace] — clear this project's short-term memory and backlog",
 				"/persona-mind migrate-persona — explicitly import an ambiguous historical persona alias",
 				"/persona-mind optimize [all|project|project-long|persona] — bare/all reviews each allowed tier in one bounded sequential pass; a named tier stays single-target",
@@ -115,6 +123,24 @@ export function registerMindCommands(pi: ExtensionAPI, deps: MindCommandDeps): v
 				"/mind is an alias. Explicit review bypasses automatic gates but not worker/busy/owner safeguards; it reports bounded coverage and applies only validated CAS plans. Automatic review remains idle-gated.",
 			].join("\n");
 			publish(ctx, deps, "pi-persona-mind help", body, "Command reference is in the expandable card.");
+			return;
+		}
+		if (command.type === "handoff") {
+			if (deps.isDelegatedLeg) { ctx.ui.notify("Handoffs require an active supervisor session.", "warning"); return; }
+			const ownerCurrent = captureSessionOwner(deps, ctx);
+			const scope = deps.resolveScope(ctx);
+			const current = () => { try { return ownerCurrent() && sameScope(scope, deps.resolveScope(ctx)); } catch { return false; } };
+			const result = await runHandoff(ctx, scope, current, command.input);
+			if (!current()) { ctx.ui.notify("Memory owner changed; inspect the original scope before retrying.", "warning"); return; }
+			publish(ctx, deps, "Project handoff", formatHandoffResult(result), result.ok ? "Project handoff is in the expandable card." : "Project handoff was refused; see the expandable card.", result.ok ? "info" : "warning");
+			return;
+		}
+		if (command.type === "history") {
+			const active = captureOptimizer(deps, ctx);
+			if (!active || !optimizerIsCurrent(deps, ctx, active.optimizer, active.ownerCurrent)) { ctx.ui.notify("Memory owner unavailable.", "warning"); return; }
+			const formatted = await runMemoryHistory(active.optimizer, { ...(command.target === undefined ? {} : { target: command.target }), ...(command.receiptId === undefined ? {} : { receiptId: command.receiptId }), ...(command.offset === undefined ? {} : { offset: command.offset }) });
+			if (!optimizerIsCurrent(deps, ctx, active.optimizer, active.ownerCurrent)) { ctx.ui.notify("Memory owner changed; history was withheld.", "warning"); return; }
+			publish(ctx, deps, "Memory history", formatted.content[0]?.text ?? "No result.");
 			return;
 		}
 		if (command.type === "optimize-shared-refused") {
@@ -175,7 +201,7 @@ export function registerMindCommands(pi: ExtensionAPI, deps: MindCommandDeps): v
 			const formatted = command.type === "optimize-history"
 				? await runMindActivity(deps.activity?.(ctx), "inspect", command.target, async () => {
 					const result = await active.optimizer.history(command.target);
-					return result.ok ? formatOptimizeHistory(result) : formatOptimizeFailure(result);
+					return result.ok ? formatMemoryHistory(result) : formatOptimizeFailure(result);
 				}, (result) => result.details.ok === true)
 				: await runMindActivity(deps.activity?.(ctx), "apply", command.target, async () => {
 					const result = await active.optimizer.undo(command.receiptId, command.target);
@@ -356,7 +382,26 @@ function sameScope(left: Scope, right: Scope): boolean {
 export function parseMindCommand(args: string): MindCommand {
 	if (typeof args !== "string") return { type: "invalid", message: USAGE };
 	const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
+	const original = args.trim().split(/\s+/).filter(Boolean);
 	if (parts.length === 0) return { type: "snapshot" };
+	if (parts[0] === "handoff") {
+		let input: unknown;
+		if (parts.length === 2 && parts[1] === "list") input = { operation: "list" };
+		else if (parts.length === 3 && parts[1] === "show") input = { operation: "read", id: original[2] };
+		else if (parts.length === 4 && parts[1] === "forget") input = { operation: "forget", id: original[2], revision: Number(original[3]) };
+		else if (parts.length >= 5 && parts[1] === "complete") input = { operation: "complete", id: original[2], revision: Number(original[3]), resolution: original.slice(4).join(" ") };
+		return validateHandoffInput(input) ? { type: "handoff", input } : { type: "invalid", message: USAGE };
+	}
+	if (parts[0] === "history") {
+		if (parts.length === 1) return { type: "history" };
+		if (parts.length === 2 && isOptimizeTarget(parts[1])) return { type: "history", target: parts[1] };
+		if ((parts.length === 4 || parts.length === 5) && parts[1] === "show" && isPlanId(original[2]) && isOptimizeTarget(parts[3])) {
+			const offset = parts.length === 5 ? Number(original[4]) : undefined;
+			if (offset !== undefined && (!Number.isSafeInteger(offset) || offset < 0)) return { type: "invalid", message: USAGE };
+			return { type: "history", receiptId: original[2], target: parts[3], ...(offset === undefined ? {} : { offset }) };
+		}
+		return { type: "invalid", message: USAGE };
+	}
 	if (parts.length === 1 && parts[0] === "help") return { type: "help" };
 	if (parts[0] === "review") {
 		if (parts.length === 1) return { type: "review" };

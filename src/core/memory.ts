@@ -210,6 +210,13 @@ export function upsertMemory(entries: readonly MemoryEntry[], entry: MemoryEntry
 	const merged: MemoryEntry = existing
 		? { ...entry, id: existing.id, recordedAt: existing.recordedAt, lastSeenAt: entry.recordedAt }
 		: entry;
+	// A repeated observation renews the fact, not its origin. Keep omitted provenance without
+	// inheriting lifetime/owner fields, and do not replay its historical supersedes retirement.
+	if (existing) {
+		if (entry.source === undefined && existing.source !== undefined) merged.source = existing.source;
+		if (entry.derivedFrom === undefined && existing.derivedFrom !== undefined) merged.derivedFrom = [...existing.derivedFrom];
+		if (entry.supersedes === undefined && existing.supersedes !== undefined) merged.supersedes = existing.supersedes;
+	}
 	// Retire the previous copy under the SAME semantic key it was found by, never by its id: an id
 	// carried over from a migrated store can be shared with an unrelated fact, and dropping every
 	// entry holding it would erase that fact too.

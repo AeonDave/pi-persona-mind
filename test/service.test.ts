@@ -341,6 +341,36 @@ test("remember refuses an ambiguous supersedes id instead of retiring two distin
 	assert.deepEqual(remaining.hits.map((e) => e.tags.join("|")).sort(), ["a,b", "a|b"], "both durable memories survive, and nothing was written");
 });
 
+test("remember refuses supersedes outside its destination without changing either store", async () => {
+	for (const source of ["short", "shared", "persona"] as const) {
+		const scope = scopeFor(`supersedes-outside-${source}`, "elite");
+		const mind = new MindService(scope, { now: () => 1_000_000 });
+		const old = await mind.remember(source === "short"
+			? { term: "short", kind: "note", text: "Project uses Node 20" }
+			: { term: "long", scope: source, kind: "note", text: "Project uses Node 20" });
+		assert.ok(old.ok);
+		const oldPath = source === "short" ? scope.paths.stm : source === "shared" ? scope.paths.shared : scope.paths.ltm;
+		const before = await readFile(oldPath, "utf8");
+		const result = await mind.remember({ term: "long", scope: "project", kind: "note", text: "Project uses Node 22", supersedes: old.entry.id });
+		assert.equal(result.ok, false, "a replacement must not leave its named old fact active elsewhere");
+		if (!result.ok) assert.match(result.reason, /supersedes.*outside.*destination/i);
+		assert.equal(await readFile(oldPath, "utf8"), before);
+		assert.equal(existsSync(scope.paths.projectLtm), false, "the refused replacement must not create its destination");
+		assert.deepEqual((await mind.recall("Node", "both", 10)).hits.map((entry) => entry.text), ["Project uses Node 20"]);
+	}
+});
+
+test("remember supersedes stays local when the same fact also exists in another tier", async () => {
+	const mind = svc("supersedes-local-copy", "elite", 1_000_000);
+	const old = await mind.remember({ term: "long", scope: "project", kind: "note", text: "old fact" });
+	assert.ok(old.ok);
+	assert.ok((await mind.remember({ term: "long", scope: "shared", kind: "note", text: "old fact" })).ok);
+	assert.ok((await mind.remember({ term: "long", scope: "project", kind: "note", text: "old fact", supersedes: old.entry.id })).ok, "self-supersession still deduplicates");
+	assert.ok((await mind.remember({ term: "long", scope: "project", kind: "note", text: "new fact", supersedes: old.entry.id })).ok);
+	assert.deepEqual((await mind.recall("", "project", 10)).hits.map((entry) => entry.text), ["new fact"]);
+	assert.deepEqual((await mind.recall("", "shared", 10)).hits.map((entry) => entry.text), ["old fact"], "the other scope is never implicitly deleted");
+});
+
 test("remember refuses an ambiguous supersedes that spans two tiers, exactly as forget does", async () => {
 	// The colliding pair need not sit in one file: `forget` resolves an id across ltm ⊕ shared ⊕ stm and
 	// refuses, so a per-store check on the write path would still let the handle destroy the copy that

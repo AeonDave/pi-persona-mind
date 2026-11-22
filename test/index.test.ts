@@ -14,9 +14,37 @@ import { contentId, legacyContentId } from "../src/core/ids.ts";
 import { makeMemory } from "../src/core/memory.ts";
 import { mindPaths, projectSlug, sanitizePersona } from "../src/core/scope.ts";
 import { MindService } from "../src/core/service.ts";
+import { HandoffStore } from "../src/core/handoff-store.ts";
 import { SESSION_NOTE_ENTRY_TYPE } from "../src/core/session-memory.ts";
 
 type WakeStateForTest = Awaited<ReturnType<MindService["backlogList"]>>;
+
+test("handoff ownership survives ordinary appends but is revoked by branch navigation", async () => {
+	const cwd = join(dir, "handoff-owner", "project");
+	const manager = SessionManager.inMemory(cwd);
+	const ctx = { ...ctxFor(cwd), sessionManager: manager };
+	const m = mockPi({}, () => manager);
+	createExtension(m.pi, { agentDir: join(dir, "handoff-owner", "agent") });
+	await m.handlers.get("session_start")?.({}, ctx);
+	let captured: (() => boolean) | undefined;
+	let ready!: () => void; const started = new Promise<void>((resolve) => { ready = resolve; });
+	let release!: () => void; const blocked = new Promise<void>((resolve) => { release = resolve; });
+	const original = HandoffStore.prototype.execute;
+	HandoffStore.prototype.execute = async function (owner) {
+		captured = owner.isCurrent; ready(); await blocked;
+		return { ok: true, operation: "list", entries: [], total: 0 };
+	};
+	try {
+		const pending = m.tools.get("memory")!.execute("handoff", { action: "handoff", handoff: { operation: "list" } }, undefined, undefined, ctx);
+		await started;
+		manager.appendCustomEntry("ordinary-status", { value: "progress" });
+		assert.equal(captured?.(), true, "ordinary appended status is not branch navigation");
+		await m.handlers.get("session_tree")?.({}, ctx);
+		assert.equal(captured?.(), false, "old operation is revoked even if the manager and persona are unchanged");
+		release();
+		assert.equal((await pending).details.ok, false, "no stale content is returned after navigation");
+	} finally { release(); HandoffStore.prototype.execute = original; await m.handlers.get("session_shutdown")?.({}, ctx); }
+});
 
 // A minimal ExtensionAPI stand-in that records what the factory wires up and lets tests drive it.
 interface ToolLike {
@@ -161,14 +189,16 @@ after(async () => {
 	await rm(dir, { recursive: true, force: true });
 });
 
-test("the Pi host floor comparison requires stable 1.5.2 or newer releases", () => {
+test("the Pi host floor comparison requires stable 1.6.0 or newer releases", () => {
 	assert.equal(isSupportedPiVersion("0.99.9"), false);
 	assert.equal(isSupportedPiVersion("1.4.9"), false);
 	assert.equal(isSupportedPiVersion("1.5.1"), false);
-	assert.equal(isSupportedPiVersion("1.5.2-rc.1"), false);
-	assert.equal(isSupportedPiVersion("1.5.2"), true);
-	assert.equal(isSupportedPiVersion("1.5.2+host.1"), true);
-	assert.equal(isSupportedPiVersion("1.5.3-alpha.1"), true);
+	assert.equal(isSupportedPiVersion("1.5.2"), false);
+	assert.equal(isSupportedPiVersion("1.5.3-alpha.1"), false);
+	assert.equal(isSupportedPiVersion("1.6.0-rc.1"), false);
+	assert.equal(isSupportedPiVersion("1.6.0"), true);
+	assert.equal(isSupportedPiVersion("1.6.0+host.1"), true);
+	assert.equal(isSupportedPiVersion("1.6.1-alpha.1"), true);
 	assert.equal(isSupportedPiVersion("2.0.0"), true);
 	assert.equal(isSupportedPiVersion("unknown"), false);
 	assert.equal(isSupportedPiVersion("01.0.0"), false);
@@ -955,7 +985,7 @@ test("/mind reset workspace is the same as /mind reset", async () => {
 	assert.ok(notices.some((n) => /Cleared this workspace/i.test(n)));
 });
 
-test("/mind reset all refuses to wipe long-term identity", async () => {
+test("/mind reset all refuses to wipe long-term identity", async (t) => {
 	const m = mockPi();
 	const notices: string[] = [];
 	createExtension(m.pi, { agentDir: join(dir, "reset-all", "agent") });
@@ -963,7 +993,10 @@ test("/mind reset all refuses to wipe long-term identity", async () => {
 		...ctxFor(join(dir, "reset-all", "proj")),
 		ui: { setStatus: () => {}, notify: (message: string) => notices.push(message), theme: { fg: (_c: string, s: string) => s } },
 	};
-	await m.tools.get("memory")?.execute("t1", { action: "remember", term: "long", scope: "persona", kind: "preference", text: "keep me" }, undefined, undefined, ctx);
+	await m.handlers.get("session_start")?.({}, ctx);
+	t.after(async () => { await m.handlers.get("session_shutdown")?.({}, ctx); });
+	const stored = await m.tools.get("memory")?.execute("t1", { action: "remember", term: "long", scope: "persona", kind: "preference", text: "keep me" }, undefined, undefined, ctx);
+	assert.equal(stored?.details.ok, true);
 	await m.commands.get("mind")?.handler("reset all", ctx);
 	assert.ok(notices.some((n) => /Long-term persona identity is not workspace-scoped/i.test(n)));
 	const long = await m.tools.get("memory")?.execute("r", { action: "recall", scope: "long" }, undefined, undefined, ctx);
@@ -1194,12 +1227,14 @@ test("a later direct input supersedes an earlier pending capture notice", async 
 	await m.handlers.get("session_shutdown")?.({}, ctx);
 });
 
-test("a remembered fact is injected into the next turn's system prompt", async () => {
+test("a remembered fact is injected into the next turn's system prompt", async (t) => {
 	const m = mockPi();
 	const agentDir = join(dir, "inject", "agent");
 	createExtension(m.pi, { agentDir });
 	const cwd = join(dir, "inject", "proj");
 	const ctx = ctxFor(cwd);
+	await m.handlers.get("session_start")?.({}, ctx);
+	t.after(async () => { await m.handlers.get("session_shutdown")?.({}, ctx); });
 
 	const memory = m.tools.get("memory");
 	assert.ok(memory);
@@ -1282,14 +1317,17 @@ test("fallback cue-hint deduplication resets at a new Pi session", async () => {
 	shutdown({}, ctx);
 });
 
-test("a memory whose TEXT quotes the empty-hint phrase is NOT mistaken for the announcement (no suppression)", async () => {
+test("a memory whose TEXT quotes the empty-hint phrase is NOT mistaken for the announcement (no suppression)", async (t) => {
 	// Regression: the announcement is matched by PREFIX, not by a substring of the block. A substring
 	// check would see "this mind is empty" inside a real memory and suppress the whole content block on
 	// later turns — silent memory loss from injection.
 	const m = mockPi();
 	createExtension(m.pi, { agentDir: join(dir, "collision", "agent") });
 	const ctx = ctxFor(join(dir, "collision", "proj"));
-	await m.tools.get("memory")?.execute("t1", { action: "remember", term: "long", scope: "persona", kind: "note", text: "we discussed that this mind is empty as a discoverability phrase" }, undefined, undefined, ctx);
+	await m.handlers.get("session_start")?.({}, ctx);
+	t.after(async () => { await m.handlers.get("session_shutdown")?.({}, ctx); });
+	const stored = await m.tools.get("memory")?.execute("t1", { action: "remember", term: "long", scope: "persona", kind: "note", text: "we discussed that this mind is empty as a discoverability phrase" }, undefined, undefined, ctx);
+	assert.equal(stored?.details.ok, true);
 	const before = m.handlers.get("before_agent_start");
 	assert.ok(before);
 	// The content block must inject on BOTH turns — not suppressed on the second.
@@ -1479,18 +1517,21 @@ test("a direct persistence cue is captured once as a session note and does not d
 	await m.handlers.get("session_shutdown")?.({}, ctx);
 });
 
-test("failed mind tool results are marked as errors; successful writes refresh the status count", async () => {
+test("failed mind tool results are marked as errors; successful writes refresh the status count", async (t) => {
 	const m = mockPi();
 	const status: string[] = [];
 	const cwd = join(dir, "tool-status", "proj");
 	const ctx = { ...ctxFor(cwd), ui: { setStatus: (_k: string, value: string) => status.push(value), notify: () => {}, theme: { fg: (_c: string, s: string) => s } } };
 	createExtension(m.pi, { agentDir: join(dir, "tool-status", "agent") });
+	await m.handlers.get("session_start")?.({}, ctx);
+	t.after(async () => { await m.handlers.get("session_shutdown")?.({}, ctx); });
 	const handler = m.handlers.get("tool_result");
 	assert.ok(handler);
 	const failed = await handler({ toolName: "memory", details: { ok: false, reason: "disk full" }, content: [{ type: "text", text: "Not stored" }] }, ctx);
 	assert.deepEqual(failed, { isError: true });
 
-	await m.tools.get("memory")?.execute("m", { action: "remember", term: "long", scope: "persona", kind: "note", text: "one durable fact" }, undefined, undefined, ctx);
+	const stored = await m.tools.get("memory")?.execute("m", { action: "remember", term: "long", scope: "persona", kind: "note", text: "one durable fact" }, undefined, undefined, ctx);
+	assert.equal(stored?.details.ok, true);
 	await handler({ toolName: "memory", details: { ok: true }, content: [{ type: "text", text: "Remembered" }] }, ctx);
 	assert.ok(status.some((value) => /mind 1L/.test(value)), "status reflects the committed write immediately");
 });
@@ -1522,7 +1563,7 @@ test("a soft cue hint never elevates the user's raw instruction-shaped text into
 	assert.doesNotMatch(result?.systemPrompt ?? "", /ignore all previous instructions/i);
 });
 
-test("a delegated worker leg (PI_PERSONA_CHILD) withholds tools + wakes and injects only the lean mind", async () => {
+test("a delegated worker leg (PI_PERSONA_CHILD) withholds tools + wakes and injects only the lean mind", async (t) => {
 	const agentDir = join(dir, "leg", "agent");
 	const cwd = join(dir, "leg", "proj");
 
@@ -1530,9 +1571,12 @@ test("a delegated worker leg (PI_PERSONA_CHILD) withholds tools + wakes and inje
 	const sup = mockPi();
 	createExtension(sup.pi, { agentDir });
 	const supCtx = ctxFor(cwd);
-	await sup.tools.get("memory")?.execute("t1", { action: "remember", term: "long", scope: "persona", kind: "objective", text: "root every box on the range" }, undefined, undefined, supCtx);
-	await sup.tools.get("memory")?.execute("t2", { action: "remember", term: "long", scope: "persona", kind: "preference", text: "prefers verbose recon" }, undefined, undefined, supCtx);
-	await sup.tools.get("memory")?.execute("t3", { action: "remember", term: "short", kind: "note", text: "prod db is read-only right now" }, undefined, undefined, supCtx);
+	await sup.handlers.get("session_start")?.({}, supCtx);
+	t.after(async () => { await sup.handlers.get("session_shutdown")?.({}, supCtx); });
+	const objective = await sup.tools.get("memory")?.execute("t1", { action: "remember", term: "long", scope: "persona", kind: "objective", text: "root every box on the range" }, undefined, undefined, supCtx);
+	const identity = await sup.tools.get("memory")?.execute("t2", { action: "remember", term: "long", scope: "persona", kind: "preference", text: "prefers verbose recon" }, undefined, undefined, supCtx);
+	const working = await sup.tools.get("memory")?.execute("t3", { action: "remember", term: "short", kind: "note", text: "prod db is read-only right now" }, undefined, undefined, supCtx);
+	for (const stored of [objective, identity, working]) assert.equal(stored?.details.ok, true);
 	await sup.tools.get("backlog")?.execute("t4", { action: "add", text: "revisit the SMB share", dueInSeconds: 60 }, undefined, undefined, supCtx);
 
 	// A delegated leg — the flag is sampled at factory time, so set it only around createExtension.
@@ -1549,11 +1593,14 @@ test("a delegated worker leg (PI_PERSONA_CHILD) withholds tools + wakes and inje
 	// No write tools in a worker — it cannot read/mutate the supervisor persona's stores.
 	assert.equal(leg.tools.has("memory"), false, "a leg registers no memory tool");
 	assert.equal(leg.tools.has("backlog"), false, "a leg registers no backlog tool");
+	const legCtx = ctxFor(cwd);
+	await leg.handlers.get("session_start")?.({}, legCtx);
+	t.after(async () => { await leg.handlers.get("session_shutdown")?.({}, legCtx); });
 
 	// Lean injection: it inherits the north-star + identity but NOT the supervisor's project state.
 	const before = leg.handlers.get("before_agent_start");
 	assert.ok(before);
-	const res = (await before({ messageType: "user", systemPrompt: "BASE", prompt: "do the assigned task" }, ctxFor(cwd))) as { systemPrompt?: string } | undefined;
+	const res = (await before({ messageType: "user", systemPrompt: "BASE", prompt: "do the assigned task" }, legCtx)) as { systemPrompt?: string } | undefined;
 	assert.ok(res?.systemPrompt, "the leg inherits a lean mind block");
 	assert.match(res.systemPrompt, /root every box/, "leg inherits the north-star");
 	assert.match(res.systemPrompt, /verbose recon/, "leg inherits durable identity");
@@ -1561,7 +1608,6 @@ test("a delegated worker leg (PI_PERSONA_CHILD) withholds tools + wakes and inje
 	assert.doesNotMatch(res.systemPrompt, /revisit the SMB share/, "leg does NOT inherit the backlog");
 
 	// A worker never arms/fires the supervisor's backlog wakes.
-	await leg.handlers.get("session_start")?.({}, ctxFor(cwd));
 	assert.equal(wakeTexts(leg).length, 0, "a leg fires no backlog wakes");
 });
 
@@ -2170,10 +2216,12 @@ test("a late injection from a stopped session cannot mutate the next session's a
   await m.handlers.get("session_shutdown")?.({}, ctx);
 });
 
-test("memory saves show one useful line and retain the machine-readable receipt", async () => {
+test("memory saves show one useful line and retain the machine-readable receipt", async (t) => {
 	const m = mockPi();
 	createExtension(m.pi, { agentDir: join(dir, "save-card", "agent") });
 	const ctx = ctxFor(join(dir, "save-card", "proj"));
+	await m.handlers.get("session_start")?.({}, ctx);
+	t.after(async () => { await m.handlers.get("session_shutdown")?.({}, ctx); });
 	const memory = m.tools.get("memory");
 	assert.ok(memory?.renderResult);
 	for (const term of ["long", "short"] as const) {
@@ -2200,14 +2248,17 @@ test("memory saves show one useful line and retain the machine-readable receipt"
 	assert.match(memory.renderResult(legacy, { expanded: true }, plainTheme, renderContext).render(200).join("\n"), /abb181b69cfb/);
 });
 
-test("memory recall stays complete for the model but collapses the human card", async () => {
+test("memory recall stays complete for the model but collapses the human card", async (t) => {
 	const m = mockPi();
 	createExtension(m.pi, { agentDir: join(dir, "mem-card", "agent") });
 	const ctx = ctxFor(join(dir, "mem-card", "proj"));
+	await m.handlers.get("session_start")?.({}, ctx);
+	t.after(async () => { await m.handlers.get("session_shutdown")?.({}, ctx); });
 	const memory = m.tools.get("memory");
 	assert.ok(memory?.renderResult);
 	for (let i = 0; i < 8; i++) {
-		await memory.execute(`r${i}`, { action: "remember", term: "long", scope: "persona", kind: "note", text: `durable fact ${i} ${"x".repeat(80)}` }, undefined, undefined, ctx);
+		const stored: Awaited<ReturnType<ToolLike["execute"]>> = await memory.execute(`r${i}`, { action: "remember", term: "long", scope: "persona", kind: "note", text: `durable fact ${i} ${"x".repeat(80)}` }, undefined, undefined, ctx);
+		assert.equal(stored.details.ok, true);
 	}
 	const recalled = await memory.execute("recall", { action: "recall", max: 8 }, undefined, undefined, ctx);
 	assert.match(recalled.content[0]?.text ?? "", /recalled/);

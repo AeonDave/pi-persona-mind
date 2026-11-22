@@ -4,8 +4,10 @@
 import { compactMemoryText, MEMORY_KINDS, MAX_MEMORY_ID_CHARS, MAX_MEMORY_SOURCE_CHARS, MAX_MEMORY_TAGS, MAX_MEMORY_TAG_CHARS, MAX_MEMORY_TEXT_CHARS } from "../core/memory.ts";
 import type { MemoryEntry } from "../core/memory.ts";
 import type { MemoryOptimizer } from "../core/optimize-service.ts";
-import type { OptimizeHistory, OptimizeUndone } from "../core/optimize-history.ts";
+import type { OptimizeUndone } from "../core/optimize-history.ts";
 import { isOptimizeTarget, MAX_OPTIMIZE_OPERATIONS, MAX_OPTIMIZE_SOURCES, type OptimizeApplied, type OptimizeFailure, type OptimizeInspection, type OptimizeOperation, type OptimizePlan, type OptimizeTarget } from "../core/optimize.ts";
+
+import { formatMemoryHistory } from "./memory-history.ts";
 
 export const MAX_OPTIMIZE_TOTAL_SOURCES = 64;
 
@@ -65,20 +67,6 @@ export function formatOptimizeApplied(result: OptimizeApplied): OptimizeToolResu
 	return ok(`Applied staged memory plan ${result.planId}: ${result.changed} change(s), ${result.beforeCount} entries → ${result.afterCount}.${result.receiptId ? ` Recovery receipt: ${result.receiptId} (${result.target}); undo requires matching affected facts.` : ""}${result.warning ? `\n${result.warning}` : ""}`, { ...result, mode: "apply" });
 }
 
-export function formatOptimizeHistory(result: OptimizeHistory): OptimizeToolResult {
-	const rows = result.receipts.map((receipt) => [
-		`Receipt ${receipt.receiptId} · ${receipt.createdAt} · ${receipt.state}${receipt.state === "prepared" ? " (interrupted intent; replacement may or may not have committed)" : ""}`,
-		...receipt.changes.flatMap((change) => [
-			...change.before.map((entry) => `  before: ${JSON.stringify(entry)}`),
-			`  after: ${JSON.stringify(change.after)}`,
-		]),
-	].join("\n"));
-	return ok(`Memory optimization history (${result.target}): ${result.receipts.length} shown of ${result.retained} retained; ${result.omitted} omitted from this page; ${result.withheldUnsafe ?? 0} withheld as unsafe. Retention is bounded to ${result.limit} receipts / ${result.maxBytes} bytes per store; older settled receipts can be evicted. Prepared receipts are preserved and may require manual recovery if they fill capacity.\n${rows.join("\n") || "(no retained receipts)"}\nUndo requires unchanged affected facts, no restored-source collisions, the same owner, and unexpired sources.`, {
-		ok: true, mode: "history", target: result.target, retained: result.retained, omitted: result.omitted, withheldUnsafe: result.withheldUnsafe ?? 0,
-		receipts: result.receipts.map(({ storePath: _storePath, ...receipt }) => receipt),
-	});
-}
-
 export function formatOptimizeUndone(result: OptimizeUndone): OptimizeToolResult {
 	return ok(`Undid memory consolidation ${result.receiptId} (${result.target}): restored ${result.restored} original fact(s); unrelated facts preserved.${result.warning ? `\n${result.warning}` : ""}`, { ...result, mode: "undo" });
 }
@@ -107,7 +95,7 @@ export async function runOptimizeAction(
 	const mode = input.mode ?? "inspect";
 	if (mode === "history") {
 		const result = await optimizer.history(input.target ?? "project", input.max);
-		return result.ok ? formatOptimizeHistory(result) : formatOptimizeFailure(result);
+		return result.ok ? formatMemoryHistory(result) : formatOptimizeFailure(result);
 	}
 	if (mode === "undo") {
 		if (!input.receiptId || !input.target) return fail("undo needs receiptId and an explicit target");

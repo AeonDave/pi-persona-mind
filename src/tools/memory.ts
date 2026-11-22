@@ -33,13 +33,24 @@ import { isOptimizeTarget, MAX_OPTIMIZE_OPERATIONS } from "../core/optimize.ts";
 import { DEFAULT_STORE_MAX_ENTRIES } from "../core/store.ts";
 import { runMindActivity } from "../extension/activity.ts";
 import type { MindActivityRunner } from "../extension/activity.ts";
+import type { HandoffInput } from "../core/handoff.ts";
+import type { HandoffResult } from "../core/handoff-store.ts";
+import { formatHandoffResult, validateHandoffInput } from "./memory-handoff.ts";
+import { MAX_MEMORY_HISTORY_TEXT_CHARS, runMemoryHistory } from "./memory-history.ts";
 
 export type GetMind = (ctx: ExtensionContext) => MindService;
 
 const MemoryParams = Type.Object({
-	action: Type.Union([Type.Literal("remember"), Type.Literal("recall"), Type.Literal("read"), Type.Literal("forget"), Type.Literal("promote"), Type.Literal("optimize")], {
-		description: "remember = store · recall = search · read = retrieve full text · forget = delete/tombstone by id · promote = graduate short-term · optimize = inspect, stage, or explicitly apply a consolidation",
+	action: Type.Union([Type.Literal("remember"), Type.Literal("recall"), Type.Literal("read"), Type.Literal("forget"), Type.Literal("promote"), Type.Literal("optimize"), Type.Literal("handoff"), Type.Literal("history")], {
+		description: "remember = store · recall = search · read = retrieve full text · forget = delete/tombstone by id · promote = graduate short-term · optimize = inspect, stage, or explicitly apply a consolidation · history = discover/read change receipts · handoff = explicit cross-session work snapshot",
 	}),
+	handoff: Type.Optional(Type.Union([
+		Type.Object({ operation: Type.Literal("save"), goal: Type.String({ minLength: 1, maxLength: 4096 }), completed: Type.Array(Type.String({ minLength: 1, maxLength: 2048 }), { maxItems: 32 }), pending: Type.Array(Type.String({ minLength: 1, maxLength: 2048 }), { maxItems: 32 }), nextStep: Type.String({ minLength: 1, maxLength: 4096 }), references: Type.Array(Type.String({ minLength: 1, maxLength: 2048 }), { maxItems: 32 }) }, { additionalProperties: false }),
+		Type.Object({ operation: Type.Literal("list") }, { additionalProperties: false }),
+		Type.Object({ operation: Type.Literal("read"), id: Type.String({ pattern: "^[a-f0-9]{32}$" }) }, { additionalProperties: false }),
+		Type.Object({ operation: Type.Literal("complete"), id: Type.String({ pattern: "^[a-f0-9]{32}$" }), revision: Type.Integer({ minimum: 1 }), resolution: Type.String({ minLength: 1, maxLength: 4096 }) }, { additionalProperties: false }),
+		Type.Object({ operation: Type.Literal("forget"), id: Type.String({ pattern: "^[a-f0-9]{32}$" }), revision: Type.Integer({ minimum: 1 }) }, { additionalProperties: false }),
+	])),
 	term: Type.Optional(
 		Type.Union([Type.Literal("long"), Type.Literal("short"), Type.Literal("session")], {
 			description: "remember: choose the lifetime explicitly. session = active-branch only (use for task-specific or uncertain choices such as models, strategies, and task constraints); short = expiring project working context; long = durable and requires an explicit scope. Kind does not change lifetime; an objective may be session-local or short-lived.",
@@ -60,7 +71,7 @@ const MemoryParams = Type.Object({
 	),
 	tags: Type.Optional(Type.Array(Type.String({ maxLength: MAX_MEMORY_TAG_CHARS }), { maxItems: MAX_MEMORY_TAGS, description: "optional tags to aid later recall" })),
 	ttlHours: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "remember(short): hours until it is deleted from the store (default 48)" })),
-	supersedes: Type.Optional(Type.String({ maxLength: MAX_MEMORY_ID_CHARS, description: "remember: id of an existing entry this one replaces" })),
+	supersedes: Type.Optional(Type.String({ maxLength: MAX_MEMORY_ID_CHARS, description: "remember: id of an entry this one replaces within the destination scope and lifetime; an id found only in another tier is refused" })),
 	source: Type.Optional(Type.String({ maxLength: MAX_MEMORY_SOURCE_CHARS, description: "remember: optional human-citable origin of this fact (e.g. 'the user said', 'child scout')" })),
 	derivedFrom: Type.Optional(Type.Array(Type.String({ maxLength: MAX_MEMORY_ID_CHARS }), { maxItems: MAX_MEMORY_DERIVED_IDS, description: "remember: optional ids of memories distilled into this fact" })),
 	query: Type.Optional(Type.String({ maxLength: MAX_RECALL_QUERY_CHARS, description: "recall: keywords (empty = most recent); optimize inspect: optional substring filter" })),
@@ -68,7 +79,7 @@ const MemoryParams = Type.Object({
 		Type.Union([Type.Literal("long"), Type.Literal("short"), Type.Literal("both"), Type.Literal("session"), Type.Literal("project"), Type.Literal("persona"), Type.Literal("shared")], { description: "remember(long): REQUIRED destination project|persona|shared; no implicit default. Use project for stable facts of this repository, persona for facts intended across all projects of this persona, and shared only when intended across personas. remember(short) defaults to project and only accepts project; remember(session) accepts no scope or redundant session. This selects API routing; it is not authenticated consent. promote defaults to project. recall/read/forget: project includes repository durable + working facts; long includes all durable tiers; both includes all active stores; session is branch-local." }),
 	),
 	max: Type.Optional(Type.Number({ description: "recall: maximum results, clamped to 1..50 (default 8); optimize inspect: entry page 1..100 (default 20)" })),
-	offset: Type.Optional(Type.Number({ minimum: 0, maximum: DEFAULT_STORE_MAX_ENTRIES, multipleOf: 1, description: `optimize inspect: zero-based page offset from 0 to ${DEFAULT_STORE_MAX_ENTRIES} (default 0)` })),
+	offset: Type.Optional(Type.Number({ minimum: 0, maximum: MAX_MEMORY_HISTORY_TEXT_CHARS, multipleOf: 1, description: `optimize inspect: entry offset 0..${DEFAULT_STORE_MAX_ENTRIES}; history detail: character offset from the previous page` })),
 	id: Type.Optional(Type.String({ maxLength: MAX_MEMORY_ID_CHARS, description: "read/forget/promote: exact entry id; session:<UUID> addresses an active-session note" })),
 	mode: Type.Optional(Type.Union([Type.Literal("inspect"), Type.Literal("stage"), Type.Literal("apply"), Type.Literal("history"), Type.Literal("undo")], { description: "optimize: inspect candidates; stage an immutable proposal; apply a plan; history retrieves bounded durable before/after receipts; undo safely restores a receipt's unchanged affected facts (default inspect)" })),
 	target: Type.Optional(Type.Union([Type.Literal("project"), Type.Literal("project-long"), Type.Literal("persona"), Type.Literal("shared")], { description: "optimize: project = working memory, project-long = durable repository knowledge, persona/shared = durable identity/common facts" })),
@@ -81,7 +92,7 @@ const MemoryParams = Type.Object({
 		source: Type.Optional(Type.String({ maxLength: MAX_MEMORY_SOURCE_CHARS })),
 	}, { additionalProperties: false }), { maxItems: 8, description: "optimize stage: explicit replacements; source IDs must be disjoint and total no more than 64" })),
 	planId: Type.Optional(Type.String({ minLength: 1, maxLength: 160, description: "optimize apply: exact unexpired staged plan id" })),
-	receiptId: Type.Optional(Type.String({ minLength: 1, maxLength: 160, description: "optimize undo: exact retained durable receipt id; also supply target" })),
+	receiptId: Type.Optional(Type.String({ minLength: 1, maxLength: 160, description: "history detail or optimize undo: exact retained receipt id; also supply target" })),
 }, { additionalProperties: false });
 
 type MemoryToolParams = Type.Static<typeof MemoryParams>;
@@ -108,19 +119,21 @@ function say(text: string, details: Record<string, unknown> = {}): ToolResult {
 
 export type GetOptimizer = (ctx: ExtensionContext) => MemoryOptimizer;
 export type GetMindActivity = (ctx: ExtensionContext) => MindActivityRunner | undefined;
+export type RunHandoff = (ctx: ExtensionContext, input: HandoffInput) => Promise<HandoffResult>;
 
-export function registerMemoryTool(pi: ExtensionAPI, getMind: GetMind, sessionMemory?: SessionMemory, getOptimizer?: GetOptimizer, getActivity?: GetMindActivity): void {
+export function registerMemoryTool(pi: ExtensionAPI, getMind: GetMind, sessionMemory?: SessionMemory, getOptimizer?: GetOptimizer, getActivity?: GetMindActivity, handoff?: RunHandoff): void {
 	pi.registerTool({
 		name: "memory",
 		label: "Memory",
 		promptSnippet: "memory — persist, recall, inspect, and explicitly consolidate durable facts, project context, and active-session notes",
 		promptGuidelines: [
+			"For a deliberate cross-session project task handoff, use memory action=handoff with operation save/list/read/complete/forget. Handoffs are explicit, bounded snapshots, may be stale and are never injected automatically. Complete requires an explicit resolution; retained pending items are historical.",
 			"Before the final answer, use `memory` when useful context should be retained. The model chooses lifetime and scope from meaning and context; users need not name API scopes or say a literal 'global'. Genuinely portable preferences belong in persona/shared memory; subject matter alone, including a model or strategy name, never determines scope. Choose `term=session` for task-specific or uncertain choices (including models, strategies, and task constraints); use `term=short` for expiring project working context; use `term=long` only with an explicit `scope`: `project` for stable repository facts, `persona` for facts intended across all projects of this persona, and `shared` only when truly intended across personas. An explicit scope selects the API destination; it is not authenticated consent. AUTO capture is provisional session-only and never makes a durable save; do not duplicate that session note. Broader durability requires a deliberate memory call with a scope chosen from the actual user intent. Use `backlog` for unfinished work; skip secrets and re-derivable facts.",
 			"For consolidation, inspect first, read the full selected entries, compare them with the newest primary evidence, then stage explicit rewrites/merges that preserve exceptions and provenance. Review the exact before/after plan and character counts; apply the exact staged plan within the user's authorized memory-maintenance scope. Inspect is read-only and never calls a model or applies changes by itself.",
 		],
 		description: [
 			"`remember` stores context for an explicitly chosen lifetime: `session` for active-branch notes only (best for task-specific or uncertain choices), `short` for expiring project working context, or `long` for durable facts with a REQUIRED explicit `scope=project|persona|shared`. Use project for stable repository facts, persona for intent across all projects of the same persona, and shared only for intent across personas. Long-term scope has no implicit default; the scope selects an API destination and does not authenticate consent. Automatic cue capture is always provisional session-only, even for explicit durability phrases; it does not make an external/durable save. Broader retention needs a deliberate scoped memory call. Promotion defaults to project. `recall` searches; `read` gets full text; `forget` retires by id with optional scope. For `optimize`, inspect candidates, read full entries, compare against current evidence, stage explicit reviewed replacements preserving exceptions and provenance, then apply an exact reviewed plan. Inspect is read-only; it does not call a model or write.",
-			"Stored facts remain available through recall/read; relevant facts are ranked for bounded context each turn.",
+			"Stored facts remain available through recall/read; relevant facts are ranked for bounded context each turn. `history` lists compact change receipts; use receiptId plus an explicit target for before/after detail, and the returned nextOffset for later pages. Historical facts are not active memory.",
 			"Keep entries DECLARATIVE, never store secrets.",
 		].join(" "),
 		parameters: MemoryParams,
@@ -128,6 +141,20 @@ export function registerMemoryTool(pi: ExtensionAPI, getMind: GetMind, sessionMe
 			try {
 				const invalid = validateMemoryParams(params);
 				if (invalid) return say(invalid, { ok: false, reason: "invalid_parameters" });
+				if (params.action === "handoff") {
+					if (!handoff || !params.handoff) return say("Handoff unavailable in this session.", { ok: false });
+					const result = await handoff(ctx, params.handoff);
+					return say(formatHandoffResult(result), { ok: result.ok, action: "handoff" });
+				}
+				if (params.action === "history") {
+					if (!getOptimizer || !sessionMemory) return say("Memory history is unavailable.", { ok: false });
+					const ownerCurrent = sessionMemory.captureOwner(ctx);
+					if (!ownerCurrent()) return say("Memory owner unavailable.", { ok: false });
+					const optimizer = getOptimizer(ctx);
+					const result = await runMemoryHistory(optimizer, { ...(params.target === undefined ? {} : { target: params.target }), ...(params.max === undefined ? {} : { max: params.max }), ...(params.receiptId === undefined ? {} : { receiptId: params.receiptId }), ...(params.offset === undefined ? {} : { offset: params.offset }) });
+					if (!ownerCurrent() || getOptimizer(ctx) !== optimizer) return say("Memory owner changed; history was withheld.", { ok: false });
+					return result;
+				}
 				return await runMemoryAction(getMind(ctx), params, ctx, sessionMemory, getOptimizer, getActivity);
 			} catch (err) {
 				// One loud surface for every action. `remember`/`promote` already convert a store failure into
@@ -162,6 +189,8 @@ const KEYS: Record<string, ReadonlySet<string>> = {
 	forget: new Set(["action", "id", "scope"]),
 	promote: new Set(["action", "id", "scope"]),
 	optimize: new Set(["action", "mode", "target", "query", "max", "offset", "fingerprint", "operations", "planId", "receiptId"]),
+	handoff: new Set(["action", "handoff"]),
+	history: new Set(["action", "target", "max", "receiptId", "offset"]),
 };
 
 /** The host validates TypeBox schemas, but execute is also callable directly by SDK clients. */
@@ -178,6 +207,14 @@ function validateMemoryParams(value: unknown): string | undefined {
 		return `memory ${params.action} received unsupported field(s): ${unknownFields.join(", ")}.`;
 	}
 	const str = (key: string, min: number, max: number) => typeof params[key] === "string" && (params[key] as string).length >= min && (params[key] as string).length <= max;
+	if (params.action === "handoff") return validateHandoffInput(params.handoff) ? undefined : "memory handoff requires a valid, bounded handoff payload.";
+	if (params.action === "history") {
+		if (params.target !== undefined && !isOptimizeTarget(params.target)) return "unknown history target.";
+		if (params.receiptId !== undefined && (!str("receiptId", 1, 160) || params.target === undefined)) return "history detail requires receiptId and target.";
+		if (params.max !== undefined && (!Number.isSafeInteger(params.max) || (params.max as number) < 1 || (params.max as number) > 32 || params.receiptId !== undefined)) return "history max must be 1..32 and is only valid for list.";
+		if (params.offset !== undefined && (!Number.isSafeInteger(params.offset) || (params.offset as number) < 0 || (params.offset as number) > MAX_MEMORY_HISTORY_TEXT_CHARS || params.receiptId === undefined)) return `history offset requires a receiptId and must be between 0 and ${MAX_MEMORY_HISTORY_TEXT_CHARS}.`;
+		return;
+	}
 	if (params.action === "remember") {
 		if (params.term !== "long" && params.term !== "short" && params.term !== "session") return rememberCorrection("memory remember is missing a valid term; choose long, short, or session.", SESSION_REMEMBER_EXAMPLE);
 		const example = params.term === "long" ? LONG_REMEMBER_EXAMPLE : params.term === "short" ? SHORT_REMEMBER_EXAMPLE : SESSION_REMEMBER_EXAMPLE;
@@ -268,13 +305,15 @@ async function runMemoryAction(mind: MindService, params: MemoryToolParams, ctx:
 		const r = await mind.remember(input);
 		const destination = params.term === "long" ? params.scope as "project" | "persona" | "shared" : "project";
 		return r.ok
-			? say(`Remembered ${r.entry.id} — ${r.entry.expiresAt ? "short" : "long"}-term ${params.kind} in ${destination} scope. Available through memory recall/read and ranked for bounded context.`, {
+			? say(`Remembered ${r.entry.id} — ${r.entry.expiresAt ? "short" : "long"}-term ${params.kind} in ${destination} scope. Available through memory recall/read and ranked for bounded context.${r.receiptId ? ` Replacement receipt: ${r.receiptId}.` : ""}${r.warning ? ` Warning: ${r.warning}` : ""}`, {
 				id: r.entry.id,
 				ok: true,
+				...(r.receiptId ? { receiptId: r.receiptId } : {}),
+				...(r.warning ? { warning: r.warning } : {}),
 				scope: destination,
 				// Native receipt metadata, not model-supplied source authority or a new archive.
 				recording: { version: 1, persona: mind.inspectionScope().persona, projectRoot: mind.inspectionScope().projectRoot, target: params.term === "short" ? "project" : destination === "project" ? "project-long" : destination },
-				summary: `${destination} · ${r.entry.expiresAt ? "working" : "durable"} saved — ${compactMemoryText(r.entry.text, 80)}`,
+				summary: `${destination} · ${r.entry.expiresAt ? "working" : "durable"} saved${r.warning ? " · history warning; expand for details" : ` — ${compactMemoryText(r.entry.text, 80)}`}`,
 			})
 			: say(`Not stored: ${r.reason}`, { ok: false, reason: r.reason });
 	}

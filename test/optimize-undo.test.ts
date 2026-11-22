@@ -37,6 +37,20 @@ test("durable undo survives a new optimizer and preserves unrelated writes", asy
 	assert.equal((await reopened.undo(applied.receiptId, "project")).ok, false, "undo cannot replay");
 }));
 
+test("persisted optimizer receipts without origin remain readable and undoable", async () => fixture(async ({ store, optimizer, reopen }) => {
+	const before = fact("original source"); await store.update(() => [before]);
+	const plan = await stage(optimizer, before.id);
+	const applied = await optimizer.apply(plan.planId); assert.ok(applied.ok); assert.ok(applied.receiptId);
+	const historyPath = `${store.filePath}.optimize-history.json`;
+	const raw = JSON.parse(await readFile(historyPath, "utf8"));
+	delete raw.entries[0].origin;
+	await writeFile(historyPath, JSON.stringify(raw));
+	const detail = await reopen().getReceipt(applied.receiptId, "project"); assert.ok(detail.ok);
+	assert.equal(detail.receipt.origin, "optimization"); assert.equal(detail.receipt.planId, plan.planId);
+	assert.ok((await reopen().undo(applied.receiptId, "project")).ok);
+	assert.deepEqual((await store.load()).entries, [before]);
+}));
+
 test("settled history is bounded with oldest receipts evicted; unresolved crash intents are preserved", async () => fixture(async ({ store, optimizer }) => {
 	let source = fact("original source"); await store.update(() => [source]);
 	let oldest = "";

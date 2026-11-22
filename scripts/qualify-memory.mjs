@@ -57,7 +57,58 @@ export async function qualifyMemory(session) {
 	assert.equal(durable.details.entries[0].target, "project-long");
 	assert.equal(durable.details.entries[0].entry.expiresAt, undefined);
 	await call({ action: "read", scope: "short", id: source.details.id }, false);
+
+	// A direct supersession produces an independently inspectable before/after receipt. Use
+	// enough real content to force detail pagination, and reassemble every returned page.
+	const oldFact = `Original qualification detail: ${"alpha evidence ".repeat(460)}`.trim();
+	const newFact = `Replacement qualification detail: ${"beta evidence ".repeat(480)}`.trim();
+	const original = await call({ action: "remember", term: "short", kind: "note", text: oldFact });
+	const superseding = await call({ action: "remember", term: "short", kind: "note", text: newFact, supersedes: original.details.id });
+	assert.equal(typeof superseding.details.receiptId, "string");
+	const receiptId = superseding.details.receiptId;
+	const replacementHistory = await call({ action: "history", target: "project" });
+	assert.ok(replacementHistory.details.receipts.some((receipt) => receipt.receiptId === receiptId && receipt.origin === "replacement"));
+	let offset = 0;
+	let receiptText = "";
+	let pages = 0;
+	for (;;) {
+		const page = await call({ action: "history", target: "project", receiptId, offset });
+		assert.equal(page.details.offset, offset);
+		assert.ok(page.details.page.length <= 12_000);
+		receiptText += page.details.page;
+		pages++;
+		if (page.details.nextOffset === undefined) { assert.equal(receiptText.length, page.details.totalChars); break; }
+		assert.ok(page.details.nextOffset > offset);
+		offset = page.details.nextOffset;
+		assert.ok(pages < 10, "history pagination must terminate");
+	}
+	assert.ok(pages > 1, "qualification must exercise more than one history page");
+	assert.ok(receiptText.includes(oldFact) && receiptText.includes(newFact), "reassembled history retains both full facts");
+	await call({ action: "read", scope: "short", id: original.details.id }, false);
+
+	const handoffCall = (handoff, expected = true) => call({ action: "handoff", handoff }, expected);
+	const handoffData = (result) => {
+		const body = result.content.map((item) => item.text ?? "").join("\n");
+		const match = /<handoff-data>\n([\s\S]*?)\n<\/handoff-data>/.exec(body);
+		assert.ok(match, "handoff result includes fenced data");
+		return JSON.parse(match[1]);
+	};
+	const handoff = handoffData(await handoffCall({ operation: "save", goal: "Finish the offline qualification", completed: ["Ran the memory checks"], pending: ["Review results"], nextStep: "Inspect the report", references: ["docs/DESIGN.md"] }));
+	assert.equal(handoff.origin.sessionId, session.sessionManager.getSessionId());
+	assert.equal(handoff.origin.branchId, session.sessionManager.getLeafId());
+	const handoffs = handoffData(await handoffCall({ operation: "list" }));
+	assert.equal(handoffs.total, handoffs.entries.length);
+	assert.ok(handoffs.entries.some((entry) => entry.id === handoff.id));
+	const loaded = handoffData(await handoffCall({ operation: "read", id: handoff.id }));
+	assert.deepEqual(loaded.pending, ["Review results"]);
+	assert.deepEqual(loaded.references, ["docs/DESIGN.md"]);
+	await handoffCall({ operation: "complete", id: handoff.id, revision: handoff.revision + 1, resolution: "Reviewed" }, false);
+	const completed = handoffData(await handoffCall({ operation: "complete", id: handoff.id, revision: handoff.revision, resolution: "Reviewed" }));
+	assert.equal(completed.status, "completed");
+	assert.deepEqual(completed.pending, ["Review results"], "completed pending data remains a historical snapshot");
+	await handoffCall({ operation: "forget", id: handoff.id, revision: completed.revision });
+	await handoffCall({ operation: "read", id: handoff.id }, false);
 	await call({ action: "forget", id: sessionId });
 	await call({ action: "read", id: sessionId }, false);
-	return { sessionNotes: true, fullRead: true, explicitOptimization: true, stalePlanRefused: true, expiryAndOriginsPreserved: true, durableProject: true, consolidationUndo: true };
+	return { sessionNotes: true, fullRead: true, explicitOptimization: true, stalePlanRefused: true, expiryAndOriginsPreserved: true, durableProject: true, consolidationUndo: true, supersessionHistory: true, paginatedHistory: true, explicitHandoff: true };
 }

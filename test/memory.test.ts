@@ -63,6 +63,37 @@ test("upsertMemory preserves a migrated v1 id when the current id uses v2 tag en
 	assert.equal(list[0]?.lastSeenAt, current.recordedAt);
 });
 
+test("re-recording preserves omitted provenance while renewing short-term lifetime", () => {
+	const first = makeMemory({ term: "short", kind: "note", text: "same fact", source: "reviewed file:42", derivedFrom: ["source-record"], supersedes: "old-record", ttlHours: 1, persona: "original" }, T0);
+	const later = makeMemory({ term: "short", kind: "note", text: "Same fact", ttlHours: 6, persona: "current" }, T0 + H);
+	const before = structuredClone([first, later]);
+	const [merged] = upsertMemory([first], later);
+	assert.ok(merged);
+	assert.equal(merged.source, first.source);
+	assert.deepEqual(merged.derivedFrom, first.derivedFrom);
+	assert.equal(merged.supersedes, first.supersedes);
+	assert.equal(merged.recordedAt, first.recordedAt);
+	assert.equal(merged.lastSeenAt, later.recordedAt);
+	assert.equal(merged.expiresAt, later.expiresAt);
+	assert.equal(merged.persona, later.persona);
+	assert.deepEqual([first, later], before, "neither input is mutated");
+	assert.notEqual(merged.derivedFrom, first.derivedFrom, "retained lineage is not an alias of the old record");
+});
+
+test("re-recording uses explicitly supplied provenance and retires only the new supersedes target", () => {
+	const historical = makeMemory({ term: "long", kind: "note", text: "historical source" }, T0);
+	const retired = makeMemory({ term: "long", kind: "note", text: "new retirement target" }, T0);
+	const first = makeMemory({ term: "long", kind: "note", text: "same fact", source: "old origin", derivedFrom: [historical.id], supersedes: historical.id }, T0);
+	const later = makeMemory({ term: "long", kind: "note", text: "same fact", source: "new origin", derivedFrom: [retired.id], supersedes: retired.id }, T0 + H);
+	const result = upsertMemory([historical, retired, first], later);
+	assert.deepEqual(result.map((entry) => entry.text), ["historical source", "same fact"]);
+	assert.equal(result[1]?.source, "new origin");
+	assert.deepEqual(result[1]?.derivedFrom, [retired.id]);
+	assert.equal(result[1]?.supersedes, retired.id);
+	const rerecorded = upsertMemory([historical, first], makeMemory({ term: "long", kind: "note", text: "same fact" }, T0 + H));
+	assert.equal(rerecorded.length, 2, "preserving old lineage must not replay its retirement");
+});
+
 test("upsertMemory does not merge distinct facts that shared an ambiguous v1 id", () => {
 	const migrated = makeMemory({ term: "long", kind: "note", text: "same fact", tags: ["a,b"] }, T0);
 	migrated.id = legacyContentId(migrated.kind, migrated.text, migrated.tags);

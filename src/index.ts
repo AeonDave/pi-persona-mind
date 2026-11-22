@@ -33,6 +33,7 @@ import { createSessionMemory } from "./session-memory.ts";
 import { registerSessionNoteRenderer } from "./ui/session-note-card.ts";
 import type { MemoryOptimizer } from "./core/optimize-service.ts";
 import { registerMindCommands } from "./extension/mind-command.ts";
+import { runHandoff } from "./extension/handoff.ts";
 import { createMemoryInspector } from "./extension/memory-inspector.ts";
 import { loadInspectorPage } from "./extension/inspector-data.ts";
 import { openMemoryInspector } from "./ui/memory-inspector.ts";
@@ -311,7 +312,9 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	const getMind = (ctx: ExtensionContext): MindService => {
 		const reason = unavailableReason(ctx);
 		if (reason) throw new Error(reason);
-		return new MindService(resolveMindScope(ctx), { onWarn: (message) => surfaceWarning(ctx, message) });
+		const ownerCurrent = captureMemoryOwner(ctx);
+		const sessionCurrent = sessionMemory.captureOwner(ctx);
+		return new MindService(resolveMindScope(ctx), { onWarn: (message) => surfaceWarning(ctx, message), isCurrent: () => ownerCurrent() && sessionCurrent() });
 	};
 	const sessionMemory = createSessionMemory(pi);
 	const mindCardUI = createMindCardUI(pi);
@@ -558,7 +561,11 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		actions: (ctx, request, current) => runMindInspectorActions(ctx, request, current, { consolidate: (target) => autoOptimize.startExplicit(target), review: knowledgeReview }),
 	});
 	if (!isDelegatedLeg) pi.registerShortcut("f10", { description: "Inspect memory, sources and timeline", handler: (ctx) => inspector.open(ctx) });
-	pi.on("session_tree", () => { discardOptimizer(); inspector.invalidate(); knowledgeReview.interrupt(); });
+	pi.on("session_tree", (_event, ctx) => {
+		discardOptimizer(); inspector.invalidate(); knowledgeReview.interrupt();
+		sessionMemory.deactivate();
+		if (!isDelegatedLeg && available(ctx)) sessionMemory.activate(ctx);
+	});
 	pi.on("agent_start", () => knowledgeReview.interrupt());
 	pi.on("model_select", () => knowledgeReview.interrupt());
 
@@ -566,7 +573,11 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 	// backlog is exactly the bleed we prevent. It still INHERITS the lean block below (read-only, curated).
 	if (!isDelegatedLeg) {
 		const guardedTools = personaGuardedTools(pi, unavailableReason);
-		registerMemoryTool(guardedTools, getMind, sessionMemory, getOptimizer, getActivity);
+		registerMemoryTool(guardedTools, getMind, sessionMemory, getOptimizer, getActivity, (ctx, input) => {
+			const ownerCurrent = captureMemoryOwner(ctx);
+			const sessionCurrent = sessionMemory.captureOwner(ctx);
+			return runHandoff(ctx, resolveMindScope(ctx), () => ownerCurrent() && sessionCurrent(), input);
+		});
 		registerBacklogTool(guardedTools, getMind);
 	}
 

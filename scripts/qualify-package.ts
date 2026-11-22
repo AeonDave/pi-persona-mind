@@ -1,4 +1,4 @@
-/** Load an extracted extension through the current Pi 1.5.2 SDK. */
+/** Load an extracted extension through the current Pi 1.6.0 SDK. */
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -35,7 +35,7 @@ try {
   assert.equal(h.faux.state.callCount, 4, "the reminder itself adds no model call");
   await qualifyMemory(h.session);
   assert.equal(h.faux.state.callCount, 4, "explicit local memory operations add no model call");
-  console.log("PASS: extracted Mind package loaded in Pi 1.5.2; session notes, full read, staged optimization, stale-plan refusal and one display-only wake qualified.");
+  console.log("PASS: extracted Mind package loaded in Pi 1.6.0; session notes, full read, staged optimization, stale-plan refusal and one display-only wake qualified.");
 } finally {
   try { await h?.dispose(); }
   finally { await rm(root, { recursive: true, force: true }); }

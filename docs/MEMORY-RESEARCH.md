@@ -33,6 +33,20 @@ Mind uses deterministic lexical, tag and path ranking, with explicit full reads 
 injection. This is explainable and avoids an additional indexing service, but differently worded
 queries may miss relevant facts. No general semantic-recall guarantee follows from a passing test.
 
+Identifier components and vowel-accent folding are lower-weight fallback matches, behind exact
+words and paths. Numeric versions stay intact, negation terms remain searchable, and Unicode/CJK
+segmentation is preserved. A fallback can still add irrelevant rows: fewer missed identifiers does
+not imply perfect precision. Tags already normalized when saved cannot recover lost camel casing.
+
+`npm run eval:memory` compares the previous ranker and injection renderer with the current ones on
+the same corpus, scope and budget. In the 12-case development fixture, positive top-one hits improve
+from 2/7 to 7/7; in a separate nine-case supervisor-labelled holdout withheld during initial
+implementation, they improve from 6/7 to 7/7. Negative queries with results fall from one to zero in
+each set. False positives among the top three remain 1 in development and fall from 5 to 3 in the
+holdout; a weak `memory`/`memoryOwnership` match remains. The preceding 30-case fixture's metrics and
+seven sentinel outcomes are unchanged. These small synthetic sets and their labels are inspectable
+regression evidence, not an external benchmark or a general semantic-quality claim.
+
 Injection is a planning budget, not a billing measurement. Preserve wrappers, omission counts and
 whole admitted excerpts within the documented limits. The runtime estimate operates on UTF-8 bytes;
 it must not select a correction factor by detecting a language. A comparison against a named reference
@@ -55,6 +69,16 @@ encoding remains a comparison to that encoding, not a count for every possible s
 
 Successful validation establishes structural permission and freshness, not semantic truth. A worker
 can still propose a bad summary. Keep proposals inspectable and state that limitation explicitly.
+
+Ordinary explicit supersession now uses that same receipt protocol. This preserves a changed
+decision's original evidence without making historical facts compete with current facts in recall.
+An ordinary receipt is read-only; consolidation undo retains its existing conflict checks. No second
+archive, embeddings service or automatically generated summary is introduced.
+
+Cross-session handoffs address a separate need: a deliberately saved work snapshot with a next step,
+origin and explicit completion resolution. They remain owner-scoped and manually discoverable, never
+automatic instructions or a claim that a worker session was restored. Quota refusal and explicit
+forgetting preserve unfinished work instead of silently deleting it on a timer.
 
 ## What verification can establish
 
@@ -83,7 +107,7 @@ reference counts or automatically tune the production budget from a small fixtur
 ## Inspector architecture decision
 
 The memory inspector adds a read-only view over existing stores and the native active branch, rather
-than introducing an OptChat-style permanent transcript and summary tree. This preserves Mind's role as
+than introducing a permanent transcript and summary tree. This preserves Mind's role as
 selective scoped memory and avoids a second retention policy, summarizer budget and source of truth.
 A separate archive could eventually make older cross-session episodes navigable, but would require an
 explicit access, deletion and retention design; an opaque source string is not that authorization.

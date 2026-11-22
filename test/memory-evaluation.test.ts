@@ -30,10 +30,33 @@ test("a missing synonym tag produces an honest lexical abstention", () => {
 	assert.ok(MEMORY_EVALUATION_FACTS.find((entry) => entry.id === "no-synonym")?.tags.includes("compaction"));
 });
 
+test("normalization comparison freezes the previous ranker and measures precision controls and actual injection", () => {
+	const report = evaluateMemoryFixture();
+	assert.equal(report.methods.lexicalBaseline.hitAt1, report.methods.ranked.hitAt1);
+	assert.equal(report.methods.lexicalBaseline.hitAt3, report.methods.ranked.hitAt3);
+	assert.equal(report.methods.lexicalBaseline.falsePositiveResultsAt3, report.methods.ranked.falsePositiveResultsAt3);
+	const { development, heldout } = report.normalization;
+	assert.deepEqual([development.facts, development.cases, heldout.facts, heldout.cases], [10, 12, 9, 9]);
+	assert.deepEqual(development.budget, heldout.budget);
+	assert.equal(development.budget.tokens, 400);
+	assert.deepEqual([development.baseline.hitAt1, development.improved.hitAt1], [0.286, 1]);
+	assert.deepEqual([development.baseline.injectedRelevantCases, development.improved.injectedRelevantCases], [2, 7]);
+	assert.deepEqual([development.baseline.negativeQueriesWithResults, development.improved.negativeQueriesWithResults], [1, 0]);
+	// A weak "memory" match to memoryOwnership remains a measured false positive, not hidden by labels.
+	assert.deepEqual([development.baseline.falsePositiveResultsAt3, development.improved.falsePositiveResultsAt3], [1, 1]);
+	assert.deepEqual([heldout.baseline.hitAt1, heldout.improved.hitAt1], [0.857, 1]);
+	assert.deepEqual([heldout.baseline.hitAt3, heldout.improved.hitAt3], [0.857, 1]);
+	assert.deepEqual([heldout.baseline.injectedRelevantCases, heldout.improved.injectedRelevantCases], [6, 7]);
+	assert.deepEqual([heldout.baseline.falsePositiveResultsAt3, heldout.improved.falsePositiveResultsAt3], [5, 3]);
+	assert.deepEqual([heldout.baseline.negativeQueriesWithResults, heldout.improved.negativeQueriesWithResults], [1, 0]);
+	assert.deepEqual([heldout.baseline.injectedNonRelevantFacts, heldout.improved.injectedNonRelevantFacts], [11, 9]);
+});
+
 test("paired sentinels report live retrieval and injection outcomes and detect a removed-fact control", () => {
 	const report = evaluateMemoryFixture();
 	assert.ok(report.sentinels);
 	assert.equal(report.sentinels.allPassed, true);
+	assert.deepEqual(report.sentinels, report.sentinelBaseline, "chronology, negation, exception and provenance outcomes stay identical to the previous implementation");
 	for (const id of ["owner-current-again", "owner-old-history", "retry-exception", "retry-old-history", "session-branch", "branch-exception", "capture-origin"]) {
 		const outcome = report.sentinels.cases.find((item) => item.caseId === id);
 		assert.ok(outcome, `missing sentinel ${id}`);

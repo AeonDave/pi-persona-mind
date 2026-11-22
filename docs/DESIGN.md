@@ -9,7 +9,7 @@ the user workflow is in [README](../README.md). Local design rationale and evalu
 This design contract describes the current development tree; released changes are recorded separately
 in CHANGELOG.md.
 
-Target the latest stable Pi only, currently 1.5.2, and Node >=22.19. All four development Pi packages
+Target the latest stable Pi only, currently 1.6.0, and Node >=22.19. All four development Pi packages
 are pinned together; runtime host/typebox packages remain optional wildcard peers. No second host
 runtime or historical hook-shape adapter is bundled. A development-only security override does not
 patch an installed host.
@@ -17,7 +17,7 @@ patch an installed host.
 Mind requires a loaded compatible pi-persona through its versioned local companion handshake.
 Missing/incompatible presence leaves tools inactive and suppresses capture, storage/import,
 injection and reminders. A settings file or installed npm package is not proof of an active
-companion. Mind 0.9.2 requires Persona 1.18.1 or later for these paired contracts. Its optional npm
+companion. Mind 0.9.3 requires Persona 1.18.1 or later for these paired contracts. Its optional npm
 peer declares that requirement without auto-installing or activating another extension.
 
 The node-only core has no Pi imports. The factory wires native Pi hooks, tools, scope, scheduling
@@ -35,6 +35,7 @@ Command parsing/presentation lives outside the factory. Important seams:
 | core/session-memory.ts, session-memory.ts | Session event validation/replay and native owner adapter |
 | core/optimize.ts, optimize-service.ts | Pure consolidation rules and short-lived staged plans |
 | core/optimize-history.ts | Bounded durable before images and conflict-checked undo |
+| core/handoff.ts, handoff-store.ts | Explicit scoped handoff snapshots, revision checks and bounded persistence |
 | core/retrieval.ts, context-budget.ts | Explainable task ranking and shared context estimate |
 | core/memory-read.ts | Full explicit retrieval without clipped discovery or recovery writes |
 | tools/memory.ts, memory-optimize.ts | Model-facing action validation and result formatting |
@@ -57,7 +58,12 @@ recall frequency. Read operations do not boost ranking or reset expiry. `term` a
 `kind: objective` is not automatically promoted, so a short objective remains expiring project context
 and a session objective remains on that active native session branch.
 
-Supersession retires an active row. derivedFrom stores bounded IDs. Optimizer before images provide
+Exact re-recording preserves existing `source`, `derivedFrom` and `supersedes` when no replacement
+metadata is supplied; nonempty replacement metadata updates the corresponding value. In `remember`,
+an empty source or empty `derivedFrom` list is treated as omitted, not as a request to clear provenance.
+`remember` supersession retires an active row in its selected destination tier. A target found only
+in another tier is refused before writing; moving a fact and replacing one are separate operations.
+derivedFrom stores bounded IDs. Optimizer before images provide
 bounded recoverability; ordinary supersession/forget are not a temporal database or unlimited undo.
 Every long-term `remember` requires an explicit destination: project LTM, persona LTM, or shared LTM;
 there is no implicit persona destination. Short-term memory remains project-scoped by default. Promotion
@@ -115,6 +121,58 @@ Injection is reference data, escaped and bounded to a 600-token planning estimat
 with excerpts of at most 700 characters. It shares the total memory budget. Current task matching
 precedes recency, with objective priority. Omitted entries and clipping are disclosed. Explicit read returns the whole note.
 An in-memory session is not advertised as restart-durable.
+
+## Cross-session handoffs
+
+`memory { action: "handoff", handoff: { operation: "save", goal, completed, pending, nextStep,
+references } }` stores an explicit snapshot. `completed`, `pending` and `references` are arrays of
+strings. `list` discovers metadata; `read` with `id` returns the snapshot. `complete` requires `id`,
+the latest `revision` and a `resolution`; `forget` requires `id` and `revision`. These actions share
+the existing memory tool, not another tool or model service. `/mind handoff list`,
+`/mind handoff show <id>`, `/mind handoff complete <id> <revision> <resolution>` and
+`/mind handoff forget <id> <revision>` provide operator access.
+
+Handoffs belong to the actual project and active persona, with the native source session/branch
+and cwd recorded as provenance. A later independent session may explicitly read the same owner's
+handoff. Home sessions and delegated workers cannot access this surface. The live owner is checked
+before IO, after reads and under the write lock; branch/session changes revoke pending operations.
+Stored content is untrusted, scanned and fenced. References remain literal strings, never automatic
+file reads or tool instructions.
+
+One `<STM store>.handoffs.json` sidecar holds up to 32 entries / 128 KiB, shared by personas with
+owner-filtered access. Each record, including metadata, is limited to 16 KiB; the normal store backup
+also applies. Listing uses 160-character goal previews and a 40 KiB formatted-output bound. Explicit
+full reads are bounded to 100 KiB after JSON escaping; neither path silently truncates stored records.
+There is no TTL or automatic eviction: at quota, a new save fails until explicit forgetting frees
+space. Completion increments the revision and records a resolution; earlier pending work remains
+historical. It does not verify tests, execute pending tasks or claim a restored worker session.
+Handoffs never join active fact recall, injection, consolidation or session-note replay.
+`/mind reset` clears working memory and backlog only; handoffs require explicit `forget` by ID and
+revision. This preserves a handoff intended for a later session during routine workspace cleanup.
+
+## Replacement history
+
+An ordinary `remember` with `supersedes` that retires an existing fact writes a before/after receipt
+through the same write-ahead/CAS helper and bounded store used by consolidation. `origin: replacement`
+distinguishes it from `optimization`; it has no invented plan ID or model-generated reason. If the
+destination already contains the resulting fact, its prior metadata is retained as well. Plain saves,
+exact re-recording, self-supersession and missing-source lineage do not create receipt noise.
+
+`memory { action: "history", target: "project-long" }` and `/mind history project-long` list compact
+metadata. For detail, provide `receiptId` and an explicit target; `offset` pages 12,000 UTF-16 units
+of serialized before/after JSON. `/mind history show <receiptId> <target> [offset]` is the command
+equivalent. Targets are `project` (working memory), `project-long`, `persona` and `shared`; listing
+defaults to `project`. `/mind optimize history` uses the same compact discovery view.
+
+Only the modifying persona can inspect its receipts, with persisted-content scanning on reads.
+Historical values remain outside active recall and injection. Ordinary replacement receipts are
+read-only: optimizer undo refuses them. Consolidation receipts retain their guarded undo path.
+Retention and interrupted-write behavior are the same for both origins, as described below.
+`/mind reset` does not delete these receipts; history follows its own bounded retention policy.
+Ordinary saves and replacements recheck the accepting session/branch/persona at admission and under
+the store lock. A source or replacement that expires while awaiting commit is refused. Revocation
+after a completed write reports possible persistence in the original scope without exposing stale
+record content or claiming rollback.
 
 ## Explicit consolidation
 
@@ -462,7 +520,7 @@ language detector, language-specific factor, local tokenizer execution or runtim
 The reference encoding is not the current model's billing counter, and eight curated vectors do not
 establish broad language coverage or justify automatic budget tuning. The runtime budget is unchanged.
 
-Tests isolate PI_PERSONA_* and a throwaway PI_AGENT_DIR, use the actual Pi 1.5.2 SDK/tool pipeline and
+Tests isolate PI_PERSONA_* and a throwaway PI_AGENT_DIR, use the actual Pi 1.6.0 SDK/tool pipeline and
 offline providers, and join session_shutdown before SDK disposal. Native session tests cover persisted
 reopen, branch/fork, in-memory behavior and owner revocation. Store tests cover lost writes, stale plans,
 invalid inputs and concurrent apply. Installed-host/package qualification complements source tests.

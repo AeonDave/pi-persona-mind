@@ -1,6 +1,25 @@
 # Changelog
 
-## [Unreleased]
+## [0.9.3](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.9.3) - 2026-11-22
+
+- Improve lexical recall for camelCase/acronyms and vowel accents with weaker fallback scores;
+  preserve Unicode, exact paths, numeric versions and negation. Extend the offline evaluator with
+  the preceding implementation, negative controls and a separate labelled holdout.
+- Retain before/after receipts for ordinary explicit memory replacements in the existing bounded
+  history. Discover them with `memory history` or `/mind history`, then page the full retained detail.
+  Historical facts stay outside active recall; ordinary replacement undo is deliberately unavailable.
+- Add explicit project/persona handoffs with goals, completed/pending work, next steps, references
+  and native session/branch provenance. Read them in later sessions; completion and forgetting require
+  the current revision. No automatic expiry, injection, model call or worker restoration is involved.
+- Target and qualify Pi 1.6.0, keeping all four development host packages aligned and unbundled.
+- Recheck the accepting memory owner and replacement expiry under the write lock. Refuse malformed
+  history/handoff records, keep discovery output bounded, and distinguish branch navigation from
+  ordinary native-session appends.
+
+- Preserve recording provenance and lineage when an identical memory is recorded again without
+  replacement metadata.
+- Refuse `remember` replacements whose `supersedes` target exists only in another memory tier,
+  instead of reporting success while keeping both facts active. No cross-tier deletion is implied.
 
 ## [0.9.2](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.9.2) - 2026-11-18
 

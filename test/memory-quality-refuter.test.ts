@@ -146,9 +146,11 @@ test("promotion preserves graduation but never retires a lineage handle that bec
 	try {
 		const mind = new MindService({ persona: "elite", slug: "repo", projectRoot: dir, paths: mindPaths(dir, "elite", "repo") }, { now: () => T });
 		const text = "Build flag policy";
-		const original = await mind.remember({ term: "long", scope: "persona", kind: "note", text, tags: ["a,b"] }); assert.ok(original.ok);
 		const alias = legacyContentId("note", text, ["a,b"]);
+		// The working fact retains historical lineage before that handle becomes live elsewhere.
+		// A fresh remember cannot supersede an existing fact in a different destination tier.
 		const working = await mind.remember({ term: "short", kind: "note", text: "Reviewed replacement build policy", supersedes: alias }); assert.ok(working.ok);
+		const original = await mind.remember({ term: "long", scope: "persona", kind: "note", text, tags: ["a,b"] }); assert.ok(original.ok);
 		const shared = await mind.remember({ term: "long", scope: "shared", kind: "note", text, tags: ["a", "b"] }); assert.ok(shared.ok);
 		assert.equal((await mind.forget(alias, "long")).reason, "ambiguous_id");
 		const promoted = await mind.promote(working.entry.id, "persona"); assert.ok(promoted.ok);

@@ -1,4 +1,4 @@
-/** Actual Pi 1.5.2 branch/shutdown lifecycle, real stores and deterministic persistence gates.
+/** Actual Pi 1.6.0 branch/shutdown lifecycle, real stores and deterministic persistence gates.
  * Only Persona's worker transport is an offline protocol fixture, not a real model call. */
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";

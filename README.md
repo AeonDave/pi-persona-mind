@@ -1,7 +1,7 @@
 <h1 align="center">pi-persona-mind</h1>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v0.9.2/assets/banner.png" alt="pi-persona-mind — durable memory for Pi">
+  <img src="https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v0.9.3/assets/banner.png" alt="pi-persona-mind — durable memory for Pi">
 </p>
 
 [![CI](https://github.com/AeonDave/pi-persona-mind/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/AeonDave/pi-persona-mind/actions/workflows/test.yml)
@@ -12,12 +12,15 @@
 and deferred work without turning every conversation into permanent memory.
 Mind complements Pi's native conversation history and compaction; it does not replace them.
 
+## Features
+
 | What you need | What Mind provides |
 |---|---|
-| Continue a long project | Durable repository decisions, scoped preferences and session notes that survive compaction |
-| Keep context focused | Bounded retrieval by words, tags and paths, with explicit full-record reads |
+| Continue a long project | Durable repository decisions, session notes and explicit handoffs for the next session |
+| Keep context focused | Bounded retrieval by words, code identifiers, tags and paths, with explicit full-record reads |
 | See what the agent remembers | **F10**: saved facts, prepared context and an active-branch timeline |
 | Maintain a growing archive | Bounded consolidation, evidence-grounded review, change history and guarded undo |
+| Understand a changed decision | Retained before/after records for explicit replacements, kept out of active recall |
 
 Memory is stored in local files and Pi's native session history. Recall and browsing need no model
 call. [Automatic consolidation](#quiet-automatic-maintenance) is on by default; it and explicit
@@ -25,7 +28,7 @@ knowledge reviews use the current session model and incur model usage.
 
 ## Quick start
 
-Mind 0.9.2 requires **Pi 1.5.2**, **Node.js 22.19.0+**, and
+Mind 0.9.3 requires **Pi 1.6.0**, **Node.js 22.19.0+**, and
 [**pi-persona 1.18.1+**](https://github.com/AeonDave/pi-persona) loaded in the same instance.
 
 ```bash
@@ -49,6 +52,7 @@ Try asking your agent:
 - “Remember this preference across projects for this persona.”
 - “Put the blocked migration in the backlog and remind me tomorrow.”
 - “Recall the decision about retries and show the complete saved record.”
+- “Save a handoff with the goal, completed work, remaining work, next step and references.”
 
 Press **F10** to inspect what Mind has saved and prepared. Use **`/mind`** for a snapshot,
 **`/mind help`** for commands and **`/mind doctor`** for effective settings and storage warnings.
@@ -78,8 +82,10 @@ project injection and reminders. See [lifetimes and scope](docs/DESIGN.md#four-l
 
 ## Retrieval and inspection
 
-Mind selects relevant excerpts each turn within one shared context budget. Words, tags and paths
-drive retrieval; lexical matching can miss paraphrases or conflicting facts. Use `memory recall`
+Mind selects relevant excerpts each turn within one shared context budget. Exact words and paths
+receive more weight than matches across code identifiers (`HTTPResponseParser` → “HTTP response parser”)
+and vowel accents (`café` → “cafe”). Unicode text remains searchable. This is lexical retrieval;
+it can miss paraphrases or conflicting facts. Use `memory recall`
 to search and `memory read` to inspect a complete record. The budget is an estimate, not a billing counter.
 
 **F10** toggles the read-only inspector in the interactive TUI:
@@ -100,6 +106,12 @@ windows keep the selection visible, and **?** opens help. See the
 [inspector design](docs/DESIGN.md#read-only-memory-inspector) for navigation, sources and coverage.
 
 ## Maintain knowledge deliberately
+
+**Decision history** keeps the previous fact when an explicit replacement retires it. Use
+`/mind history project-long` to find a receipt and `/mind history show <receiptId> project-long`
+to inspect its before/after records. Old facts stay out of active recall and injected context.
+History is bounded; ordinary replacements are inspectable, while guarded undo applies to consolidation.
+[History and retention →](docs/DESIGN.md#replacement-history)
 
 **Consolidation** merges compatible saved facts and applies validated changes. `/mind optimize`
 reviews one bounded window per allowed project/persona tier; `/mind optimize project-long` selects
@@ -135,6 +147,18 @@ Use `/mind optimize auto status`, `/mind optimize auto off` or `/mind optimize a
 session. `PI_PERSONA_MIND_OPTIMIZE=off` disables automatic optimization at startup. Capture can be set
 with `PI_PERSONA_MIND_CAPTURE=auto|prompt|off`, and `PI_PERSONA_MIND_NUDGE=off` disables suggestions.
 See [automatic review](docs/DESIGN.md#automatic-semantic-review) for admission and cost details.
+
+## Hand off a long task
+
+Ask the agent to save a handoff before switching sessions. It records the goal, completed work,
+pending work, next step and references, together with the originating session and branch.
+In a new session with the same project and persona, use **`/mind handoff list`** and
+**`/mind handoff show <id>`** to consult it.
+
+A handoff is an explicit work snapshot, not proof that a task is complete. It is never injected or
+executed automatically. Completion requires a resolution; forgetting is explicit. Up to 32 handoffs
+share a bounded project file, with no automatic expiry or eviction.
+[Commands, ownership and limits →](docs/DESIGN.md#cross-session-handoffs)
 
 ## Learn more
 

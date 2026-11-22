@@ -1,14 +1,14 @@
 /** Session-local staged plans over strict one-file memory snapshots. No model calls or hidden jobs. */
 import { randomUUID } from "node:crypto";
 import { isExpired, isSafeMemoryContent, MAX_RECALL_QUERY_CHARS, type MemoryEntry } from "./memory.ts";
-import { MAX_OPTIMIZE_HISTORY, MAX_OPTIMIZE_HISTORY_BYTES, OptimizeHistoryStore, restoreReceipt, type OptimizeHistory, type OptimizeReceipt, type OptimizeUndone } from "./optimize-history.ts";
+import { MAX_OPTIMIZE_HISTORY, MAX_OPTIMIZE_HISTORY_BYTES, OptimizeHistoryStore, restoreReceipt, type OptimizeHistory, type OptimizeReceipt, type OptimizeReceiptDetail, type OptimizeUndone } from "./optimize-history.ts";
 import {
 	isOptimizeTarget, MAX_OPTIMIZE_ENTRIES, MAX_OPTIMIZE_PLANS, OPTIMIZE_PLAN_TTL_MS,
 	optimizeCandidates, planConsolidation,
 	type OptimizeApplied, type OptimizeFailure, type OptimizeInspection, type OptimizeInspectOptions,
 	type OptimizePlan, type OptimizePreviewInput, type OptimizeTarget,
 } from "./optimize.ts";
-import { DEFAULT_STORE_MAX_ENTRIES, type JsonStore, StoreConflictError, withFileLock } from "./store.ts";
+import { DEFAULT_STORE_MAX_ENTRIES, type JsonStore, withFileLock } from "./store.ts";
 
 export interface MemoryOptimizerOptions {
 	stores: Record<OptimizeTarget, JsonStore<MemoryEntry>>;
@@ -90,38 +90,23 @@ export class MemoryOptimizer {
 		try {
 			let receiptId: string | undefined;
 			let warning: string | undefined;
-			const commit = async () => this.historyStore(staged.plan.target).exclusive(async () => {
+			const commit = async () => {
 				const assertCurrent = () => {
 					if (this.plans.get(planId) !== staged || this.now() >= Date.parse(staged.plan.expiresAt)) throw new Error("plan expired or invalidated; inspect and stage again");
 					if (staged.plan.changes.some((change) => change.before.some((entry) => isExpired(entry, this.now())))) throw new Error("a source expired since preview; inspect and stage again");
+					assertEvidenceFresh?.();
 				};
-				assertCurrent();
-				assertEvidenceFresh?.();
 				const store = this.options.stores[staged.plan.target];
-				if ((await store.inspectStrict()).fingerprint !== staged.plan.fingerprint) throw new StoreConflictError();
 				const history = this.historyStore(staged.plan.target);
+				let receipt: OptimizeReceipt | undefined;
 				if (staged.plan.changes.length) {
 					receiptId = randomUUID();
-					const receipt: OptimizeReceipt = { receiptId, planId, target: staged.plan.target, persona: this.options.persona, createdAt: new Date(this.now()).toISOString(), state: "prepared", storePath: store.filePath, changes: structuredClone(staged.plan.changes) };
-					await history.prepare(receipt);
+					receipt = { receiptId, planId, origin: "optimization", target: staged.plan.target, persona: this.options.persona, createdAt: new Date(this.now()).toISOString(), state: "prepared", storePath: store.filePath, changes: structuredClone(staged.plan.changes) };
 				}
-				let callbackRejected = false;
-				try {
-					await store.compareAndUpdate(staged.plan.fingerprint, () => {
-						try { assertCurrent(); assertEvidenceFresh?.(); return structuredClone(staged.next); }
-						catch (error) { callbackRejected = true; throw error; }
-					});
-				} catch (error) {
-					// A generic IO failure may occur after rename. Preserve its prepared before images.
-					if (receiptId && (callbackRejected || error instanceof StoreConflictError)) await history.settle(receiptId, "rejected").catch(() => {});
-					throw error;
-				}
+				const result = await history.commit(store, staged.plan.fingerprint, receipt, () => structuredClone(staged.next), assertCurrent);
 				this.plans.delete(planId);
-				if (receiptId) {
-					try { await history.settle(receiptId, "applied"); }
-					catch { warning = "replacement committed; durable receipt remains prepared because history finalization failed"; }
-				}
-			});
+				warning = result.warning;
+			};
 			if (this.options.mutationLock) await withFileLock(this.options.mutationLock, commit); else await commit();
 			return { ok: true, planId, target: staged.plan.target, changed: staged.plan.changes.length, beforeCount: staged.plan.beforeCount, afterCount: staged.plan.afterCount, ...(receiptId ? { receiptId } : {}), ...(warning ? { warning } : {}) };
 		} catch (error) { return failure(error); }
@@ -137,6 +122,15 @@ export class MemoryOptimizer {
 			const receipts = safe.slice().reverse().slice(0, Math.min(MAX_OPTIMIZE_HISTORY, Math.floor(max)));
 			return { ok: true, target, receipts, retained: all.length, omitted: safe.length - receipts.length, withheldUnsafe: all.length - safe.length, limit: MAX_OPTIMIZE_HISTORY, maxBytes: MAX_OPTIMIZE_HISTORY_BYTES };
 		} catch (error) { return failure(error); }
+	}
+
+	/** Exact, bounded read through the same owner/content filters as history; no active-store IO. */
+	async getReceipt(receiptId: string, target: OptimizeTarget): Promise<OptimizeReceiptDetail | OptimizeFailure> {
+		if (typeof receiptId !== "string" || !/^[\da-f-]{36}$/i.test(receiptId)) return { ok: false, reason: "invalid memory receipt id" };
+		const history = await this.history(target, MAX_OPTIMIZE_HISTORY);
+		if (!history.ok) return history;
+		const receipt = history.receipts.find((entry) => entry.receiptId === receiptId);
+		return receipt ? { ok: true, target, receipt } : { ok: false, reason: "memory receipt not found in this scope, unsafe, or no longer retained" };
 	}
 
 	async undo(receiptId: string, target?: OptimizeTarget): Promise<OptimizeUndone | OptimizeFailure> {

@@ -8,10 +8,15 @@ import { diagnoseTokenReference } from "./token-diagnostic.ts";
 import { renderMind } from "../src/core/inject.ts";
 import type { MemoryEntry } from "../src/core/memory.ts";
 import { rankMemoryEntries } from "../src/core/retrieval.ts";
+import { rankMemoryEntries as priorLexicalRank } from "../test/fixtures/pre-normalization-retrieval.ts";
+import { renderMind as priorRenderMind } from "../test/fixtures/pre-normalization-inject.ts";
+import { HELDOUT_RETRIEVAL_CASES, HELDOUT_RETRIEVAL_FACTS } from "../test/fixtures/retrieval-heldout.ts";
 import {
 	MEMORY_EVALUATION_CASES,
 	MEMORY_EVALUATION_FACTS,
 	MEMORY_EVALUATION_NOW,
+	NORMALIZATION_EVALUATION_CASES,
+	NORMALIZATION_EVALUATION_FACTS,
 	type MemoryEvaluationCase,
 	type MemoryEvaluationFact,
 } from "../test/fixtures/memory-evaluation.ts";
@@ -23,6 +28,21 @@ interface MethodMetrics {
 	judgedCases: number;
 	abstentionCases: number;
 	abstentionCorrect: number;
+	falsePositiveResultsAt3: number;
+	negativeQueriesWithResults: number;
+}
+
+interface NormalizationMethodMetrics extends MethodMetrics {
+	injectedRelevantCases: number;
+	injectedNonRelevantFacts: number;
+}
+
+interface NormalizationCohort {
+	facts: number;
+	cases: number;
+	baseline: NormalizationMethodMetrics;
+	improved: NormalizationMethodMetrics;
+	budget: { ltm: number; projectLtm: number; stm: number; backlog: number; tokens: number };
 }
 
 interface SentinelCaseOutcome {
@@ -49,8 +69,10 @@ export interface MemoryEvaluationReport {
 	evaluation: "synthetic deterministic lexical retrieval";
 	facts: number;
 	cases: number;
-	methods: { substringBaseline: MethodMetrics; ranked: MethodMetrics };
+	methods: { substringBaseline: MethodMetrics; lexicalBaseline: MethodMetrics; ranked: MethodMetrics };
+	normalization: { development: NormalizationCohort; heldout: NormalizationCohort };
 	sentinels: { cases: SentinelCaseOutcome[]; groups: SentinelGroupOutcome[]; passedCases: number; totalCases: number; allPassed: boolean };
+	sentinelBaseline: MemoryEvaluationReport["sentinels"];
 	injection: { maxCharacters: number; maxEstimatedTokens: number; tokenBudget: number; withinBudget: boolean };
 	tokenReference: ReturnType<typeof diagnoseTokenReference>;
 	limits: string[];
@@ -71,6 +93,10 @@ function rankedMethod(entries: readonly MemoryEvaluationFact[], query: string): 
 	return rankMemoryEntries(entries, query).filter((ranked) => ranked.score > 0).map((ranked) => ranked.entry);
 }
 
+function priorLexicalMethod(entries: readonly MemoryEvaluationFact[], query: string): MemoryEntry[] {
+	return priorLexicalRank(entries, query).filter((ranked) => ranked.score > 0).map((ranked) => ranked.entry);
+}
+
 function scoreMethod(cases: readonly MemoryEvaluationCase[], entries: readonly MemoryEvaluationFact[], rank: RankFunction): MethodMetrics {
 	const judged = cases.filter((item) => item.relevantIds.length > 0);
 	let hitAt1 = 0;
@@ -85,6 +111,8 @@ function scoreMethod(cases: readonly MemoryEvaluationCase[], entries: readonly M
 	}
 	const abstentionCases = cases.filter((item) => item.relevantIds.length === 0);
 	const abstentionCorrect = abstentionCases.filter((item) => rank(entries, item.query).length === 0).length;
+	const falsePositiveResultsAt3 = cases.reduce((total, item) => total + rank(entries, item.query).slice(0, 3)
+		.filter((entry) => !item.relevantIds.includes(entry.id) && !item.acceptableIds?.includes(entry.id)).length, 0);
 	const rate = (value: number, denominator: number): number => denominator === 0 ? 0 : Number((value / denominator).toFixed(3));
 	return {
 		hitAt1: rate(hitAt1, judged.length),
@@ -93,12 +121,17 @@ function scoreMethod(cases: readonly MemoryEvaluationCase[], entries: readonly M
 		judgedCases: judged.length,
 		abstentionCases: abstentionCases.length,
 		abstentionCorrect,
+		falsePositiveResultsAt3,
+		negativeQueriesWithResults: abstentionCases.length - abstentionCorrect,
 	};
 }
 
-function renderFixtureMemory(entries: readonly MemoryEvaluationFact[], item: MemoryEvaluationCase): string {
+function renderFixtureMemory(entries: readonly MemoryEvaluationFact[], item: MemoryEvaluationCase,
+	render: typeof renderMind = renderMind,
+	budget = { ltm: 8, projectLtm: 4, stm: 5, backlog: 0, tokens: DEFAULT_MEMORY_CONTEXT_TOKENS },
+): string {
 	const split = (tier: MemoryEvaluationFact["tier"]): MemoryEvaluationFact[] => entries.filter((entry) => entry.tier === tier);
-	return renderMind({
+	return render({
 		persona: "elite",
 		ltm: split("persona"),
 		projectLtm: split("project"),
@@ -106,11 +139,31 @@ function renderFixtureMemory(entries: readonly MemoryEvaluationFact[], item: Mem
 		backlog: [],
 		now: MEMORY_EVALUATION_NOW,
 		query: item.query,
-		budget: { ltm: 8, projectLtm: 4, stm: 5, backlog: 0, tokens: DEFAULT_MEMORY_CONTEXT_TOKENS },
+		budget,
 	});
 }
 
-function evaluateSentinels(cases: readonly MemoryEvaluationCase[], entries: readonly MemoryEvaluationFact[]): MemoryEvaluationReport["sentinels"] {
+function evaluateNormalizationCohort(entries: readonly MemoryEvaluationFact[], cases: readonly MemoryEvaluationCase[]): NormalizationCohort {
+	// Both methods see the same full corpus, scopes and constraints; only the frozen ranker differs.
+	const budget = { ltm: 2, projectLtm: 2, stm: 2, backlog: 0, tokens: 400 };
+	const measure = (rank: RankFunction, render: typeof renderMind): NormalizationMethodMetrics => {
+		let injectedRelevantCases = 0;
+		let injectedNonRelevantFacts = 0;
+		for (const item of cases) {
+			const block = renderFixtureMemory(entries, item, render, budget);
+			if (estimateTokens(block) > budget.tokens) throw new Error("Normalization injection exceeds its common token budget");
+			const injected = entries.filter((entry) => block.includes(entry.text));
+			if (injected.some((entry) => item.relevantIds.includes(entry.id))) injectedRelevantCases++;
+			injectedNonRelevantFacts += injected.filter((entry) => !item.relevantIds.includes(entry.id) && !item.acceptableIds?.includes(entry.id)).length;
+		}
+		return { ...scoreMethod(cases, entries, rank), injectedRelevantCases, injectedNonRelevantFacts };
+	};
+	return { facts: entries.length, cases: cases.length, baseline: measure(priorLexicalMethod, priorRenderMind), improved: measure(rankedMethod, renderMind), budget };
+}
+
+function evaluateSentinels(cases: readonly MemoryEvaluationCase[], entries: readonly MemoryEvaluationFact[],
+	rankEntries: typeof priorLexicalRank = rankMemoryEntries, render: typeof renderMind = renderMind,
+): MemoryEvaluationReport["sentinels"] {
 	const byId = new Map(cases.map((item) => [item.id, item]));
 	if (byId.size !== cases.length) throw new Error("Memory evaluation case IDs must be unique");
 	const sentinelCases = cases.filter((item) => item.sentinel !== undefined);
@@ -128,10 +181,10 @@ function evaluateSentinels(cases: readonly MemoryEvaluationCase[], entries: read
 	const outcomes: SentinelCaseOutcome[] = sentinelCases.map((item) => {
 		const sentinel = item.sentinel;
 		if (!sentinel) throw new Error(`Missing sentinel expectation for ${item.id}`);
-		const ranked = rankMemoryEntries(entries, item.query).filter((result) => result.score > 0);
+		const ranked = rankEntries(entries, item.query).filter((result) => result.score > 0);
 		const rankIndex = ranked.findIndex((result) => result.entry.id === sentinel.expectedId);
 		const fact = entries.find((entry) => entry.id === sentinel.expectedId);
-		const block = renderFixtureMemory(entries, item);
+		const block = renderFixtureMemory(entries, item, render);
 		const rank = rankIndex < 0 ? null : rankIndex + 1;
 		const injected = fact !== undefined && block.includes(fact.text);
 		const paired = sentinel.pairWith === undefined ? undefined : byId.get(sentinel.pairWith);
@@ -186,9 +239,15 @@ export function evaluateMemoryFixture(
 		cases: cases.length,
 		methods: {
 			substringBaseline: scoreMethod(cases, entries, priorSubstringBaseline),
+			lexicalBaseline: scoreMethod(cases, entries, priorLexicalMethod),
 			ranked: scoreMethod(cases, entries, rankedMethod),
 		},
+		normalization: {
+			development: evaluateNormalizationCohort(NORMALIZATION_EVALUATION_FACTS, NORMALIZATION_EVALUATION_CASES),
+			heldout: evaluateNormalizationCohort(HELDOUT_RETRIEVAL_FACTS, HELDOUT_RETRIEVAL_CASES),
+		},
 		sentinels: evaluateSentinels(cases, entries),
+		sentinelBaseline: evaluateSentinels(cases, entries, priorLexicalRank, priorRenderMind),
 		injection: {
 			maxCharacters,
 			maxEstimatedTokens,
@@ -198,6 +257,9 @@ export function evaluateMemoryFixture(
 		tokenReference: diagnoseTokenReference(),
 		limits: [
 			"Hand-authored synthetic data; this is not model-driven semantic-quality evaluation.",
+			"Heldout cases were independently supervisor-labelled and withheld during initial implementation; this small sample is not an external benchmark.",
+			"Prior lexical ranker and renderer are frozen repository-source test fixtures; scopes and budgets are identical within each comparison.",
+			"False positives count non-labelled/ non-acceptable results in the first three positive-score recall rows. Injection can include non-relevant standing context even on a negative query; its separate count is not recall precision.",
 			"Tags are explicit lexical bridges; no synonym table or embedding service is used.",
 			"Estimated tokens use UTF-8 bytes divided by three, not a provider tokenizer.",
 			"Published cl100k_base vector counts are reference data, not current-model tokenizer or billing counts; source literals were transcribed and not locally tokenizer-verified.",

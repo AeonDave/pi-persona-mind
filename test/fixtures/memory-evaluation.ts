@@ -15,8 +15,10 @@ export interface MemoryEvaluationSentinel {
 export interface MemoryEvaluationCase {
 	id: string;
 	query: string;
-	/** Empty only for the explicit no-shared-vocabulary abstention case. */
+	/** Empty for explicit negative/abstention controls. */
 	relevantIds: readonly string[];
+	/** Declared weaker lexical alternatives, excluded from false-positive counts but not counted as hits. */
+	acceptableIds?: readonly string[];
 	why: string;
 	sentinel?: MemoryEvaluationSentinel;
 }
@@ -80,6 +82,35 @@ export const MEMORY_EVALUATION_FACTS: readonly MemoryEvaluationFact[] = [
 	fact("no-synonym", "note", "Compaction preserves the active branch and latest summary for later reading.", ["active branch", "compaction"], "project", 9),
 	fact("irrelevant-theme", "note", "The release screenshot uses a dark theme and a 1.17.4 icon.", ["screenshot", "theme"], "project", 0),
 	fact("irrelevant-mobile", "note", "The mobile app uses Playwright screenshots for navigation menus.", ["mobile", "screenshots"], "working", 0),
+];
+
+/** Development examples, synthetic and deliberately distinct from repository records. */
+export const NORMALIZATION_EVALUATION_FACTS: readonly MemoryEvaluationFact[] = [
+	fact("norm-owner", "note", "resolveMemoryOwner chooses the active notebook.", [], "persona", 30),
+	fact("norm-http", "note", "parseHTTPResponse validates payloads.", [], "persona", 29),
+	fact("norm-cafe", "note", "The café kiosk prints receipts.", [], "persona", 28),
+	fact("norm-resume", "note", "The résumé template uses a single column.", [], "persona", 27),
+	fact("norm-naive", "note", "A naïve estimator ignores correlated samples.", [], "persona", 26),
+	fact("norm-year", "note", "año", [], "persona", 25),
+	fact("norm-version", "note", "v2.14.9", [], "persona", 24),
+	fact("norm-hash", "note", "a17bc92f", [], "persona", 23),
+	fact("norm-longer", "note", "memoryOwnership", [], "persona", 22),
+	fact("norm-noise", "note", "Paint the dashboard teal.", [], "persona", 0),
+];
+
+export const NORMALIZATION_EVALUATION_CASES: readonly MemoryEvaluationCase[] = [
+	{ id: "camel-words", query: "memory owner", relevantIds: ["norm-owner"], why: "identifier word boundaries" },
+	{ id: "acronym-words", query: "http response", relevantIds: ["norm-http"], why: "acronym boundary" },
+	{ id: "cafe-accent", query: "cafe", relevantIds: ["norm-cafe"], why: "vowel-accent bridge" },
+	{ id: "resume-accent", query: "resume", relevantIds: ["norm-resume"], why: "vowel-accent bridge" },
+	{ id: "naive-accent", query: "naive", relevantIds: ["norm-naive"], why: "vowel-accent bridge" },
+	{ id: "camel-original", query: "resolveMemoryOwner", relevantIds: ["norm-owner"], why: "original identifier retained" },
+	{ id: "version-original", query: "v2.14.9", relevantIds: ["norm-version"], why: "original version retained" },
+	{ id: "consonant-collision", query: "ano", relevantIds: [], why: "ñ remains distinct" },
+	{ id: "version-neighbor", query: "v2.14.8", relevantIds: [], why: "version components cannot produce partial positives" },
+	{ id: "hash-neighbor", query: "a17bc92e", relevantIds: [], why: "no fuzzy identifier matching" },
+	{ id: "word-neighbor", query: "ownerships", relevantIds: [], why: "no stemming" },
+	{ id: "unknown-vocabulary", query: "quasar", relevantIds: [], why: "no unrelated fallback in recall" },
 ];
 
 export const MEMORY_EVALUATION_CASES: readonly MemoryEvaluationCase[] = [

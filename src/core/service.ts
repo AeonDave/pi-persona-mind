@@ -9,6 +9,7 @@
  * (same default life; a later wake extends it).
  */
 
+import { randomUUID } from "node:crypto";
 import type { BacklogEntry, BacklogState, TransitionResult } from "./backlog.ts";
 import { clampBacklogMax, compactTerminal, makeBacklog, openItems, orderBacklog, pruneExpired as pruneExpiredBacklog, transition, validateBacklog, viewFor, MAX_BACKLOG_NOTE_CHARS, MAX_BACKLOG_TAGS, MAX_BACKLOG_TAG_CHARS, MAX_BACKLOG_TEXT_CHARS } from "./backlog.ts";
 import { contentId } from "./ids.ts";
@@ -16,7 +17,8 @@ import type { MindBudget } from "./inject.ts";
 import { renderMind } from "./inject.ts";
 import { readMemory, memoryTargets, type MemoryReadResult, type MemoryReadScope } from "./memory-read.ts";
 import { MemoryOptimizer } from "./optimize-service.ts";
-import { samePersistedMemory } from "./optimize.ts";
+import { OptimizeHistoryStore, type OptimizeReceipt } from "./optimize-history.ts";
+import { samePersistedMemory, type OptimizeTarget } from "./optimize.ts";
 import type { MemoryEntry, MemoryInput, MemoryKind } from "./memory.ts";
 import { clampRecallMax, isExpired, isMemoryId, isSafeMemoryContent, makeMemory, memoryContentKey, memoryIdMatches, promoteToLong, pruneExpired, recall, sameMemoryContent, supersedeTargets, upsertMemory, validateLongMemory, validateShortMemory, MAX_MEMORY_DERIVED_IDS, MAX_MEMORY_ID_CHARS, MAX_MEMORY_SOURCE_CHARS, MAX_MEMORY_TAGS, MAX_MEMORY_TAG_CHARS, MAX_MEMORY_TEXT_CHARS } from "./memory.ts";
 import { scanContent } from "./scanner.ts";
@@ -32,6 +34,8 @@ export interface MindServiceOptions {
 	now?: () => number;
 	onWarn?: (message: string) => void;
 	budget?: MindBudget;
+	/** Runtime owner snapshot for remember admission/commit; omitted by standalone store callers. */
+	isCurrent?: () => boolean;
 }
 
 interface RememberInputBase {
@@ -82,7 +86,7 @@ export interface AmbiguousMemory {
 	resolves: boolean;
 }
 
-export type RememberResult = { ok: true; entry: MemoryEntry } | { ok: false; reason: string };
+export type RememberResult = { ok: true; entry: MemoryEntry; receiptId?: string; warning?: string } | { ok: false; reason: string };
 export type BacklogAddResult = { ok: true; entry: BacklogEntry } | { ok: false; reason: string };
 export type BacklogSetResult = { ok: true; entry: BacklogEntry } | { ok: false; reason?: string };
 export type ForgetResult = { removed: number; reason?: "ambiguous_id"; candidates?: AmbiguousMemory[] };
@@ -160,6 +164,7 @@ export class MindService {
 	private readonly backlog: JsonStore<BacklogEntry>;
 	private readonly memoryMutationLock: string;
 	private readonly warn: (message: string) => void;
+	private readonly isCurrent: () => boolean;
 
 	constructor(
 		scope: Scope,
@@ -169,6 +174,7 @@ export class MindService {
 		this.now = opts.now ?? Date.now;
 		this.budget = opts.budget;
 		this.warn = opts.onWarn ?? (() => {});
+		this.isCurrent = opts.isCurrent ?? (() => true);
 		const longOpts: JsonStoreOptions<MemoryEntry> = { version: STORE_VERSION, validateEntry: validateLongMemory, now: this.now };
 		const shortOpts: JsonStoreOptions<MemoryEntry> = { version: STORE_VERSION, validateEntry: validateShortMemory, now: this.now };
 		const backlogOpts: JsonStoreOptions<BacklogEntry> = { version: STORE_VERSION, validateEntry: validateBacklog, now: this.now };
@@ -239,6 +245,7 @@ export class MindService {
 
 	/** Store a memory (long or short term). Scanned + non-empty-checked before it is persisted. */
 	async remember(input: RememberInput): Promise<RememberResult> {
+		if (!this.rememberOwnerCurrent()) return { ok: false, reason: "memory owner is unavailable; no memory was stored" };
 		if (input.term !== "long" && input.term !== "short") return { ok: false, reason: "unknown memory term" };
 		if (input.scope !== undefined && !["project", "persona", "shared"].includes(input.scope)) return { ok: false, reason: "unknown memory scope" };
 		if (input.term === "long" && input.scope === undefined) return { ok: false, reason: "long-term memory requires an explicit scope: project, persona, or shared" };
@@ -281,36 +288,71 @@ export class MindService {
 		if (term === "short" || input.scope === "project") makeInput.persona = this.scope.persona;
 
 		const entry = makeMemory(makeInput, now);
-		const store = term === "short" ? this.stm : input.scope === "project" ? this.projectLtm : input.scope === "shared" ? this.shared : this.ltm;
+		const target: OptimizeTarget = term === "short" ? "project" : input.scope === "project" ? "project-long" : input.scope === "shared" ? "shared" : "persona";
+		const store = this.memoryStores()[target];
 		try {
-			let committed: MemoryEntry | undefined;
-			let ambiguous: { id: string; candidates: AmbiguousMemory[] } | undefined;
-			await withFileLock(this.memoryMutationLock, async () => {
-				if (entry.supersedes !== undefined) {
-					// Same contract as `forget`: a handle that addresses more than one fact retires none of
-					// them, and the caller is told so rather than silently getting a partial write. Read under
-					// the mutation lock every writer holds, so the answer cannot go stale before the update.
-					// The pool is the one `forget` resolves against — all durable/working stores, not just the one
-					// being written: a v1 comma-joined id can name a durable fact in `shared` and another in
-					// `ltm`, and a per-store check would still let the write destroy whichever copy sits in the
-					// target tier while the delete path refuses the identical handle.
-					const loaded = await Promise.all(Object.values(this.memoryStores()).map((memoryStore) => memoryStore.load()));
-					const visible = loaded.flatMap((snapshot) => pruneExpired(snapshot.entries, this.now()));
-					if (supersedeTargets(visible, entry.supersedes).ambiguous) {
-						ambiguous = { id: entry.supersedes, candidates: ambiguityCandidates(visible, entry.supersedes) };
-						return;
-					}
-				}
-				const updated = await store.update((es) => upsertMemory(term === "short" ? pruneExpired(es, this.now()) : es, entry));
-				committed = updated.entries.find((candidate) => sameMemoryContent(candidate, entry));
+			const result = await withFileLock(this.memoryMutationLock, async (): Promise<RememberResult> => {
+				this.assertRememberOwner();
+				if (entry.supersedes !== undefined) return this.rememberSuperseding(entry, target);
+				const updated = await store.update((es) => {
+					this.assertRememberOwner();
+					return upsertMemory(term === "short" ? pruneExpired(es, this.now()) : es, entry);
+				});
+				return { ok: true, entry: updated.entries.find((candidate) => sameMemoryContent(candidate, entry)) ?? entry };
 			});
-			if (ambiguous) {
-				return { ok: false, reason: ambiguousSupersedesReason(ambiguous.id, ambiguous.candidates) };
-			}
-			return { ok: true, entry: committed ?? entry };
+			if (result.ok && !this.rememberOwnerCurrent()) return { ok: false, reason: "memory owner changed while remember was running; the write may have committed in its original scope; inspect that scope before retrying" };
+			return result;
 		} catch (err) {
 			return { ok: false, reason: storageFailure(err) };
 		}
+	}
+
+	private rememberOwnerCurrent(): boolean {
+		try { return this.isCurrent(); } catch { return false; }
+	}
+
+	private assertRememberOwner(): void {
+		if (!this.rememberOwnerCurrent()) throw new Error("memory owner changed; remember refused before commit");
+	}
+
+	/** Under the memory transaction lock: resolve across tiers, but retire only in the destination. */
+	private async rememberSuperseding(entry: MemoryEntry, target: OptimizeTarget): Promise<RememberResult> {
+		const stores = Object.values(this.memoryStores());
+		const store = this.memoryStores()[target];
+		// Unlike recovery reads, strict snapshots cannot silently erase evidence before replacement.
+		const loaded = await Promise.all(stores.map((memoryStore) => memoryStore.inspectStrict()));
+		const visible = loaded.flatMap((snapshot) => pruneExpired(snapshot.store.entries, this.now()));
+		const resolved = supersedeTargets(visible, entry.supersedes!);
+		if (resolved.ambiguous) return { ok: false, reason: ambiguousSupersedesReason(entry.supersedes!, ambiguityCandidates(visible, entry.supersedes!)) };
+		const snapshot = loaded[stores.indexOf(store)]!;
+		const active = pruneExpired(snapshot.store.entries, this.now());
+		if (resolved.targets.length > 0 && !active.some((candidate) => memoryIdMatches(candidate, entry.supersedes!))) {
+			return { ok: false, reason: "memory supersedes id exists only outside the destination tier; use the source's scope and lifetime to replace it" };
+		}
+		const retired = supersedeTargets(active, entry.supersedes!).targets.filter((candidate) => !sameMemoryContent(candidate, entry));
+		const mutate = (entries: MemoryEntry[]) => {
+			this.assertRememberOwner();
+			if (isExpired(entry, this.now())) throw new Error("the replacement expired before commit; record the current fact again");
+			return upsertMemory(target === "project" ? pruneExpired(entries, this.now()) : entries, entry);
+		};
+		if (!retired.length) {
+			const updated = await store.compareAndUpdate(snapshot.fingerprint, mutate);
+			return { ok: true, entry: updated.entries.find((candidate) => sameMemoryContent(candidate, entry)) ?? entry };
+		}
+		const next = mutate(snapshot.store.entries);
+		const after = next.find((candidate) => sameMemoryContent(candidate, entry))!;
+		// If the new fact already exists, upsert also updates that row's metadata: retain it too.
+		const before = active.filter((candidate) => retired.includes(candidate) || sameMemoryContent(candidate, entry));
+		const receipt: OptimizeReceipt = { receiptId: randomUUID(), origin: "replacement", target, persona: this.scope.persona,
+			createdAt: new Date(this.now()).toISOString(), state: "prepared", storePath: store.filePath, changes: [{ before, after }] };
+		const history = new OptimizeHistoryStore(`${store.filePath}.optimize-history.json`, this.now);
+		const updated = await history.commit(store, snapshot.fingerprint, receipt, () => structuredClone(next), () => {
+			this.assertRememberOwner();
+			if (before.some((source) => isExpired(source, this.now()))) throw new Error("a superseded source expired before commit; record the current fact again");
+			if (isExpired(after, this.now())) throw new Error("the replacement expired before commit; record the current fact again");
+		});
+		return { ok: true, entry: updated.entries.find((candidate) => sameMemoryContent(candidate, entry))!, receiptId: receipt.receiptId,
+			...(updated.warning ? { warning: updated.warning } : {}) };
 	}
 
 	/** Preserve repository scope unless the caller explicitly selects a broader durable tier. */

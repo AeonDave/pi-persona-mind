@@ -172,14 +172,15 @@ test("memory remember and recall route explicit session scope to session notes o
 	assert.deepEqual(h.calls.mindRecall, ["both"], "both keeps its existing long+short meaning");
 });
 
-test("memory optimizer history exposes full recovery facts and undo requires an explicit target", async () => {
+test("memory optimizer history discovers receipts without dumping bodies and undo requires an explicit target", async () => {
 	const events: MindActivityEvent[] = [];
 	const activity = createMindActivityRunner({ sessionId: "native-session", enabled: () => true, isCurrent: () => true, emit: (_channel, payload) => events.push(payload) });
 	const h = makeToolHarness(activity);
 	const history = await execute(h, { action: "optimize", mode: "history", target: "project-long" });
 	assert.equal(history.details.ok, true);
 	assert.match(history.content[0]!.text, /prepared.*interrupted/i);
-	assert.match(history.content[0]!.text, /The user prefers small reviewable changes/);
+	assert.doesNotMatch(history.content[0]!.text, /The user prefers small reviewable changes/);
+	assert.match(history.content[0]!.text, /receiptId/);
 	const missingTarget = await execute(h, { action: "optimize", mode: "undo", receiptId: "receipt-1" });
 	assert.equal(missingTarget.details.ok, false);
 	const undone = await execute(h, { action: "optimize", mode: "undo", receiptId: "receipt-1", target: "project-long" });
