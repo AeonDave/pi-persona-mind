@@ -55,3 +55,24 @@ test("the public npm package has consistent identity, companion requirements and
 	assert.ok(existsSync(new URL("../assets/banner.png", import.meta.url)));
 	assert.equal(manifest.pi.image, `https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v${manifest.version}/assets/banner.png`);
 });
+
+test("every version statement agrees with the manifest", () => {
+	const manifest = json("../package.json");
+	const text = (relative: string) => readFileSync(new URL(relative, import.meta.url), "utf8");
+	const compat = text("../src/core/host-compat.ts");
+	const readme = text("../README.md");
+	const changelog = text("../CHANGELOG.md");
+	const floor = /MIN_PI_VERSION = "([^"]+)"/.exec(compat)?.[1];
+	assert.ok(floor, "host-compat.ts declares MIN_PI_VERSION");
+	for (const host of ["pi-ai", "pi-agent-core", "pi-coding-agent", "pi-tui"]) {
+		assert.equal(manifest.devDependencies[`@earendil-works/${host}`], floor, `${host} pin equals MIN_PI_VERSION`);
+	}
+	assert.ok(readme.includes(`Mind ${manifest.version} requires **Pi ${floor}**`), "README states the manifest version and the Pi floor");
+	assert.ok(changelog.includes(`## [${manifest.version}]`), "CHANGELOG has a heading for the manifest version");
+	assert.ok(changelog.includes(`/releases/tag/v${manifest.version})`), "CHANGELOG heading links the manifest version tag");
+	assert.ok(readme.includes(`pi-persona-mind/v${manifest.version}/assets/banner.png`), "README banner uses the manifest tag");
+	assert.ok(manifest.pi.image.includes(`/v${manifest.version}/`), "manifest banner URL uses the manifest tag");
+	const range = /^>=(\d+\.\d+\.\d+)$/.exec(manifest.peerDependencies["@aeondave/pi-persona"])?.[1];
+	assert.ok(range, "the pi-persona peer is a >= range");
+	assert.ok(readme.includes(`pi-persona ${range}+`), "README states the pi-persona range the manifest requires");
+});

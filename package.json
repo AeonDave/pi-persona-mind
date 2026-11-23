@@ -3,7 +3,7 @@
   "version": "0.9.3",
   "private": false,
   "type": "module",
-  "description": "Local memory for Pi with pi-persona \u2014 durable project and persona facts, session notes, bounded retrieval, and supervised automatic consolidation.",
+  "description": "Local memory for Pi with pi-persona — durable project and persona facts, session notes, bounded retrieval, and supervised automatic consolidation.",
   "keywords": [
     "pi-package",
     "pi-extension",
