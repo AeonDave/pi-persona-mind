@@ -48,8 +48,19 @@ test("normalization comparison freezes the previous ranker and measures precisio
 	assert.deepEqual([heldout.baseline.hitAt3, heldout.improved.hitAt3], [0.857, 1]);
 	assert.deepEqual([heldout.baseline.injectedRelevantCases, heldout.improved.injectedRelevantCases], [6, 7]);
 	assert.deepEqual([heldout.baseline.falsePositiveResultsAt3, heldout.improved.falsePositiveResultsAt3], [5, 3]);
+	assert.deepEqual([heldout.baseline.strictFalsePositiveResultsAt3, heldout.improved.strictFalsePositiveResultsAt3], [5, 5]);
+	assert.deepEqual([development.baseline.strictFalsePositiveResultsAt3, development.improved.strictFalsePositiveResultsAt3], [1, 1]);
 	assert.deepEqual([heldout.baseline.negativeQueriesWithResults, heldout.improved.negativeQueriesWithResults], [1, 0]);
 	assert.deepEqual([heldout.baseline.injectedNonRelevantFacts, heldout.improved.injectedNonRelevantFacts], [11, 9]);
+});
+
+test("acceptable labels change only label-aware false positives, never strict counts", () => {
+	const fact = MEMORY_EVALUATION_FACTS[0]!;
+	const item = { id: "label-control", query: fact.text, relevantIds: [], why: "isolate acceptable-label accounting" };
+	const strict = evaluateMemoryFixture([fact], [item]).methods.ranked;
+	const labelled = evaluateMemoryFixture([fact], [{ ...item, acceptableIds: [fact.id] }]).methods.ranked;
+	assert.deepEqual([strict.strictFalsePositiveResultsAt3, labelled.strictFalsePositiveResultsAt3], [1, 1]);
+	assert.deepEqual([strict.falsePositiveResultsAt3, labelled.falsePositiveResultsAt3], [1, 0]);
 });
 
 test("paired sentinels report live retrieval and injection outcomes and detect a removed-fact control", () => {

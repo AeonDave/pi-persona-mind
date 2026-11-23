@@ -28,6 +28,9 @@ interface MethodMetrics {
 	judgedCases: number;
 	abstentionCases: number;
 	abstentionCorrect: number;
+	/** Counts every top-three result outside relevantIds, ignoring acceptableIds. */
+	strictFalsePositiveResultsAt3: number;
+	/** Label-aware count: weaker acceptable alternatives are excluded. */
 	falsePositiveResultsAt3: number;
 	negativeQueriesWithResults: number;
 }
@@ -111,6 +114,8 @@ function scoreMethod(cases: readonly MemoryEvaluationCase[], entries: readonly M
 	}
 	const abstentionCases = cases.filter((item) => item.relevantIds.length === 0);
 	const abstentionCorrect = abstentionCases.filter((item) => rank(entries, item.query).length === 0).length;
+	const strictFalsePositiveResultsAt3 = cases.reduce((total, item) => total + rank(entries, item.query).slice(0, 3)
+		.filter((entry) => !item.relevantIds.includes(entry.id)).length, 0);
 	const falsePositiveResultsAt3 = cases.reduce((total, item) => total + rank(entries, item.query).slice(0, 3)
 		.filter((entry) => !item.relevantIds.includes(entry.id) && !item.acceptableIds?.includes(entry.id)).length, 0);
 	const rate = (value: number, denominator: number): number => denominator === 0 ? 0 : Number((value / denominator).toFixed(3));
@@ -121,6 +126,7 @@ function scoreMethod(cases: readonly MemoryEvaluationCase[], entries: readonly M
 		judgedCases: judged.length,
 		abstentionCases: abstentionCases.length,
 		abstentionCorrect,
+		strictFalsePositiveResultsAt3,
 		falsePositiveResultsAt3,
 		negativeQueriesWithResults: abstentionCases.length - abstentionCorrect,
 	};
@@ -257,9 +263,9 @@ export function evaluateMemoryFixture(
 		tokenReference: diagnoseTokenReference(),
 		limits: [
 			"Hand-authored synthetic data; this is not model-driven semantic-quality evaluation.",
-			"Heldout cases were independently supervisor-labelled and withheld during initial implementation; this small sample is not an external benchmark.",
+			"The held-out set was written alongside the implementation, not withheld from it; this small synthetic sample is not an external benchmark.",
 			"Prior lexical ranker and renderer are frozen repository-source test fixtures; scopes and budgets are identical within each comparison.",
-			"False positives count non-labelled/ non-acceptable results in the first three positive-score recall rows. Injection can include non-relevant standing context even on a negative query; its separate count is not recall precision.",
+			"strictFalsePositiveResultsAt3 counts top-three positive-score recall rows outside relevantIds, ignoring acceptableIds; falsePositiveResultsAt3 excludes acceptableIds. Injection uses acceptable labels and can include non-relevant standing context even on a negative query; its separate count is not recall precision.",
 			"Tags are explicit lexical bridges; no synonym table or embedding service is used.",
 			"Estimated tokens use UTF-8 bytes divided by three, not a provider tokenizer.",
 			"Published cl100k_base vector counts are reference data, not current-model tokenizer or billing counts; source literals were transcribed and not locally tokenizer-verified.",

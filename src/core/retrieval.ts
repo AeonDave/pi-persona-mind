@@ -92,8 +92,15 @@ function vocabulary(value: string): { exact: ReadonlySet<string>; normalized: Re
 	const exact = new Set<string>();
 	const normalized = new Set<string>();
 	for (const word of new Set(words(value))) {
-		exact.add(word.toLowerCase());
-		for (const part of components(word)) normalized.add(part);
+		// Expand only stored tail words: expanding queries would make partial versions match.
+		const tail = word.match(/^[vV]?\d+(?:\.\d+)+[-+](.*)$/u)?.[1];
+		// Tail qualifiers do not express negation; ordinary occurrences remain searchable.
+		const tailWords = tail?.split(/[-+.]/).filter((part) => /^\p{L}+$/u.test(part))
+			.flatMap(words).filter((part) => !NEGATION_AND_EXCEPTION.has(part.toLowerCase())) ?? [];
+		for (const token of [word, ...tailWords]) {
+			exact.add(token.toLowerCase());
+			for (const part of components(token)) normalized.add(part);
+		}
 	}
 	return { exact, normalized };
 }

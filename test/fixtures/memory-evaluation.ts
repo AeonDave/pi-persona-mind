@@ -17,7 +17,7 @@ export interface MemoryEvaluationCase {
 	query: string;
 	/** Empty for explicit negative/abstention controls. */
 	relevantIds: readonly string[];
-	/** Declared weaker lexical alternatives, excluded from false-positive counts but not counted as hits. */
+	/** Weaker alternatives excluded only from label-aware false positives, never strict counts or hits. */
 	acceptableIds?: readonly string[];
 	why: string;
 	sentinel?: MemoryEvaluationSentinel;

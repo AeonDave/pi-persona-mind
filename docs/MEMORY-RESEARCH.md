@@ -34,16 +34,20 @@ injection. This is explainable and avoids an additional indexing service, but di
 queries may miss relevant facts. No general semantic-recall guarantee follows from a passing test.
 
 Identifier components and vowel-accent folding are lower-weight fallback matches, behind exact
-words and paths. Numeric versions stay intact, negation terms remain searchable, and Unicode/CJK
+words and paths. Numeric versions stay exact atoms; alphabetic tail words are also indexed at ordinary
+word weight, while numeric or digit-bearing tail parts stay inside the atom. Negation remains searchable, and Unicode/CJK
 segmentation is preserved. A fallback can still add irrelevant rows: fewer missed identifiers does
 not imply perfect precision. Tags already normalized when saved cannot recover lost camel casing.
 
 `npm run eval:memory` compares the previous ranker and injection renderer with the current ones on
 the same corpus, scope and budget. In the 12-case development fixture, positive top-one hits improve
-from 2/7 to 7/7; in a separate nine-case supervisor-labelled holdout withheld during initial
-implementation, they improve from 6/7 to 7/7. Negative queries with results fall from one to zero in
-each set. False positives among the top three remain 1 in development and fall from 5 to 3 in the
-holdout; a weak `memory`/`memoryOwnership` match remains. The preceding 30-case fixture's metrics and
+from 2/7 to 7/7; in the separate nine-case held-out set, they improve from 6/7 to 7/7.
+The held-out set was written alongside the implementation, not withheld from it.
+Negative queries with results fall from one to zero in each set. Strict false positives among the top
+three, ignoring `acceptableIds`, remain 1 to 1 in development and 5 to 5 in the held-out set.
+With acceptable labels, the counts are 1 to 1 and 5 to 3 respectively; that held-out reduction depends
+on the labels excusing weaker accent matches. A weak `memory`/`memoryOwnership` match remains.
+The preceding 30-case fixture's metrics and
 seven sentinel outcomes are unchanged. These small synthetic sets and their labels are inspectable
 regression evidence, not an external benchmark or a general semantic-quality claim.
 

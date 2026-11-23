@@ -1,7 +1,8 @@
 import type { MemoryEvaluationCase, MemoryEvaluationFact } from "./memory-evaluation.ts";
 
-/** Independently supervisor-labelled synthetic examples, withheld during initial implementation.
- * This is a small hand-authored holdout, not an external dataset or a semantic-quality benchmark.
+/** Synthetic examples written alongside the implementation, not withheld from it.
+ * Acceptable labels excuse weaker matches only in label-aware counts, not strict counts or hits.
+ * This is a small hand-authored set, not an external dataset or a semantic-quality benchmark.
  */
 const texts = {
 	hdr: "HTTPResponseParser validates inbound headers.",

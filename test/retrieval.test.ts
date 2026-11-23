@@ -115,6 +115,85 @@ test("dotted prerelease and build versions match only their complete version ato
 	assert.equal(rankRetrievalEntries([entry], "next release")[0]?.score, 6);
 });
 
+for (const [text, query] of [
+	["Base image node:22.19-alpine", "alpine"],
+	["Pinned to 3.12-slim", "slim"],
+	["Use a 1.5-second timeout", "second"],
+	["See v2.14.9-hotfix notes", "hotfix"],
+	["Release 1.2.3+hotfix", "hotfix"],
+] as const) {
+	test(`version tail word ${query} is searchable in ${text}`, () => {
+		const fact = makeMemory({ term: "long", kind: "note", text }, NOW);
+		const result = rankMemoryEntries([fact], query)[0]!;
+		assert.equal(result.score, 3);
+		assert.equal(result.entry.id, fact.id);
+		assert.deepEqual(result.textTerms, [query]);
+		assert.deepEqual(result.normalizedTerms, []);
+		assert.equal(rankRetrievalEntries([{ text: "", tags: [text] }], query)[0]?.score, 2);
+	});
+}
+
+for (const term of ["only", "except", "never", "no", "not", "unless", "without"]) {
+	test(`version tail ${term} does not contribute a negation or exception match`, () => {
+		const text = `Requires Python 3.12-${term} syntax`;
+		// The same term outside the tail keeps its ordinary score and attribution.
+		for (const ordinary of [term, `${text}; ${term}`]) {
+			const result = rankRetrievalEntries([{ text: ordinary }], term)[0]!;
+			assert.equal(result.score, 4);
+			assert.deepEqual(result.textTerms, [term]);
+			assert.deepEqual(result.normalizedTerms, []);
+			assert.equal(rankRetrievalEntries([{ text: "", tags: [ordinary] }], term)[0]?.score, 3);
+		}
+		const ranked = rankRetrievalEntries([{ id: "tail", text }, { id: "retry", text: "Do not retry" }], `${term} retry`);
+		assert.equal(ranked[0]?.entry.id, "retry");
+		assert.equal(ranked[1]?.score, 0);
+		assert.deepEqual(ranked[1]?.textTerms, []);
+		for (const version of [`3.12-${term}`, `3.12+${term.toUpperCase()}`, `3.12-slim.${term}+build`]) {
+			assert.equal(rankRetrievalEntries([{ text: version }], term)[0]?.score, 0, version);
+			assert.equal(rankRetrievalEntries([{ text: "", tags: [version] }], term)[0]?.score, 0, version);
+			assert.equal(rankRetrievalEntries([{ text: version }], version)[0]?.score, 3, version);
+		}
+	});
+}
+
+for (const query of ["日本", "日本語"]) {
+	test(`CJK version tails use ordinary word segmentation for ${query}`, () => {
+		const ordinary = rankRetrievalEntries([{ text: "日本語" }], query)[0]!;
+		assert.equal(ordinary.score, query === "日本" ? 3 : 6);
+		for (const text of ["1.0-日本語", "1.0+日本語"]) {
+			const result = rankRetrievalEntries([{ text }], query)[0]!;
+			assert.equal(result.score, ordinary.score, text);
+			assert.deepEqual(result.textTerms, ordinary.textTerms);
+			assert.deepEqual(result.normalizedTerms, []);
+			const tagged = rankRetrievalEntries([{ text: "", tags: [text] }], query)[0]!;
+			assert.equal(tagged.score, query === "日本" ? 2 : 4);
+			assert.deepEqual(tagged.tagTerms, ordinary.textTerms);
+			assert.equal(rankRetrievalEntries([{ text }], text)[0]?.score, 3);
+		}
+	});
+}
+
+test("version tail words preserve exact atoms and stable ordering behind a full match", () => {
+	const entries = [
+		{ id: "z-tail", text: "1.2.3+hotfix" },
+		{ id: "a-tail", text: "v2.14.9-hotfix" },
+		{ id: "full", text: "22.19-hotfix" },
+	];
+	const ranked = rankRetrievalEntries(entries, "22.19-hotfix hotfix");
+	assert.deepEqual(ranked.map(({ entry, score }) => [entry.id, score]), [["full", 6], ["a-tail", 3], ["z-tail", 3]]);
+	assert.deepEqual(rankRetrievalEntries([...entries].reverse(), "22.19-hotfix hotfix"), ranked);
+	for (const [text, query] of [
+		["22.19-alpine", "22.19"],
+		["1.0-1.5", "1.5"],
+		["v2.14.9-alpha.1+build.7", "v2.14.9-alpha.1"],
+		["1.2.3-rc1+build7", "rc"],
+		["1.2.3-rc1+build7", "rc1"],
+		["1.2.3-rc1+build7", "build7"],
+	] as const) {
+		assert.equal(rankRetrievalEntries([{ text }], query)[0]?.score, 0, `${query} in ${text}`);
+	}
+});
+
 test("normalized tags and reverse identifier queries share the ranker and expose weak matches", () => {
 	const tagged = { text: "Transport settings", tags: ["parseHTTPResponse", "café"] };
 	const ranked = rankRetrievalEntries([tagged], "http response cafe")[0];
