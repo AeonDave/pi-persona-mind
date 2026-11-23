@@ -139,12 +139,16 @@ before IO, after reads and under the write lock; branch/session changes revoke p
 Stored content is untrusted, scanned and fenced. References remain literal strings, never automatic
 file reads or tool instructions.
 
-One `<STM store>.handoffs.json` sidecar holds up to 32 entries / 128 KiB, shared by personas with
-owner-filtered access. Each record, including metadata, is limited to 16 KiB; the normal store backup
+One `<STM store>.handoffs.json` sidecar is shared by all personas with owner-filtered access. Each
+owner (persona + project) may hold up to 32 entries; the file as a whole is capped at 128 KiB, which is
+its only total bound. Each record, including metadata, is limited to 16 KiB; the normal store backup
 also applies. Listing uses 160-character goal previews and a 40 KiB formatted-output bound. Explicit
 full reads are bounded to 100 KiB after JSON escaping; neither path silently truncates stored records.
-There is no TTL or automatic eviction: at quota, a new save fails until explicit forgetting frees
-space. Completion increments the revision and records a resolution; earlier pending work remains
+There is no TTL or automatic eviction: at its own quota, a persona's new save fails until it forgets
+one of its handoffs. A save refused by the file-wide byte cap reports the caller's own entry count and
+the other personas' count, never their names, ids or content; when the other personas' entries alone
+fill the file, the refused persona cannot free space itself. A sidecar that cannot be read strictly
+refuses every handoff operation with a message naming the file (and its `.bak` when that is the remedy). Completion increments the revision and records a resolution; earlier pending work remains
 historical. It does not verify tests, execute pending tasks or claim a restored worker session.
 Handoffs never join active fact recall, injection, consolidation or session-note replay.
 `/mind reset` clears working memory and backlog only; handoffs require explicit `forget` by ID and
@@ -157,6 +161,12 @@ through the same write-ahead/CAS helper and bounded store used by consolidation.
 distinguishes it from `optimization`; it has no invented plan ID or model-generated reason. If the
 destination already contains the resulting fact, its prior metadata is retained as well. Plain saves,
 exact re-recording, self-supersession and missing-source lineage do not create receipt noise.
+The destination tier is read strictly (it anchors the compare-and-swap); the other tiers are read with
+ordinary recovery but must be read completely, because one of them could hold a second fact with the id
+being superseded. A tier counts as completely read only when it was read cleanly, is genuinely absent
+(no live file and no backup), or was restored in full from a valid backup. Hidden rows, a quarantine,
+or a backup that exists but cannot be used while the live file is absent leave it unread, and the
+replacement is refused, naming that store.
 
 `memory { action: "history", target: "project-long" }` and `/mind history project-long` list compact
 metadata. For detail, provide `receiptId` and an explicit target; `offset` pages 12,000 UTF-16 units
@@ -211,9 +221,15 @@ appending ordinary turn entries does not invalidate an owner. Applying never spa
 Before replacement, persist a scoped before/after receipt to `<store>.optimize-history.json`, under
 its transaction lock and the memory mutation lock. Maximum 32 receipts / 2 MiB per target, plus the
 standard backup. Evict settled receipts only; refuse the replacement if unresolved prepared receipts
-or the new receipt exceed capacity. A generic IO failure may occur after the memory rename, so its
-receipt remains prepared with outcome uncertainty. Known pre-write conflicts/lifecycle refusals are
-rejected. Finalization failure after a successful memory commit returns success with a warning.
+or the new receipt exceed capacity. A capacity error, a conflict, a callback refusal,
+or any other failure after which the memory store still holds the bytes the receipt was prepared
+against settles the receipt rejected: the replacement is not in effect, whether it never landed or
+backup recovery rolled it back, so there is nothing to undo. Only a changed or unreadable store leaves
+the receipt prepared with outcome uncertainty. Receipts record the store fingerprint they were
+prepared against (history detail omits it, like the store path). At history capacity, prepared
+receipts of the same store, owner and target whose recorded fingerprint equals the current one are
+resolved as rejected and become evictable; receipts without a fingerprint (written before 0.9.4),
+prepared against other bytes, or belonging to another owner stay protected. Finalization failure after a successful memory commit returns success with a warning.
 
 History/undo survive optimizer recreation. History is bounded, owner-filtered and scanner-filtered.
 Undo restores only exact affected facts, preserving unrelated current records; it refuses changed
@@ -253,8 +269,20 @@ Separate started/settled receipts preserve the attempt target and cooldown witho
 interrupted review as completed. Restore considers only the latest attempt for each target, so an
 older interrupted input cannot reappear after its changed-input retry has settled. A semantic digest
 skips unchanged settled inputs, including terminal refusals. Only a retry of the interrupted attempt
-bypasses the token gate; it still requires a later native settled event and cooldown. Cancellation
-alone never rearms it. Unexpected current-owner failures persist terminal suppression without advancing
+bypasses the token gate, at most once per unchanged input digest; it still requires a later native
+settled event and cooldown. Cancellation alone never rearms it. Two consecutive interrupted automatic
+launches of the same tier and digest (a stop, a foreground interruption, or a host that reports its
+worker deadline as stopped) park that window: rotation bypasses it without recording it as reviewed or
+settled, bypasses it again whenever it returns to it unchanged, and reviews it again once its records
+change. Parking is derived from the persisted attempt receipts (the last 64), so turning automatic
+review off, in-memory retry state and a restart all give the same answer; turning it off removes the
+permission to retry, never the fact that the retry was used. A pending retry whose own window, at the
+cursor it was launched from, no longer yields its input is dropped without a receipt. A retry whose
+position cannot be verified (after a restart, or when another run moved the cursor) stays owed as one
+token-free admission for that tier, used by the next dirty write and superseded by any launch on the
+tier. Neither records the interrupted input as settled. A worker result with status `failed`
+(including Persona's 180-second deadline) is terminal for that input and never earns a token-free
+retry. Explicit reviews are unaffected. Unexpected current-owner failures persist terminal suppression without advancing
 the page cursor; a warning asks for inspection when an apply may have completed. If persistence itself
 fails, durable retry suppression cannot be guaranteed and the failure remains visible.
 Incoming input, `agent_start`, native branch navigation, off,
@@ -505,7 +533,9 @@ explicit attempt markers; interruptions never create an automatic retry entitlem
 the worker reservation rather than holding it while waiting for a human. Apply must acquire a new one;
 concurrent writes or expired plans are refused. New input, agent/model/branch changes, owner revocation
 and shutdown cancel workers/dialogs and invalidate pending review plans. Shutdown joins admitted apply
-work through approval, guarded persistence, receipt finalization and lease cleanup. Revocation blocks new
+work through approval, guarded persistence, receipt finalization and lease cleanup; it bounds only the
+wait for a Persona worker's completion (5 s), and a wait that reaches the bound is treated as an
+interruption. Revocation blocks new
 admission and guarded writes, but does not roll back an already committed replacement or relabel it as
 cancelled; its finalization is still awaited and stale completion UI is suppressed. Completion uses display-only
 native entries/toasts and never triggers a supervisor turn.

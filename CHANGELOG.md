@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+- A memory replacement or consolidation refused before anything was written (a full store, a lock
+  timeout, any failure that left the memory unchanged) no longer leaves a permanent `prepared` receipt.
+  Thirty-two of them used to block every later replacement and consolidation on that store. Receipts
+  left prepared by earlier versions carry no store fingerprint and still need the history file removed
+  by hand.
+- Words after a dotted version are searchable again: `node:22.19-alpine` matches `alpine`, `3.12-slim`
+  matches `slim`. Numeric versions stay exact (`22.19` still does not match `22.19-alpine`), and a tail
+  word is never treated as a negation.
+- Automatic memory review retries an interrupted input once, not on every turn. A second interruption
+  parks that window until its records change, and rotation moves past it instead of stopping there.
+  Turning automatic review off and on no longer resets the count. A worker that Persona ends at its
+  180-second deadline is a failure, not an interruption.
+- The 32-handoff limit is per persona. One persona's handoffs no longer stop the others from saving;
+  only the 128 KiB file limit is shared, and a save it refuses says how many entries the caller and the
+  other personas hold. Handoff refusals for an unreadable file name the file and no longer mention
+  optimizing.
+- `remember` with `supersedes` is no longer blocked by a corrupt memory tier it does not write to, when
+  that tier recovers completely from its backup. It still refuses, naming the store, when another tier
+  cannot be read completely, because that tier could hide the fact being replaced. A backup that exists
+  but cannot be used is now reported as a warning on every read instead of being treated as absent.
+- Session shutdown waits at most 5 seconds for a Persona worker's completion; local apply and
+  persistence work is still joined in full.
+- The memory evaluation reports held-out false positives both strictly and with its acceptable-match
+  labels (5 and 5 strictly; 5 and 3 with labels), and states that the held-out set was written alongside
+  the implementation.
+
 ## [0.9.3](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.9.3) - 2026-11-22
 
 - Improve lexical recall for camelCase/acronyms and vowel accents with weaker fallback scores;

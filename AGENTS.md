@@ -71,7 +71,10 @@ coupled through a versioned local companion handshake to
   completed digests, but interrupted explicit work never grants automatic retry. Usage alone never
   marks memories dirty. Coalesce 2s after `agent_settled` while idle with no queued
   work; cool down 5min between actual attempts. Only the interrupted attempt can retry without the
-  token floor, after a later settled event and cooldown. One worker per instance; unchanged semantic
+  token floor, after a later settled event and cooldown, once per unchanged input digest; a second
+  interruption parks that window (bypassed by rotation, never settled) until its records change, and a
+  `failed` worker result is terminal for its input. A skipped window never settles another window's
+  pending retry: that retry is dropped without a receipt when its own input is gone, else stays owed. One worker per instance; unchanged semantic
   digests skip review. New input, agent start,
   off or owner changes cancel and invalidate plans. Use a real visible
   Persona-hosted Mind worker on exactly the session model, no fallback or arbitrary tools. Give it
@@ -100,14 +103,15 @@ coupled through a versioned local companion handshake to
 - Rotate completed automatic review over older records/pages; account for actual byte admission,
   preserve newest-fact inclusion, and never mark stopped/interrupted work as completed. No unbounded
   sweeper. Optimizer receipts precede replacement and persist at most 32/2MiB per target; unresolved
-  prepared receipts are protected. Undo compares affected facts and owner generation under lock,
+  prepared receipts are protected unless the store still holds the bytes they were prepared against
+  (then the replacement is not in effect and they settle rejected; same store, owner and target only). Undo compares affected facts and owner generation under lock,
   never restores expired STM or clobbers unrelated writes. Propagate uncertain-finalization warnings.
 - Retrieval uses one lexical/tag/path ranker; do not introduce a second recall policy. Matches preserve Unicode and exact-term priority; identifier/vowel-accent bridges have lower weight.
   Keep numeric versions exact and retain negation/exception terms. Test false positives as well as hits.
   Ordinary `remember supersedes` receipts share the optimizer's history/CAS protocol and retain
   before/after provenance. Historical facts never join active recall or injection; ordinary receipt
   undo is refused. History lists metadata and explicit receipt details are paged, not full-store dumps.
-  Explicit handoffs use one bounded project sidecar (32 entries / 128 KiB) with persona ownership,
+  Explicit handoffs use one bounded project sidecar (32 entries per persona, 128 KiB for the file) with persona ownership,
   native session/branch origin and revision checks. No automatic expiry/eviction, injection or worker
   access. Complete requires a resolution; pending text remains historical. Recheck accepting owners
   under the store lock and reject malformed/unsafe persisted fields.
