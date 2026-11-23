@@ -31,7 +31,7 @@ export async function runMemoryHistory(optimizer: MemoryOptimizer, input: Memory
 	if (!input.target || input.max !== undefined) return fail("receipt detail requires an explicit target and uses offset instead of max");
 	const detail = await optimizer.getReceipt(input.receiptId, input.target);
 	if (!detail.ok) return fail(detail.reason);
-	const { storePath: _path, ...receipt } = detail.receipt;
+	const { storePath: _path, fingerprint: _fingerprint, ...receipt } = detail.receipt;
 	// Escaping angle brackets preserves the JSON value while preventing a stored field closing the fence.
 	const body = JSON.stringify(receipt, null, 2).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
 	const offset = input.offset ?? 0;

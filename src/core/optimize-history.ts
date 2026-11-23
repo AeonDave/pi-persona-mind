@@ -1,7 +1,7 @@
 /** Bounded write-ahead before images. Missing/corrupt history is never repaired to empty. */
 import { isExpired, isSafeMemoryContent, memoryContentKey, validateMemory, type MemoryEntry } from "./memory.ts";
 import { isOptimizeTarget, MAX_OPTIMIZE_OPERATIONS, MAX_OPTIMIZE_SOURCES, samePersistedMemory, type OptimizeChange, type OptimizeFailure, type OptimizeTarget } from "./optimize.ts";
-import { JsonStore, StoreConflictError, withFileLock } from "./store.ts";
+import { JsonStore, StoreCapacityError, StoreConflictError, withFileLock } from "./store.ts";
 
 export const MAX_OPTIMIZE_HISTORY = 32;
 export const MAX_OPTIMIZE_HISTORY_BYTES = 2 * 1024 * 1024;
@@ -13,6 +13,8 @@ interface ReceiptBase {
 	/** Prepared may mean interrupted before OR after memory commit; exact facts decide undo. */
 	state: "prepared" | "applied" | "undone" | "rejected";
 	storePath: string;
+	/** Memory-store fingerprint the receipt was prepared against. Bytes still equal to it mean the replacement is not in effect (never landed, or rolled back by backup recovery), so there is nothing to undo. */
+	fingerprint?: string;
 	changes: OptimizeChange[];
 }
 /** Missing origin is the existing persisted optimizer contract, never an ordinary replacement. */
@@ -40,6 +42,7 @@ function validateReceipt(raw: unknown): OptimizeReceipt | null {
 	if (!Number.isFinite(createdAt) || new Date(createdAt).toISOString() !== value.createdAt) return null;
 	if (!["prepared", "applied", "undone", "rejected"].includes(value.state ?? "")) return null;
 	if (typeof value.storePath !== "string" || value.storePath.length > 32_768 || !value.storePath) return null;
+	if (value.fingerprint !== undefined && (typeof value.fingerprint !== "string" || !/^[\da-f]{64}$/.test(value.fingerprint))) return null;
 	if (!Array.isArray(value.changes) || !value.changes.length || value.changes.length > MAX_OPTIMIZE_OPERATIONS) return null;
 	const changes: OptimizeChange[] = [];
 	const sourceIds = new Set<string>(); const replacementIds = new Set<string>();
@@ -56,7 +59,7 @@ function validateReceipt(raw: unknown): OptimizeReceipt | null {
 		replacementIds.add(after.id); changes.push({ before, after });
 	}
 	const receipt: ReceiptBase = { receiptId: value.receiptId!, target: value.target, persona: value.persona, createdAt: value.createdAt,
-		state: value.state!, storePath: value.storePath, changes };
+		state: value.state!, storePath: value.storePath, ...(value.fingerprint === undefined ? {} : { fingerprint: value.fingerprint }), changes };
 	return value.origin === "replacement" ? { ...receipt, origin: "replacement" } : { ...receipt, origin: "optimization", planId: value.planId! };
 }
 
@@ -70,13 +73,25 @@ export class OptimizeHistoryStore {
 	}
 	async exclusive<T>(run: () => Promise<T>): Promise<T> { return withFileLock(`${this.path}.transaction.lock`, run); }
 	async read(): Promise<OptimizeReceipt[]> { return (await this.store.inspectStrict()).store.entries; }
-	async prepare(receipt: OptimizeReceipt): Promise<void> {
+	/** `currentFingerprint` is the memory store's verified current fingerprint, used only to resolve this writer's own intents that are not in effect. */
+	async prepare(receipt: OptimizeReceipt, currentFingerprint?: string): Promise<void> {
 		const snapshot = await this.store.inspectStrict();
-		const entries = [...snapshot.store.entries, receipt];
+		let entries = [...snapshot.store.entries, receipt];
 		// Only settled history can be evicted. An unresolved crash intent may own the only before image.
 		const bytes = () => Buffer.byteLength(`${JSON.stringify({ ...snapshot.store, sequence: snapshot.store.sequence + 1, entries }, null, 2)}\n`, "utf8");
+		let resolved = false;
 		while (entries.length > MAX_OPTIMIZE_HISTORY || bytes() > MAX_OPTIMIZE_HISTORY_BYTES) {
 			const index = entries.findIndex((entry) => entry.receiptId !== receipt.receiptId && entry.state !== "prepared");
+			if (index < 0 && !resolved && currentFingerprint !== undefined) {
+				// Byte-identical memory since preparation means that intent is not in effect, whether it never
+				// committed or backup recovery rolled it back, so no before image is needed. Only receipts of
+				// this store and owner qualify: the history file is shared across personas, and another owner's
+				// intent is theirs to settle. A receipt without a fingerprint, or prepared against other bytes, stays protected.
+				resolved = true;
+				const mine = (entry: OptimizeReceipt) => entry.storePath === receipt.storePath && entry.persona === receipt.persona && entry.target === receipt.target;
+				entries = entries.map((entry): OptimizeReceipt => entry.receiptId !== receipt.receiptId && entry.state === "prepared" && entry.fingerprint === currentFingerprint && mine(entry) ? { ...entry, state: "rejected" } : entry);
+				continue;
+			}
 			if (index < 0) throw new Error("optimizer history capacity exhausted by recovery receipts; replacement refused");
 			entries.splice(index, 1);
 		}
@@ -94,7 +109,7 @@ export class OptimizeHistoryStore {
 		return this.exclusive(async () => {
 			assertCurrent();
 			if ((await store.inspectStrict()).fingerprint !== fingerprint) throw new StoreConflictError();
-			if (receipt) await this.prepare(receipt);
+			if (receipt) await this.prepare({ ...receipt, fingerprint }, fingerprint);
 			let callbackRejected = false;
 			let entries: MemoryEntry[];
 			try {
@@ -103,9 +118,14 @@ export class OptimizeHistoryStore {
 					catch (error) { callbackRejected = true; throw error; }
 				})).entries;
 			} catch (error) {
-				// Generic IO errors can follow rename: never discard the only before image.
 				if (receipt) {
-					if (callbackRejected || error instanceof StoreConflictError) await this.settle(receipt.receiptId, "rejected").catch(() => {});
+					// Capacity is checked during serialization, before any write. Any other error may follow
+					// the rename, so only memory bytes still identical to the prepared fingerprint show that the
+					// replacement is not in effect (it never landed, or backup recovery rolled it back); a changed
+					// or unreadable store keeps the only before image prepared.
+					const unwritten = callbackRejected || error instanceof StoreConflictError || error instanceof StoreCapacityError
+						|| await store.inspectStrict().then((current) => current.fingerprint === fingerprint, () => false);
+					if (unwritten) await this.settle(receipt.receiptId, "rejected").catch(() => {});
 					else throw new Error(`memory replacement outcome uncertain; durable receipt ${receipt.receiptId} remains prepared: ${error instanceof Error ? error.message : "storage failure"}`);
 				}
 				throw error;

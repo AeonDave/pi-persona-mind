@@ -95,10 +95,20 @@ test("an interrupted intent before memory commit does not authorize an undo", as
 	const before = fact("original source"); await store.update(() => [before]);
 	const plan = await stage(optimizer, before.id);
 	store.compareAndUpdate = async () => { throw new Error("simulated failure before commit"); };
+	// Memory still holding the prepared bytes means the write is not in effect, so the intent settles rejected.
 	assert.equal((await optimizer.apply(plan.planId)).ok, false);
-	const history = await reopen().history("project"); assert.ok(history.ok); assert.equal(history.receipts[0]?.state, "prepared");
+	const history = await reopen().history("project"); assert.ok(history.ok); assert.equal(history.receipts[0]?.state, "rejected");
 	assert.deepEqual((await store.load()).entries, [before]);
 	assert.equal((await reopen().undo(history.receipts[0]!.receiptId, "project")).ok, false);
+	// An intent that could not be settled (as after a crash) stays prepared and still cannot authorize undo.
+	const again = await stage(optimizer, before.id);
+	const settle = OptimizeHistoryStore.prototype.settle;
+	OptimizeHistoryStore.prototype.settle = async () => { throw new Error("finalization unavailable"); };
+	try { assert.equal((await optimizer.apply(again.planId)).ok, false); }
+	finally { OptimizeHistoryStore.prototype.settle = settle; }
+	const interrupted = await reopen().history("project"); assert.ok(interrupted.ok); assert.equal(interrupted.receipts[0]?.state, "prepared");
+	assert.deepEqual((await store.load()).entries, [before]);
+	assert.equal((await reopen().undo(interrupted.receipts[0]!.receiptId, "project")).ok, false);
 }));
 
 test("undo refuses changed affected facts, foreign owners, source collisions and expired STM", async () => fixture(async ({ store, optimizer, reopen, tick }) => {

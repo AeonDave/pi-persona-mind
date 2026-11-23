@@ -4,11 +4,11 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { makeMemory } from "../src/core/memory.ts";
+import { makeMemory, type MemoryEntry } from "../src/core/memory.ts";
 import { MAX_OPTIMIZE_HISTORY, OptimizeHistoryStore } from "../src/core/optimize-history.ts";
 import { memoryMutationLockPath, mindPaths, type Scope } from "../src/core/scope.ts";
 import { MindService, type RememberInput } from "../src/core/service.ts";
-import { JsonStore, withFileLock } from "../src/core/store.ts";
+import { DEFAULT_STORE_MAX_BYTES, JsonStore, withFileLock } from "../src/core/store.ts";
 import { runMemoryHistory } from "../src/tools/memory-history.ts";
 
 const T = Date.parse("2026-11-22T10:00:00Z");
@@ -29,7 +29,11 @@ test("ordinary replacement retains original provenance in the existing history, 
 	const next = await mind.remember({ ...fact("Project runtime is version twenty two", old.entry.id), source: "updated decision" }); assert.ok(next.ok);
 	assert.ok(next.receiptId);
 	assert.deepEqual((await mind.recall("", "project", 10)).hits, [next.entry]);
-	assert.doesNotMatch(await mind.buildInjection(), /version twenty<|version twenty\n|original decision/);
+	const injection = await mind.buildInjection();
+	assert.doesNotMatch(injection, /original decision/, "historical provenance never reaches the injection");
+	const injected = injection.split("\n").filter((line) => line.startsWith("- ["));
+	assert.ok(injected.some((line) => line.includes("Project runtime is version twenty two")), "the active replacement is injected");
+	assert.ok(!injected.some((line) => line.includes("Project runtime is version twenty (")), "the superseded fact is not injected");
 	const optimizer = reopen().createOptimizer();
 	const history = await optimizer.history("project-long"); assert.ok(history.ok); assert.equal(history.receipts.length, 1);
 	const receipt = history.receipts[0]!;
@@ -113,6 +117,48 @@ test("an uncertain ordinary memory commit keeps its receipt and honestly reports
 	const history = await mind.createOptimizer().history("project-long"); assert.ok(history.ok); assert.equal(history.receipts[0]?.state, "prepared");
 	assert.deepEqual(history.receipts[0]?.changes[0]?.before, [old.entry]);
 	assert.deepEqual((await mind.recall("", "project", 10)).hits.map((entry) => entry.text), ["new fact"]);
+}));
+
+test("an unclassified commit error that left the memory bytes unchanged settles the receipt rejected", async () => fixture(async ({ mind, scope }) => {
+	const old = await mind.remember(fact("old fact")); assert.ok(old.ok);
+	const compare = JsonStore.prototype.compareAndUpdate;
+	JsonStore.prototype.compareAndUpdate = async function (fingerprint, mutate) {
+		if (this.filePath === scope.paths.projectLtm) throw new Error("mind store lock: timed out waiting for the memory store");
+		return compare.call(this, fingerprint, mutate);
+	};
+	try {
+		const result = await mind.remember(fact("new fact", old.entry.id)); assert.ok(!result.ok);
+		assert.match(result.reason, /timed out/); assert.doesNotMatch(result.reason, /uncertain/);
+	} finally { JsonStore.prototype.compareAndUpdate = compare; }
+	const history = await mind.createOptimizer().history("project-long"); assert.ok(history.ok); assert.equal(history.receipts[0]?.state, "rejected");
+	assert.deepEqual((await mind.recall("", "project", 10)).hits, [old.entry]);
+}));
+
+test("a commit rolled back by backup recovery before a lost confirmation settles rejected and leaves a coherent history", async () => fixture(async ({ mind, scope }) => {
+	const old = await mind.remember(fact("old fact")); assert.ok(old.ok);
+	const compare = JsonStore.prototype.compareAndUpdate;
+	JsonStore.prototype.compareAndUpdate = async function (fingerprint, mutate) {
+		const result = await compare.call(this, fingerprint, mutate);
+		if (this.filePath !== scope.paths.projectLtm) return result;
+		// The replacement landed, then the live file tore and a reader restored the pre-write backup.
+		await writeFile(this.filePath, "{ torn");
+		assert.deepEqual((await this.load()).entries, [old.entry]);
+		throw new Error("lost confirmation after rename");
+	};
+	try {
+		const lost = await mind.remember(fact("rolled back fact", old.entry.id)); assert.ok(!lost.ok); assert.doesNotMatch(lost.reason, /uncertain/);
+	} finally { JsonStore.prototype.compareAndUpdate = compare; }
+	// Memory holding exactly the prepared bytes means the replacement is not in effect: rejected, nothing to restore.
+	const history = await mind.createOptimizer().history("project-long"); assert.ok(history.ok); assert.equal(history.receipts[0]?.state, "rejected");
+	assert.deepEqual((await mind.recall("", "project", 10)).hits, [old.entry]);
+	const undo = await mind.createOptimizer().undo(history.receipts[0]!.receiptId, "project-long"); assert.ok(!undo.ok);
+	assert.deepEqual((await mind.recall("", "project", 10)).hits, [old.entry]);
+	// The same supersession can now be made for real, with its own applied receipt next to the rejected one.
+	const next = await mind.remember(fact("replacement that sticks", old.entry.id)); assert.ok(next.ok, next.ok ? "" : next.reason);
+	assert.deepEqual((await mind.recall("", "project", 10)).hits.map((entry) => entry.text), ["replacement that sticks"]);
+	const after = await mind.createOptimizer().history("project-long"); assert.ok(after.ok);
+	assert.deepEqual(after.receipts.map((receipt) => receipt.state).sort(), ["applied", "rejected"]);
+	assert.deepEqual(after.receipts.find((receipt) => receipt.state === "applied")?.changes[0]?.before, [old.entry]);
 }));
 
 test("ordinary replacement refuses a racing external write and preserves its unrelated fact", async () => fixture(async ({ mind, scope }) => {
@@ -253,6 +299,94 @@ test("ordinary and optimizer changes share one retention budget and protect unre
 	const before = await readFile(scope.paths.projectLtm, "utf8");
 	const refused = await mind.remember(fact("over capacity", id)); assert.ok(!refused.ok); assert.match(refused.reason, /capacity/);
 	assert.equal(await readFile(scope.paths.projectLtm, "utf8"), before);
+}));
+
+/** Pads the durable project store with real facts until only `margin` bytes of its cap remain. */
+async function fillProjectStore(path: string, margin: number): Promise<MemoryEntry[]> {
+	const raw = JSON.parse(await readFile(path, "utf8"));
+	const size = () => Buffer.byteLength(`${JSON.stringify(raw, null, 2)}\n`, "utf8");
+	const filler = (index: number, length: number) => makeMemory({ term: "long", kind: "note", text: `Filler fact ${index}: ${"padding words ".repeat(Math.ceil(length / 14))}`.slice(0, length - 1) + ".", persona: "elite" }, T);
+	const added: MemoryEntry[] = [];
+	while (DEFAULT_STORE_MAX_BYTES - margin - size() > 6_000) { const entry = filler(added.length, 4_000); raw.entries.push(entry); added.push(entry); }
+	raw.entries.push(filler(added.length, 100));
+	const last = filler(added.length, 100 + DEFAULT_STORE_MAX_BYTES - margin - size());
+	raw.entries[raw.entries.length - 1] = last; added.push(last);
+	await writeFile(path, `${JSON.stringify(raw, null, 2)}\n`);
+	assert.equal(DEFAULT_STORE_MAX_BYTES - Buffer.byteLength(await readFile(path, "utf8"), "utf8"), margin);
+	return added;
+}
+async function preparedReceipts(mind: MindService) {
+	const history = await mind.createOptimizer().history("project-long", MAX_OPTIMIZE_HISTORY); assert.ok(history.ok);
+	return history.receipts.filter((receipt) => receipt.state === "prepared");
+}
+
+test("replacements refused by store capacity settle rejected, so later replacement and consolidation still work", async () => fixture(async ({ mind, scope }) => {
+	const old = await mind.remember(fact("capacity original")); assert.ok(old.ok);
+	const fillers = await fillProjectStore(scope.paths.projectLtm, 1_500);
+	for (let attempt = 0; attempt <= MAX_OPTIMIZE_HISTORY; attempt++) {
+		const refused = await mind.remember(fact(`oversize replacement ${attempt} ${"y".repeat(4_000)}`, old.entry.id));
+		assert.ok(!refused.ok); assert.match(refused.reason, /mind store capacity/, `attempt ${attempt}`);
+		assert.doesNotMatch(refused.reason, /uncertain|exhausted/, `attempt ${attempt}`);
+	}
+	assert.deepEqual(await preparedReceipts(mind), []);
+	const small = await mind.remember(fact("capacity reduced", old.entry.id)); assert.ok(small.ok, small.ok ? "" : small.reason);
+	const optimizer = mind.createOptimizer();
+	const snapshot = await optimizer.inspect("project-long"); assert.ok(snapshot.ok);
+	const plan = await optimizer.preview({ target: "project-long", fingerprint: snapshot.fingerprint, operations: [{ sourceIds: [fillers[0]!.id, fillers[1]!.id], kind: "note", text: "merged filler facts" }] }); assert.ok(plan.ok, plan.ok ? "" : plan.reason);
+	const applied = await optimizer.apply(plan.planId); assert.ok(applied.ok, applied.ok ? "" : applied.reason);
+	assert.deepEqual(await preparedReceipts(mind), []);
+}));
+
+test("at capacity, prepared receipts proven unwritten by the store fingerprint are resolved while an uncertain one stays protected", async () => fixture(async ({ mind, scope }) => {
+	const old = await mind.remember(fact("uncertain original")); assert.ok(old.ok);
+	const compare = JsonStore.prototype.compareAndUpdate;
+	JsonStore.prototype.compareAndUpdate = async function (fingerprint, mutate) {
+		const result = await compare.call(this, fingerprint, mutate);
+		if (this.filePath === scope.paths.projectLtm) throw new Error("lost confirmation after rename");
+		return result;
+	};
+	try { const uncertain = await mind.remember(fact("uncertain replacement", old.entry.id)); assert.ok(!uncertain.ok); assert.match(uncertain.reason, /uncertain.*prepared/); }
+	finally { JsonStore.prototype.compareAndUpdate = compare; }
+	const live = (await mind.recall("", "project", 10)).hits[0]!; assert.equal(live.text, "uncertain replacement");
+	await fillProjectStore(scope.paths.projectLtm, 1_500);
+	// A failing finalizer reproduces receipts stranded before this repair existed or by an interrupted settle.
+	const settle = OptimizeHistoryStore.prototype.settle;
+	OptimizeHistoryStore.prototype.settle = async () => { throw new Error("finalization unavailable"); };
+	try {
+		for (let attempt = 1; attempt < MAX_OPTIMIZE_HISTORY; attempt++) assert.equal((await mind.remember(fact(`oversize ${attempt} ${"y".repeat(4_000)}`, live.id))).ok, false);
+	} finally { OptimizeHistoryStore.prototype.settle = settle; }
+	assert.equal((await preparedReceipts(mind)).length, MAX_OPTIMIZE_HISTORY);
+	const small = await mind.remember(fact("capacity reduced", live.id)); assert.ok(small.ok, small.ok ? "" : small.reason);
+	const prepared = await preparedReceipts(mind);
+	assert.equal(prepared.length, 1);
+	assert.deepEqual(prepared[0]!.changes[0]!.before, [old.entry]);
+}));
+
+test("capacity repair resolves only the writing owner's own prepared receipts, never another owner's on the shared store", async () => fixture(async ({ mind, scope, reopen }) => {
+	const shared = (text: string, supersedes?: string): RememberInput => ({ term: "long", scope: "shared", kind: "note", text, ...(supersedes ? { supersedes } : {}) });
+	const old = await mind.remember(shared("shared original")); assert.ok(old.ok);
+	const compare = JsonStore.prototype.compareAndUpdate;
+	const settle = OptimizeHistoryStore.prototype.settle;
+	// A refused write whose settlement never lands leaves a prepared receipt behind, as an interrupted process would.
+	const strand = async (owner: MindService, text: string) => {
+		JsonStore.prototype.compareAndUpdate = async function (fingerprint, mutate) {
+			if (this.filePath === scope.paths.shared) throw new Error("mind store lock: timed out waiting for the memory store");
+			return compare.call(this, fingerprint, mutate);
+		};
+		OptimizeHistoryStore.prototype.settle = async () => { throw new Error("finalization unavailable"); };
+		try { assert.equal((await owner.remember(shared(text, old.entry.id))).ok, false); }
+		finally { JsonStore.prototype.compareAndUpdate = compare; OptimizeHistoryStore.prototype.settle = settle; }
+	};
+	await strand(mind, "elite attempt");
+	const other = reopen("other");
+	for (let attempt = 1; attempt < MAX_OPTIMIZE_HISTORY; attempt++) await strand(other, `other attempt ${attempt}`);
+	const history = new OptimizeHistoryStore(`${scope.paths.shared}.optimize-history.json`, () => T);
+	assert.equal((await history.read()).length, MAX_OPTIMIZE_HISTORY);
+	// The next attempt of `other` hits the retention limit with nothing settled, which triggers the repair.
+	assert.ok((await other.remember(shared("other replacement", old.entry.id))).ok);
+	const receipts = await history.read();
+	assert.deepEqual(receipts.filter((receipt) => receipt.persona === "elite").map((receipt) => receipt.state), ["prepared"], "another owner's intent keeps its before image");
+	assert.ok(receipts.filter((receipt) => receipt.persona === "other" && receipt.state === "prepared").length <= 1);
 }));
 
 test("replacement history is owner scoped and never grants undo of shared or foreign project records", async () => fixture(async ({ mind, reopen }) => {
