@@ -18,7 +18,8 @@ test("handoff requests reject malformed or extraneous fields before storage", ()
 });
 
 test("handoff command keeps resolution text and requires explicit revision", () => {
-	assert.deepEqual(parseMindCommand(`/mind handoff`), { type: "invalid", message: expectUsage() });
+	assert.deepEqual(parseMindCommand("handoff"), { type: "invalid", message: expectUsage() });
+	assert.deepEqual(parseMindCommand("handoff show"), { type: "invalid", message: expectUsage() });
 	assert.deepEqual(parseMindCommand(`handoff complete ${"a".repeat(32)} 1 Tests Pass`), { type: "handoff", input: { operation: "complete", id: "a".repeat(32), revision: 1, resolution: "Tests Pass" } });
 	assert.equal(parseMindCommand(`handoff forget ${"a".repeat(32)}`).type, "invalid");
 });

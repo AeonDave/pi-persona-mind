@@ -1,12 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveScope } from "../src/core/scope.ts";
 import { HandoffStore } from "../src/core/handoff-store.ts";
+import { BoundedReadFailure, JsonStore } from "../src/core/store.ts";
 import { formatHandoffResult } from "../src/tools/memory-handoff.ts";
-import { validHandoffContent, validateHandoff } from "../src/core/handoff.ts";
+import { MAX_HANDOFF_STORE_BYTES, validHandoffContent, validateHandoff } from "../src/core/handoff.ts";
 
 test("explicit project handoff crosses sessions only for its owner, with guarded settlement", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "mind-handoff-"));
@@ -47,9 +48,120 @@ test("concurrent saves retain each entry, stale completion loses, quota refuses 
 		const results = await Promise.all(stores.map((store) => store.execute(owner, { operation: "complete", id: first.entry.id, revision: 1, resolution: "Finished" })));
 		assert.equal(results.filter((r) => r.ok).length, 1);
 		for (let i = 0; i < 20; i++) assert.equal((await stores[0]!.execute(owner, input)).ok, true);
-		assert.equal((await stores[0]!.execute(owner, input)).ok, false);
+		const refused = await stores[0]!.execute(owner, input);
+		assert.ok(!refused.ok); assert.match(refused.reason, /quota.*32.*persona.*project.*forget/i);
 		const list = await stores[0]!.execute(owner, { operation: "list" });
 		assert.equal(list.ok && list.operation === "list" && list.entries.length, 32);
+	} finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("another persona uses the same sidecar without consuming the owner's 32-entry quota", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "mind-handoff-quota-"));
+	try {
+		const aliceScope = resolveScope(dir, dir, { persona: "alice", homedir: join(dir, "home") });
+		const bobScope = resolveScope(dir, dir, { persona: "bob", homedir: join(dir, "home") });
+		assert.equal(bobScope.paths.stm, aliceScope.paths.stm);
+		const alice = { persona: aliceScope.persona, projectRoot: aliceScope.projectRoot, sessionId: "session", branchId: null, cwd: dir };
+		const bob = { ...alice, persona: bobScope.persona };
+		const aliceStore = new HandoffStore(aliceScope);
+		const bobStore = new HandoffStore(bobScope);
+		const input = { operation: "save" as const, goal: "Finish", completed: [], pending: [], nextStep: "Review", references: [] };
+		for (let i = 0; i < 32; i++) assert.equal((await aliceStore.execute(alice, input)).ok, true);
+		const saved = await bobStore.execute(bob, input);
+		assert.ok(saved.ok, JSON.stringify(saved));
+		const aliceList = await aliceStore.execute(alice, { operation: "list" });
+		assert.ok(aliceList.ok && aliceList.operation === "list"); assert.equal(aliceList.total, 32);
+		const first = aliceList.entries[0]!;
+		assert.equal((await aliceStore.execute(alice, { operation: "forget", id: first.id, revision: first.revision })).ok, true);
+		const raced = await Promise.all([aliceStore, new HandoffStore(aliceScope)].map((store) => store.execute(alice, input)));
+		assert.equal(raced.filter((result) => result.ok).length, 1);
+		const refused = raced.find((result) => !result.ok);
+		assert.ok(refused && !refused.ok); assert.match(refused.reason, /quota.*32.*persona.*project.*forget/i);
+		const bobList = await new HandoffStore(bobScope).execute(bob, { operation: "list" });
+		assert.ok(bobList.ok && bobList.operation === "list"); assert.equal(bobList.total, 1);
+		const persisted = JSON.parse(await readFile(`${aliceScope.paths.stm}.handoffs.json`, "utf8"));
+		assert.equal(persisted.entries.length, 33);
+	} finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("shared handoff byte capacity reports other personas' entry count without rewriting the file", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "mind-handoff-shared-bytes-"));
+	try {
+		const aliceScope = resolveScope(dir, dir, { persona: "alice", homedir: join(dir, "home") });
+		const bobScope = resolveScope(dir, dir, { persona: "bob", homedir: join(dir, "home") });
+		const alice = { persona: aliceScope.persona, projectRoot: aliceScope.projectRoot, sessionId: "session", branchId: null, cwd: dir };
+		const aliceStore = new HandoffStore(aliceScope);
+		const input = { operation: "save" as const, goal: "a".repeat(4096), completed: [], pending: ["a".repeat(2048), "a".repeat(2048)], nextStep: "a".repeat(4096), references: [] };
+		let count = 0;
+		for (; count < 32; count++) {
+			const result = await aliceStore.execute(alice, input);
+			if (!result.ok) break;
+		}
+		assert.ok(count > 0 && count < 32, "file bytes must fill before the owner's entry quota");
+		const path = `${aliceScope.paths.stm}.handoffs.json`;
+		const before = await readFile(path, "utf8");
+		const backup = await readFile(`${path}.bak`, "utf8");
+		const refused = await new HandoffStore(bobScope).execute({ ...alice, persona: bobScope.persona }, input);
+		assert.ok(!refused.ok);
+		assert.match(refused.reason, /other personas' handoffs fill this project's handoff file/);
+		assert.ok(refused.reason.includes(`${count} entries`));
+		assert.ok(refused.reason.includes(path));
+		assert.equal(await readFile(path, "utf8"), before);
+		assert.equal(await readFile(`${path}.bak`, "utf8"), backup);
+	} finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("byte capacity reports the caller's count and forget remedy when their own entries fill the file", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "mind-handoff-own-bytes-"));
+	try {
+		const aliceScope = resolveScope(dir, dir, { persona: "alice", homedir: join(dir, "home") });
+		const bobScope = resolveScope(dir, dir, { persona: "bob", homedir: join(dir, "home") });
+		const alice = { persona: aliceScope.persona, projectRoot: aliceScope.projectRoot, sessionId: "session", branchId: null, cwd: dir };
+		const input = { operation: "save" as const, goal: "Finish", completed: [], pending: [], nextStep: "Review", references: [] };
+		const bobSaved = await new HandoffStore(bobScope).execute({ ...alice, persona: bobScope.persona }, { ...input, goal: "Private other-owner goal" });
+		assert.ok(bobSaved.ok && bobSaved.operation === "save");
+		const store = new HandoffStore(aliceScope);
+		let count = 0;
+		for (; count < 32; count++) {
+			if (!(await store.execute(alice, { ...input, goal: "a".repeat(4096) })).ok) break;
+		}
+		assert.ok(count > 0 && count < 32, "byte cap must precede entry quota");
+		const path = `${aliceScope.paths.stm}.handoffs.json`;
+		const before = await readFile(path, "utf8");
+		const backup = await readFile(`${path}.bak`, "utf8");
+		const refused = await store.execute(alice, { ...input, goal: "a".repeat(4096) });
+		assert.ok(!refused.ok);
+		assert.match(refused.reason, /use forget to free space/);
+		assert.ok(refused.reason.includes(`your entries: ${count}; other personas: 1 entries`));
+		assert.doesNotMatch(refused.reason, /other personas' handoffs fill/);
+		assert.ok(refused.reason.includes(path));
+		for (const privateValue of ["alice", "bob", bobSaved.entry.id, bobSaved.entry.goal]) assert.ok(!refused.reason.includes(privateValue));
+		assert.equal(await readFile(path, "utf8"), before);
+		assert.equal(await readFile(`${path}.bak`, "utf8"), backup);
+	} finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("a second persona's own store cannot list, read, complete or forget another owner's handoff", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "mind-handoff-isolation-"));
+	try {
+		const aliceScope = resolveScope(dir, dir, { persona: "alice", homedir: join(dir, "home") });
+		const bobScope = resolveScope(dir, dir, { persona: "bob", homedir: join(dir, "home") });
+		assert.equal(bobScope.paths.stm, aliceScope.paths.stm);
+		const alice = { persona: aliceScope.persona, projectRoot: aliceScope.projectRoot, sessionId: "session", branchId: null, cwd: dir };
+		const aliceStore = new HandoffStore(aliceScope);
+		const bobStore = new HandoffStore(bobScope);
+		const bob = { ...alice, persona: bobScope.persona };
+		const saved = await aliceStore.execute(alice, { operation: "save", goal: "Finish", completed: [], pending: [], nextStep: "Review", references: [] });
+		assert.ok(saved.ok && saved.operation === "save");
+		const path = `${aliceScope.paths.stm}.handoffs.json`;
+		const before = await readFile(path, "utf8");
+		assert.deepEqual(await bobStore.execute(bob, { operation: "list" }), { ok: true, operation: "list", total: 0, entries: [] });
+		const { id, revision } = saved.entry;
+		for (const input of [{ operation: "read", id }, { operation: "complete", id, revision, resolution: "Done" }, { operation: "forget", id, revision }] as const) {
+			assert.deepEqual(await bobStore.execute(bob, input), { ok: false, reason: "handoff not found" });
+		}
+		assert.deepEqual(await aliceStore.execute(alice, { operation: "read", id }), { ok: true, operation: "read", entry: saved.entry });
+		assert.equal(await readFile(path, "utf8"), before);
 	} finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -97,7 +209,7 @@ test("persisted handoffs reject extra fields and coerced IDs or dates without ex
 			const raw = JSON.stringify({ ...snapshot, entries: [entry] });
 			await writeFile(path, raw);
 			const result = await store.execute(owner, { operation: "list" });
-			assert.equal(result.ok, false);
+			assert.deepEqual(result, { ok: false, reason: `handoff file ${path} is corrupt or contains invalid entries; repair or remove the invalid entry by hand` });
 			assert.doesNotMatch(formatHandoffResult(result), /hunter2secretvalue|ignore all previous/);
 			assert.equal(await readFile(path, "utf8"), raw, "read must not recover or quarantine malformed evidence");
 		}
@@ -108,6 +220,71 @@ test("persisted handoffs reject extra fields and coerced IDs or dates without ex
 		const normalized = validateHandoff(saved.entry); assert.ok(normalized);
 		assert.notEqual(normalized, saved.entry); assert.notEqual(normalized.origin, saved.entry.origin); assert.notEqual(normalized.pending, saved.entry.pending);
 	} finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+for (const failure of ["missing with backup", "corrupt JSON", "invalid envelope", "invalid entries", "unsupported version", "oversized file", "directory", "symlink"] as const) {
+	test(`strict handoff read reports the sidecar and repair guidance: ${failure}`, async () => {
+		const dir = await mkdtemp(join(tmpdir(), "mind-handoff-read-"));
+		try {
+			const scope = resolveScope(dir, dir, { persona: "alice", homedir: join(dir, "home") });
+			const owner = { persona: scope.persona, projectRoot: scope.projectRoot, sessionId: "session", branchId: null, cwd: dir };
+			const store = new HandoffStore(scope);
+			const input = { operation: "save" as const, goal: "Finish", completed: [], pending: [], nextStep: "Review", references: [] };
+			assert.ok((await store.execute(owner, input)).ok);
+			assert.ok((await store.execute(owner, input)).ok);
+			const path = `${scope.paths.stm}.handoffs.json`;
+			const original = await readFile(path, "utf8");
+			const backup = await readFile(`${path}.bak`, "utf8");
+			const envelope = JSON.parse(original);
+			switch (failure) {
+				case "missing with backup": await rm(path); break;
+				case "corrupt JSON": await writeFile(path, "broken"); break;
+				case "invalid envelope": await writeFile(path, "{}"); break;
+				case "invalid entries": await writeFile(path, JSON.stringify({ ...envelope, entries: [{}] })); break;
+				case "unsupported version": await writeFile(path, JSON.stringify({ ...envelope, version: 2 })); break;
+				case "oversized file": await writeFile(path, " ".repeat(MAX_HANDOFF_STORE_BYTES + 1)); break;
+				case "directory": await rm(path); await mkdir(path); break;
+				case "symlink": await rm(path); await symlink(`${path}.bak`, path, "file"); break;
+			}
+			const result = await store.execute(owner, { operation: "list" });
+			assert.ok(!result.ok);
+			assert.ok(result.reason.includes(`handoff file ${path}`), result.reason);
+			assert.doesNotMatch(result.reason, /optimizing/);
+			assert.match(result.reason, /repair|retry|compatible build/);
+			if (failure === "missing with backup") assert.ok(result.reason.includes(`${path}.bak`), result.reason);
+			assert.equal(await readFile(`${path}.bak`, "utf8"), backup);
+			if (failure === "missing with backup") await assert.rejects(readFile(path), { code: "ENOENT" });
+		} finally { await rm(dir, { recursive: true, force: true }); }
+	});
+}
+
+// Exercise the transient bounded-read branches deterministically rather than racing filesystem IO.
+for (const [kind, message] of [
+	["path", "store path changed or is not a regular file"],
+	["bytes", "store file grew while it was being read"],
+	["path", "store file changed or was truncated while it was being read"],
+	["path", "store path changed while it was being read"],
+] as const) {
+	test(`strict handoff read adds context to transient failure: ${message}`, async (t) => {
+		const scope = resolveScope(tmpdir(), tmpdir(), { persona: "alice", homedir: join(tmpdir(), "home") });
+		const owner = { persona: scope.persona, projectRoot: scope.projectRoot, sessionId: "session", branchId: null, cwd: tmpdir() };
+		t.mock.method(JsonStore.prototype, "inspectStrict", async () => { throw new BoundedReadFailure(kind, message); });
+		const result = await new HandoffStore(scope).execute(owner, { operation: "list" });
+		assert.ok(!result.ok);
+		assert.ok(result.reason.includes(`handoff file ${scope.paths.stm}.handoffs.json`), result.reason);
+		assert.doesNotMatch(result.reason, /optimizing/);
+		assert.match(result.reason, /repair|retry/);
+	});
+}
+
+test("strict handoff read reports filesystem access failures with the sidecar path", async (t) => {
+	const scope = resolveScope(tmpdir(), tmpdir(), { persona: "alice", homedir: join(tmpdir(), "home") });
+	const owner = { persona: scope.persona, projectRoot: scope.projectRoot, sessionId: "session", branchId: null, cwd: tmpdir() };
+	t.mock.method(JsonStore.prototype, "inspectStrict", async () => { throw Object.assign(new Error("permission denied"), { code: "EACCES" }); });
+	const result = await new HandoffStore(scope).execute(owner, { operation: "list" });
+	assert.ok(!result.ok);
+	assert.ok(result.reason.includes(`handoff file ${scope.paths.stm}.handoffs.json`), result.reason);
+	assert.match(result.reason, /access|permissions/);
 });
 
 test("full handoff reads and maximum retained summary lists stay within their post-escape byte bounds", () => {
