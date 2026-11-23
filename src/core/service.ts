@@ -23,7 +23,7 @@ import type { MemoryEntry, MemoryInput, MemoryKind } from "./memory.ts";
 import { clampRecallMax, isExpired, isMemoryId, isSafeMemoryContent, makeMemory, memoryContentKey, memoryIdMatches, promoteToLong, pruneExpired, recall, sameMemoryContent, supersedeTargets, upsertMemory, validateLongMemory, validateShortMemory, MAX_MEMORY_DERIVED_IDS, MAX_MEMORY_ID_CHARS, MAX_MEMORY_SOURCE_CHARS, MAX_MEMORY_TAGS, MAX_MEMORY_TAG_CHARS, MAX_MEMORY_TEXT_CHARS } from "./memory.ts";
 import { scanContent } from "./scanner.ts";
 import { memoryMutationLockPath, type Scope } from "./scope.ts";
-import { JsonStore, type JsonStoreOptions, withFileLock } from "./store.ts";
+import { JsonStore, type JsonStoreOptions, type StoreFile, withFileLock } from "./store.ts";
 
 const STORE_VERSION = 1;
 
@@ -315,16 +315,39 @@ export class MindService {
 		if (!this.rememberOwnerCurrent()) throw new Error("memory owner changed; remember refused before commit");
 	}
 
+	/**
+	 * Tolerant read that must have seen every row: a clean read, an absent tier, or a full restore from a valid
+	 * backup. Rows that were preserved but hidden, a quarantine that started the tier empty, or a backup that
+	 * exists but could not be used could hold the very id being superseded, so they refuse instead of passing as
+	 * an empty tier.
+	 */
+	private async loadCompletely(store: JsonStore<MemoryEntry>): Promise<StoreFile<MemoryEntry>> {
+		const refuse = (detail: string): Error => new Error(`memory store ${store.filePath} was not read completely, so it cannot be checked for an ambiguous supersedes id: ${detail}`);
+		let read;
+		try {
+			read = await store.loadChecked();
+		} catch (err) {
+			throw refuse(err instanceof Error ? err.message : String(err));
+		}
+		if (!read.complete) throw refuse(read.reasons.join("; "));
+		return read.file;
+	}
+
 	/** Under the memory transaction lock: resolve across tiers, but retire only in the destination. */
 	private async rememberSuperseding(entry: MemoryEntry, target: OptimizeTarget): Promise<RememberResult> {
-		const stores = Object.values(this.memoryStores());
 		const store = this.memoryStores()[target];
-		// Unlike recovery reads, strict snapshots cannot silently erase evidence before replacement.
-		const loaded = await Promise.all(stores.map((memoryStore) => memoryStore.inspectStrict()));
-		const visible = loaded.flatMap((snapshot) => pruneExpired(snapshot.store.entries, this.now()));
+		// The destination is compare-and-swapped, so only its strict snapshot may anchor the write. The other
+		// tiers merely feed the ambiguity check, so they are read without blocking on repairable damage: a clean
+		// read or a full restore from the backup counts. Any tier whose identities were not all checked (hidden
+		// rows, quarantine, foreign version, I/O error) could hide the id being superseded, so it refuses, naming the store.
+		const snapshot = await store.inspectStrict().catch((err: unknown) => {
+			throw new Error(`destination memory store ${store.filePath}: ${(err instanceof Error ? err.message : String(err)).replace("; repair before optimizing", "; repair it before replacing a memory")}`);
+		});
+		const others = await Promise.all(Object.values(this.memoryStores()).filter((memoryStore) => memoryStore !== store).map((memoryStore) =>
+			this.loadCompletely(memoryStore)));
+		const visible = [snapshot.store, ...others].flatMap((file) => pruneExpired(file.entries, this.now()));
 		const resolved = supersedeTargets(visible, entry.supersedes!);
 		if (resolved.ambiguous) return { ok: false, reason: ambiguousSupersedesReason(entry.supersedes!, ambiguityCandidates(visible, entry.supersedes!)) };
-		const snapshot = loaded[stores.indexOf(store)]!;
 		const active = pruneExpired(snapshot.store.entries, this.now());
 		if (resolved.targets.length > 0 && !active.some((candidate) => memoryIdMatches(candidate, entry.supersedes!))) {
 			return { ok: false, reason: "memory supersedes id exists only outside the destination tier; use the source's scope and lifetime to replace it" };

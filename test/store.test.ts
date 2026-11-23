@@ -322,6 +322,89 @@ test("JsonStore rejects an oversized backup instead of parsing it", async () => 
 	assert.ok(warnings.some((message) => /\.bak|byte|size|limit/i.test(message)), "oversized backup is surfaced");
 });
 
+const itemEnvelope = (patch: Record<string, unknown> = {}, entries: unknown[] = [{ id: "kept", n: 1 }]): string =>
+	JSON.stringify({ version: 1, updatedAt: "2026-07-16T00:00:00.000Z", sequence: 1, entries, ...patch });
+
+test("JsonStore.loadChecked reports a clean read, an absent store and a valid-backup restore as complete", async () => {
+	const clean = join(dir, "checked-clean.json");
+	await writeFile(clean, itemEnvelope(), "utf8");
+	assert.deepEqual(await itemStore(clean).loadChecked().then((read) => [read.complete, read.reasons, read.file.entries]), [true, [], [{ id: "kept", n: 1 }]]);
+
+	const absentWarnings: string[] = [];
+	const absent = await itemStore(join(dir, "checked-absent.json"), { onWarn: (message) => absentWarnings.push(message) }).loadChecked();
+	assert.equal(absent.complete, true, "no live file and no backup is a genuinely empty store");
+	assert.deepEqual([absent.file.entries, absent.reasons, absentWarnings], [[], [], []]);
+
+	for (const [name, live] of [["missing", undefined], ["torn", "{ torn"]] as const) {
+		const p = join(dir, `checked-restore-${name}.json`);
+		if (live !== undefined) await writeFile(p, live, "utf8");
+		await writeFile(`${p}.bak`, itemEnvelope(), "utf8");
+		const read = await itemStore(p).loadChecked();
+		assert.deepEqual([read.complete, read.file.entries], [true, [{ id: "kept", n: 1 }]], `${name} live file restored completely from a valid backup`);
+	}
+});
+
+test("JsonStore.loadChecked reports hidden rows and a quarantined store as incomplete", async () => {
+	const hidden = join(dir, "checked-hidden.json");
+	await writeFile(hidden, itemEnvelope({}, [{ id: "ok", n: 1 }, { id: "bad", n: "x" }]), "utf8");
+	const hiddenRead = await itemStore(hidden).loadChecked();
+	assert.equal(hiddenRead.complete, false);
+	assert.deepEqual(hiddenRead.file.entries, [{ id: "ok", n: 1 }]);
+	assert.match(hiddenRead.reasons.join("; "), /invalid entr/);
+
+	const torn = join(dir, "checked-quarantined.json");
+	await writeFile(torn, "{ torn", "utf8");
+	const tornRead = await itemStore(torn).loadChecked();
+	assert.equal(tornRead.complete, false);
+	assert.deepEqual(tornRead.file.entries, []);
+	assert.match(tornRead.reasons.join("; "), /quarantined/);
+
+	const foreign = join(dir, "checked-foreign.json");
+	await writeFile(foreign, itemEnvelope({ version: 2 }), "utf8");
+	await assert.rejects(itemStore(foreign).loadChecked(), /version 2/, "a foreign live version still throws instead of reading as incomplete");
+});
+
+for (const variant of [
+	{ name: "a foreign version", setup: (p: string) => writeFile(`${p}.bak`, itemEnvelope({ version: 999 }), "utf8"), reason: /version 999/ },
+	{ name: "an invalid envelope", setup: (p: string) => writeFile(`${p}.bak`, itemEnvelope({ updatedAt: 42 }), "utf8"), reason: /unparseable|shape/ },
+	{ name: "malformed JSON", setup: (p: string) => writeFile(`${p}.bak`, "{ torn", "utf8"), reason: /unparseable|shape/ },
+	{ name: "a directory in its place", setup: (p: string) => mkdir(`${p}.bak`), reason: /not a regular file/ },
+	{ name: "an oversized file", setup: (p: string) => writeFile(`${p}.bak`, itemEnvelope({ padding: "x".repeat(512) }), "utf8"), reason: /byte limit/ },
+]) {
+	test(`JsonStore treats a missing live file whose backup is ${variant.name} as unread, not empty`, async () => {
+		const p = join(dir, `unusable-backup-${variant.name.replace(/\W+/g, "-")}.json`);
+		await variant.setup(p);
+		const warnings: string[] = [];
+		const store = itemStore(p, { maxBytes: 256, onWarn: (message) => warnings.push(message) });
+
+		const read = await store.loadChecked();
+		assert.equal(read.complete, false, "the rows may live in the unusable backup");
+		assert.deepEqual(read.file.entries, []);
+		assert.match(read.reasons.join("; "), variant.reason);
+		assert.equal(warnings.filter((message) => message.includes(`${p}.bak`)).length, 1, `one warning names the backup: ${warnings.join(" | ")}`);
+
+		// An ordinary load keeps its result: an empty store, now with the same warning.
+		warnings.length = 0;
+		const loaded = await store.load();
+		assert.deepEqual(loaded.entries, []);
+		assert.equal(loaded.sequence, 0);
+		assert.equal(warnings.filter((message) => message.includes(`${p}.bak`)).length, 1, "ordinary callers see the unusable backup too");
+		assert.equal(existsSync(p), false, "reading never fabricates the live file");
+		assert.equal(existsSync(`${p}.corrupt-0`), false, "an unusable backup is not filed as corruption");
+	});
+}
+
+test("JsonStore leaves an unusable backup byte-for-byte alone while a missing live file is rewritten", async () => {
+	const p = join(dir, "unusable-backup-untouched.json");
+	const bak = itemEnvelope({ version: 999 });
+	await writeFile(`${p}.bak`, bak, "utf8");
+	const store = itemStore(p);
+	await store.load();
+	assert.equal(readFileSync(`${p}.bak`, "utf8"), bak, "a read never rewrites or moves the backup");
+	await store.update(() => [{ id: "new", n: 2 }]);
+	assert.deepEqual((await store.load()).entries, [{ id: "new", n: 2 }], "an update still proceeds from the empty store");
+});
+
 test("JsonStore quarantines a file that exceeds the entry cap without a usable backup", async () => {
 	const p = join(dir, "too-many-entries.json");
 	await writeFile(

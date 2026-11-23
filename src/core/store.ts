@@ -34,6 +34,17 @@ export interface StoreFile<E> {
 	entries: E[];
 }
 
+/**
+ * A tolerant read together with whether it saw every row. `complete` is false when the result may be
+ * missing rows that exist on disk: rows hidden as invalid, a file quarantined to start empty, or an
+ * existing backup that could not be used while the live file is absent. `reasons` says why.
+ */
+export interface StoreRead<E> {
+	file: StoreFile<E>;
+	complete: boolean;
+	reasons: string[];
+}
+
 export interface StoreSnapshot<E> {
 	store: StoreFile<E>;
 	/** Binds the exact live bytes and store path, including same-sequence replacements. */
@@ -56,7 +67,13 @@ let lockSeq = 0;
 // JsonStore.load(), but the next atomic rewrite can put them back verbatim instead of silently
 // erasing data that the current validator does not understand yet.
 const PRESERVED_INVALID_ENTRIES: unique symbol = Symbol("preservedInvalidEntries");
-type InternalStoreFile<E> = StoreFile<E> & { [PRESERVED_INVALID_ENTRIES]?: unknown[] };
+// Set on an empty store that stands in for data which exists but could not be read, so loadChecked()
+// can tell it from a store that is genuinely empty. Never persisted.
+const UNREAD_REASON: unique symbol = Symbol("unreadReason");
+type InternalStoreFile<E> = StoreFile<E> & { [PRESERVED_INVALID_ENTRIES]?: unknown[]; [UNREAD_REASON]?: string };
+
+/** What the `.bak` sidecar offers: nothing, a valid store, or a file that exists but cannot be used. */
+type BackupRead<E> = { kind: "absent" } | { kind: "usable"; store: InternalStoreFile<E> } | { kind: "unusable"; reason: string };
 
 export interface AtomicWriteOptions {
 	/** Refresh the `.bak` sidecar from the current live file only when this returns true for its
@@ -784,41 +801,49 @@ export class JsonStore<E> {
 		});
 	}
 
-	private async recoverFromBak(reason: string, lockToken?: string): Promise<InternalStoreFile<E> | null> {
-		if (lockToken === undefined) {
-			const peek = await this.tryBak();
-			if (!peek) return null;
-			// Missing was only an optimistic observation: a writer may repair and commit
-			// while this reader waits. Re-read live state under its lock before restoring.
-			return withFileLock(`${this.filePath}.lock`, async (token) => this.loadInternal(token));
+	/** A missing backup is normal; one that exists but cannot be used is not, and is never repaired or moved. */
+	private async readBak(): Promise<BackupRead<E>> {
+		try {
+			const store = this.parseStore(await readTextFileBounded(`${this.filePath}.bak`, this.maxBytes));
+			return store ? { kind: "usable", store } : { kind: "unusable", reason: "unparseable or unexpected shape" };
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
+			return { kind: "unusable", reason: err instanceof Error ? err.message : String(err) };
 		}
-		const bak = await this.tryBak();
-		if (!bak) return null;
+	}
+
+	/** Restore the last-known-good `.bak` over the live path. Only an unusable backup warns; an absent one is silent. */
+	private async recoverFromBak(reason: string): Promise<BackupRead<E>> {
+		const bak = await this.readBak();
+		if (bak.kind === "unusable") this.onWarn(`mind store: ${this.filePath}.bak rejected — ${bak.reason}`);
+		if (bak.kind !== "usable") return bak;
 		this.onWarn(`mind store: ${this.filePath} ${reason}; recovered from ${this.filePath}.bak`);
-		this.warnInvalidEntries(bak);
-		await this.restoreLive(bak);
+		this.warnInvalidEntries(bak.store);
+		await this.restoreLive(bak.store);
 		return bak;
 	}
 
-	/** Try to recover the last-known-good `.bak` sidecar. Returns null if it is absent or also bad. */
-	private async tryBak(): Promise<InternalStoreFile<E> | null> {
-		try {
-			return this.parseStore(await readTextFileBounded(`${this.filePath}.bak`, this.maxBytes));
-		} catch (err) {
-			if (err instanceof BoundedReadFailure) {
-				this.onWarn(`mind store: ${this.filePath}.bak rejected — ${err.message}`);
-			}
-			return null;
-		}
+	/** Empty stand-in for data that exists but was not read, flagged so loadChecked() reports it incomplete. */
+	private unreadEmpty(reason: string): InternalStoreFile<E> {
+		const store: InternalStoreFile<E> = this.empty();
+		store[UNREAD_REASON] = reason;
+		return store;
+	}
+
+	/** An unreadable live file was set aside: announce it and start empty, flagged incomplete. */
+	private startEmpty(reason: string): InternalStoreFile<E> {
+		this.onWarn(`mind store: ${this.filePath} ${reason}`);
+		return this.unreadEmpty(reason);
+	}
+
+	private invalidEntriesNote(store: InternalStoreFile<E>): string | null {
+		const count = store[PRESERVED_INVALID_ENTRIES]?.length ?? 0;
+		return count === 0 ? null : `contained ${count} invalid entr${count === 1 ? "y" : "ies"}; preserved raw and hidden from consumers`;
 	}
 
 	private warnInvalidEntries(store: InternalStoreFile<E>): void {
-		const count = store[PRESERVED_INVALID_ENTRIES]?.length ?? 0;
-		if (count === 0) return;
-		this.onWarn(
-			`mind store: ${this.filePath} contained ${count} invalid entr${count === 1 ? "y" : "ies"}; ` +
-			"preserved raw and hidden from consumers",
-		);
+		const note = this.invalidEntriesNote(store);
+		if (note !== null) this.onWarn(`mind store: ${this.filePath} ${note}`);
 	}
 
 	private async recoverBoundedFailure(failure: BoundedReadFailure, lockToken?: string): Promise<InternalStoreFile<E>> {
@@ -827,13 +852,12 @@ export class JsonStore<E> {
 			// store lock before quarantine so a writer that repaired the path wins the race safely.
 			return withFileLock(`${this.filePath}.lock`, async (token) => this.loadInternal(token));
 		}
-		const bak = await this.recoverFromBak(`rejected — ${failure.message}`, lockToken);
-		if (bak) return bak;
+		const bak = await this.recoverFromBak(`rejected — ${failure.message}`);
+		if (bak.kind === "usable") return bak.store;
 		const quarantineOptions: QuarantineOptions = {};
 		if (lockToken !== undefined) quarantineOptions.lockToken = lockToken;
 		const dest = await quarantineCorrupt(this.filePath, failure.message, quarantineOptions);
-		this.onWarn(`mind store: ${this.filePath} rejected — ${failure.message}; no usable backup, quarantined to ${dest ?? "(nowhere)"}, starting empty`);
-		return this.empty();
+		return this.startEmpty(`rejected — ${failure.message}; no usable backup, quarantined to ${dest ?? "(nowhere)"}, starting empty`);
 	}
 
 	private async loadInternal(lockToken?: string): Promise<InternalStoreFile<E>> {
@@ -842,8 +866,18 @@ export class JsonStore<E> {
 			raw = await readTextFileBounded(this.filePath, this.maxBytes);
 		} catch (err) {
 			if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-				const bak = await this.recoverFromBak("missing", lockToken);
-				return bak ?? this.empty();
+				if (lockToken === undefined) {
+					// Missing was only an optimistic observation: a writer may repair and commit while this reader
+					// waits. Unless there is no backup at all, re-read live state under its lock before restoring.
+					if ((await this.readBak()).kind === "absent") return this.empty();
+					return withFileLock(`${this.filePath}.lock`, async (token) => this.loadInternal(token));
+				}
+				const bak = await this.recoverFromBak("missing");
+				if (bak.kind === "usable") return bak.store;
+				// Only an absent backup makes this tier genuinely empty. One that exists but cannot be used leaves
+				// the tier unread: the rows it holds may be exactly the ones a caller needs to see. The backup
+				// warning has already been given by recoverFromBak.
+				return bak.kind === "unusable" ? this.unreadEmpty(`has no live file and its backup ${this.filePath}.bak could not be used (${bak.reason}); the tier was not read`) : this.empty();
 			}
 			if (err instanceof BoundedReadFailure) return this.recoverBoundedFailure(err, lockToken);
 			throw err;
@@ -865,18 +899,32 @@ export class JsonStore<E> {
 			return withFileLock(`${this.filePath}.lock`, async (token) => this.loadInternal(token));
 		}
 		// Live file is torn/invalid — roll back to the last-known-good backup before giving up.
-		const bak = await this.recoverFromBak("was corrupt — the last committed write may be lost", lockToken);
-		if (bak) return bak;
+		const bak = await this.recoverFromBak("was corrupt — the last committed write may be lost");
+		if (bak.kind === "usable") return bak.store;
 		const quarantineOptions: QuarantineOptions = {};
 		if (lockToken !== undefined) quarantineOptions.lockToken = lockToken;
 		const dest = await quarantineCorrupt(this.filePath, "unparseable / unexpected shape", quarantineOptions);
-		this.onWarn(`mind store: ${this.filePath} was corrupt and had no usable backup — quarantined to ${dest ?? "(nowhere)"}, starting empty`);
-		return this.empty();
+		return this.startEmpty(`was corrupt and had no usable backup — quarantined to ${dest ?? "(nowhere)"}, starting empty`);
+	}
+
+	private plain(store: InternalStoreFile<E>): StoreFile<E> {
+		return { version: store.version, updatedAt: store.updatedAt, sequence: store.sequence, entries: [...store.entries] };
 	}
 
 	async load(): Promise<StoreFile<E>> {
+		return this.plain(await this.loadInternal());
+	}
+
+	/**
+	 * The same tolerant read as {@link load}, plus whether it saw every row. A missing file with no backup is
+	 * complete, and so is a restore from a valid backup. Rows hidden as invalid, a quarantine that started the
+	 * store empty, or a backup that exists but could not be used while the live file is absent are not. A foreign
+	 * version or an I/O error on the live file still throws, exactly as it does for `load`.
+	 */
+	async loadChecked(): Promise<StoreRead<E>> {
 		const store = await this.loadInternal();
-		return { version: store.version, updatedAt: store.updatedAt, sequence: store.sequence, entries: [...store.entries] };
+		const reasons = [store[UNREAD_REASON], this.invalidEntriesNote(store)].filter((reason): reason is string => typeof reason === "string");
+		return { file: this.plain(store), complete: reasons.length === 0, reasons };
 	}
 
 	/** Read without recovery, quarantine, warnings or writes; invalid rows make editing unsafe. */

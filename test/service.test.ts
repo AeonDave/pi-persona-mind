@@ -360,6 +360,139 @@ test("remember refuses supersedes outside its destination without changing eithe
 	}
 });
 
+test("remember supersedes is not blocked by a tier that was recovered completely from its backup", async () => {
+	const scope = scopeFor("supersedes-recovered-tier", "elite");
+	const mind = new MindService(scope, { now: () => 1_000_000 });
+	const old = await mind.remember({ term: "long", scope: "project", kind: "note", text: "old fact" });
+	assert.ok(old.ok);
+	assert.ok((await mind.remember({ term: "long", scope: "shared", kind: "note", text: "shared fact" })).ok);
+	assert.ok((await mind.remember({ term: "long", scope: "shared", kind: "note", text: "shared fact two" })).ok, "a second write leaves a backup of the first");
+	await writeFile(scope.paths.shared, "{ torn");
+	const result = await mind.remember({ term: "long", scope: "project", kind: "note", text: "new fact", supersedes: old.entry.id });
+	assert.ok(result.ok, result.ok ? "" : result.reason);
+	assert.deepEqual((await mind.recall("", "long", 10)).hits.map((e) => e.text).sort(), ["new fact", "shared fact"]);
+});
+
+test("remember supersedes refuses when a tier it does not write to was quarantined unchecked", async () => {
+	const scope = scopeFor("supersedes-quarantined-tier", "elite");
+	const mind = new MindService(scope, { now: () => 1_000_000 });
+	const old = await mind.remember({ term: "long", scope: "project", kind: "note", text: "old fact" });
+	assert.ok(old.ok);
+	await mkdir(join(scope.paths.shared, ".."), { recursive: true });
+	await writeFile(scope.paths.shared, "{ torn");
+	const result = await mind.remember({ term: "long", scope: "project", kind: "note", text: "new fact", supersedes: old.entry.id });
+	assert.equal(result.ok, false, "its identities were never checked");
+	assert.ok((result.ok ? "" : result.reason).includes(scope.paths.shared), result.ok ? "" : result.reason);
+	assert.deepEqual((await mind.recall("", "project", 10)).hits.map((e) => e.text), ["old fact"]);
+});
+
+test("remember supersedes refuses an ambiguous id hidden by an invalid row in another tier", async () => {
+	const scope = scopeFor("supersedes-hidden-row", "elite");
+	const projectFact = makeMemory({ term: "long", kind: "note", text: "release checklist", tags: ["a,b"], persona: "elite" }, 1_000_000);
+	const sharedFact = makeMemory({ term: "long", kind: "note", text: "release checklist", tags: ["a", "b"] }, 1_000_000);
+	const legacy = legacyContentId("note", "release checklist", ["a,b"]);
+	const envelope = (entries: unknown[]): string => `${JSON.stringify({ version: 1, updatedAt: new Date(1_000_000).toISOString(), sequence: 1, entries })}\n`;
+	await mkdir(join(scope.paths.projectLtm, ".."), { recursive: true });
+	await mkdir(join(scope.paths.shared, ".."), { recursive: true });
+	await writeFile(scope.paths.projectLtm, envelope([{ ...projectFact, id: legacy }]));
+	// Malformed auxiliary metadata hides the row from load() while it stays preserved on disk.
+	await writeFile(scope.paths.shared, envelope([{ ...sharedFact, id: legacy, source: 42 }]));
+	const mind = new MindService(scope, { now: () => 2_000_000 });
+	const result = await mind.remember({ term: "long", scope: "project", kind: "note", text: "an unrelated new fact", supersedes: legacy });
+	assert.equal(result.ok, false, "the hidden row could be the second holder of the legacy id");
+	assert.ok((result.ok ? "" : result.reason).includes(scope.paths.shared), result.ok ? "" : result.reason);
+	const persisted = JSON.parse(await readFile(scope.paths.projectLtm, "utf8")) as { entries: { text: string }[] };
+	assert.deepEqual(persisted.entries.map((e) => e.text), ["release checklist"], "nothing was retired");
+});
+
+test("remember supersedes names a tier it cannot read for the ambiguity check", async () => {
+	const scope = scopeFor("supersedes-unreadable-tier", "elite");
+	const mind = new MindService(scope, { now: () => 1_000_000 });
+	const old = await mind.remember({ term: "long", scope: "project", kind: "note", text: "old fact" });
+	assert.ok(old.ok);
+	await writeFile(scope.paths.shared, `${JSON.stringify({ version: 999, updatedAt: new Date(1_000_000).toISOString(), sequence: 1, entries: [] })}
+`);
+	const result = await mind.remember({ term: "long", scope: "project", kind: "note", text: "new fact", supersedes: old.entry.id });
+	assert.equal(result.ok, false, "an unreadable tier could hide the superseded id");
+	const reason = result.ok ? "" : result.reason;
+	assert.ok(reason.includes(scope.paths.shared), reason);
+	assert.doesNotMatch(reason, /optimizing/);
+});
+
+// A tier whose live file is gone is readable only through its `.bak`. When that backup exists but cannot be
+// used, the tier was never checked for the id being superseded, so it must refuse like any other unread tier.
+const storeEnvelope = (entries: unknown[], patch: Record<string, unknown> = {}): string =>
+	`${JSON.stringify({ version: 1, updatedAt: new Date(1_000_000).toISOString(), sequence: 1, entries, ...patch })}\n`;
+
+async function legacyIdAcrossTiers(ns: string, warnings: string[] = []) {
+	const scope = scopeFor(ns, "elite");
+	const projectFact = makeMemory({ term: "long", kind: "note", text: "release checklist", tags: ["a,b"], persona: "elite" }, 1_000_000);
+	const sharedFact = makeMemory({ term: "long", kind: "note", text: "release checklist", tags: ["a", "b"] }, 1_000_000);
+	const legacy = legacyContentId("note", "release checklist", ["a,b"]);
+	await mkdir(join(scope.paths.projectLtm, ".."), { recursive: true });
+	await mkdir(join(scope.paths.shared, ".."), { recursive: true });
+	await writeFile(scope.paths.projectLtm, storeEnvelope([{ ...projectFact, id: legacy }]));
+	const mind = new MindService(scope, { now: () => 2_000_000, onWarn: (message) => warnings.push(message) });
+	return { scope, legacy, sharedRow: { ...sharedFact, id: legacy }, mind };
+}
+
+const unusableBackups: { name: string; raw: (row: unknown) => string }[] = [
+	{ name: "a foreign version", raw: (row) => storeEnvelope([row], { version: 999 }) },
+	{ name: "an invalid envelope", raw: (row) => storeEnvelope([row], { updatedAt: 42 }) },
+	{ name: "malformed JSON", raw: () => "{ torn" },
+];
+for (const { name, raw } of unusableBackups) {
+	test(`remember supersedes refuses when another tier's live file is missing and its backup has ${name}`, async () => {
+		const warnings: string[] = [];
+		const { scope, legacy, sharedRow, mind } = await legacyIdAcrossTiers(`supersedes-unusable-backup-${name.replace(/W+/g, "-")}`, warnings);
+		await writeFile(`${scope.paths.shared}.bak`, raw(sharedRow));
+		const projectBefore = await readFile(scope.paths.projectLtm, "utf8");
+		const result = await mind.remember({ term: "long", scope: "project", kind: "note", text: "an unrelated new fact", supersedes: legacy });
+		assert.equal(result.ok, false, "the unusable backup could hold the second holder of the legacy id");
+		assert.ok((result.ok ? "" : result.reason).includes(scope.paths.shared), result.ok ? "" : result.reason);
+		assert.equal(await readFile(scope.paths.projectLtm, "utf8"), projectBefore, "nothing was retired");
+		assert.ok(warnings.some((message) => message.includes(`${scope.paths.shared}.bak`)), `the unusable backup is announced: ${warnings.join(" | ")}`);
+		assert.equal(existsSync(scope.paths.shared), false, "reading never fabricates the live file");
+	});
+}
+
+test("remember supersedes still refuses the ambiguous id when the other tier's backup is valid", async () => {
+	const { scope, legacy, sharedRow, mind } = await legacyIdAcrossTiers("supersedes-valid-backup");
+	await writeFile(`${scope.paths.shared}.bak`, storeEnvelope([sharedRow]));
+	const result = await mind.remember({ term: "long", scope: "project", kind: "note", text: "an unrelated new fact", supersedes: legacy });
+	assert.equal(result.ok, false);
+	assert.match(result.ok ? "" : result.reason, /ambiguous/i);
+});
+
+test("remember supersedes allows the replacement when the other tier is genuinely absent", async () => {
+	const { scope, legacy, mind } = await legacyIdAcrossTiers("supersedes-absent-tier");
+	assert.equal(existsSync(scope.paths.shared), false);
+	assert.equal(existsSync(`${scope.paths.shared}.bak`), false);
+	const result = await mind.remember({ term: "long", scope: "project", kind: "note", text: "an unrelated new fact", supersedes: legacy });
+	assert.ok(result.ok, result.ok ? "" : result.reason);
+	assert.deepEqual((await mind.recall("", "project", 10)).hits.map((entry) => entry.text), ["an unrelated new fact"]);
+});
+
+test("remember supersedes refuses when a directory sits where another tier's backup should be", async () => {
+	const { scope, legacy, mind } = await legacyIdAcrossTiers("supersedes-backup-directory");
+	await mkdir(`${scope.paths.shared}.bak`);
+	const result = await mind.remember({ term: "long", scope: "project", kind: "note", text: "an unrelated new fact", supersedes: legacy });
+	assert.equal(result.ok, false);
+	assert.ok((result.ok ? "" : result.reason).includes(scope.paths.shared), result.ok ? "" : result.reason);
+});
+
+test("remember supersedes names a corrupt destination tier without optimizing wording", async () => {
+	const scope = scopeFor("supersedes-corrupt-destination", "elite");
+	const mind = new MindService(scope, { now: () => 1_000_000 });
+	assert.ok((await mind.remember({ term: "long", scope: "project", kind: "note", text: "old fact" })).ok);
+	await writeFile(scope.paths.projectLtm, "{ torn");
+	const result = await mind.remember({ term: "long", scope: "project", kind: "note", text: "new fact", supersedes: "anything" });
+	assert.equal(result.ok, false);
+	const reason = result.ok ? "" : result.reason;
+	assert.ok(reason.includes(scope.paths.projectLtm), reason);
+	assert.doesNotMatch(reason, /optimizing/);
+});
+
 test("remember supersedes stays local when the same fact also exists in another tier", async () => {
 	const mind = svc("supersedes-local-copy", "elite", 1_000_000);
 	const old = await mind.remember({ term: "long", scope: "project", kind: "note", text: "old fact" });
