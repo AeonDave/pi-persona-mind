@@ -6,8 +6,8 @@ import type { MemoryOptimizer } from "../core/optimize-service.ts";
 import type { OptimizePlan } from "../core/optimize.ts";
 import { buildKnowledgeReviewTask, formatKnowledgeReview, parseKnowledgeReview, type ReviewPacket, type ReviewTarget } from "../core/knowledge-review.ts";
 import { collectReviewEvidence, type ReviewEvidenceSnapshot } from "./review-evidence.ts";
-import type { ReviewReservation } from "./auto-optimize.ts";
-import type { MindWorkerAdmission } from "./mind-worker.ts";
+import { WORKER_WAIT_RELEASED, type ReviewReservation } from "./auto-optimize.ts";
+import type { MindWorkerAdmission, MindWorkerResult } from "./mind-worker.ts";
 
 export interface KnowledgeReviewDeps {
 	captureOwner(ctx: ExtensionContext): () => boolean;
@@ -16,6 +16,7 @@ export interface KnowledgeReviewDeps {
 	launch(ctx: ExtensionContext, task: string): MindWorkerAdmission;
 	appendResult(ctx: ExtensionContext, title: string, body: string): void;
 	collect?: typeof collectReviewEvidence;
+	schedule?: (work: () => void, delay: number) => () => void;
 }
 interface PendingReview {
 	ctx: ExtensionContext;
@@ -38,6 +39,8 @@ export function createKnowledgeReview(deps: KnowledgeReviewDeps) {
 	let pending: PendingReview | undefined;
 	let applying = false;
 	const collect = deps.collect ?? collectReviewEvidence;
+	const schedule = deps.schedule ?? ((work, delay) => { const timer = setTimeout(work, delay); timer.unref(); return () => clearTimeout(timer); });
+	const workerReleases = new Set<() => void>();
 	const notify = (ctx: ExtensionContext, message: string): void => ctx.ui.notify(message, "info");
 	const drop = (): void => { pending?.optimizer.invalidate(); pending = undefined; };
 	const interrupt = (): void => { generation++; dialogs.abort(); dialogs = new AbortController(); running?.cancel(); drop(); };
@@ -116,11 +119,16 @@ export function createKnowledgeReview(deps: KnowledgeReviewDeps) {
 			const reviewOptimizer = optimizer;
 			running = admission;
 			reservation = undefined; optimizer = undefined;
+			// Latched, so the cancel-then-join wait after a released first wait also returns at once.
+			let releaseWorkerWait!: () => void;
+			const workerWaitReleased = new Promise<MindWorkerResult>((resolve) => { releaseWorkerWait = () => resolve(WORKER_WAIT_RELEASED); });
+			workerReleases.add(releaseWorkerWait);
+			const completion = (): Promise<MindWorkerResult> => Promise.race([admission.completion, workerWaitReleased]);
 			work = (async () => {
 				let completed = false;
 				try {
 					lease.launched(createHash("sha256").update(`knowledge-review\n${task}`).digest("hex"));
-					const result = await admission.completion;
+					const result = await completion();
 					requireCurrent(current);
 					if (!lease.current()) throw new Error("Mind maintenance reservation was revoked.");
 					if (!result.ok || result.status !== "done") throw new Error("Knowledge review stopped or failed; no changes were applied.");
@@ -143,7 +151,7 @@ export function createKnowledgeReview(deps: KnowledgeReviewDeps) {
 				} catch (error) {
 					reviewOptimizer.invalidate();
 					admission.cancel();
-					await admission.completion.catch(() => {});
+					await completion().catch(() => {});
 					if (current()) {
 						try { deps.appendResult(ctx, "Mind knowledge review — not applied", error instanceof Error ? error.message : "Knowledge review failed."); }
 						catch { /* no persistence fallback and no application */ }
@@ -152,6 +160,7 @@ export function createKnowledgeReview(deps: KnowledgeReviewDeps) {
 				} finally {
 					if (completed && current()) { try { lease.settled(); } catch { notify(ctx, "Mind review accounting could not be persisted; inspect /mind doctor before retrying."); } }
 					lease.release();
+					workerReleases.delete(releaseWorkerWait);
 					if (running === admission) running = undefined;
 				}
 			})();
@@ -208,8 +217,13 @@ export function createKnowledgeReview(deps: KnowledgeReviewDeps) {
 		return applyWork;
 	}
 	// Revocation prevents admission/guarded writes, but cannot roll back a committed store.
-	// Join includes confirmation, persistence and receipt finalization, even after interrupt().
-	return { start, show, apply, interrupt, join: async () => { await Promise.all([work, applyWork]); }, hasPending: () => snapshot() !== undefined,
+	// Join includes confirmation, persistence and receipt finalization, even after interrupt();
+	// a bound releases only the wait for the remote worker, which then ends as interrupted.
+	const join = async (workerWaitMs?: number): Promise<void> => {
+		const cancel = workerWaitMs === undefined ? undefined : schedule(() => { for (const release of workerReleases) release(); }, workerWaitMs);
+		try { await Promise.all([work, applyWork]); } finally { cancel?.(); }
+	};
+	return { start, show, apply, interrupt, join, hasPending: () => snapshot() !== undefined,
 		discard(ctx: ExtensionContext): void { interrupt(); notify(ctx, "Knowledge review cancelled/discarded; no pending plan remains. Already applied changes require history/undo."); },
 	};
 }

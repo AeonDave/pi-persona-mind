@@ -29,6 +29,7 @@ function fixture(options: {
 	applyWarning?: string;
 	previewThrows?: boolean;
 	applyThrows?: boolean;
+	applyGate?: Promise<void>;
 	applyRefusesTarget?: AutoOptimizeTarget;
 	admissionRefusesTarget?: AutoOptimizeTarget;
 	inspectionRefusesTarget?: AutoOptimizeTarget;
@@ -103,6 +104,7 @@ function fixture(options: {
 		},
 		apply: async () => {
 			events.push("apply"); applied++;
+			if (options.applyGate) await options.applyGate;
 			if (options.applyThrows) throw new Error("apply rejected after possible commit");
 			if (plan?.target === options.applyRefusesTarget) return { ok: false as const, reason: "memory changed since preview" };
 			return { ok: true as const, planId: "plan", target: plan?.target ?? "persona", changed: 1, beforeCount: 2, afterCount: 1, receiptId: "auto-receipt", ...(options.applyWarning ? { warning: options.applyWarning } : {}) };
@@ -383,13 +385,27 @@ test("automatic ineligible singleton or mixed kinds skip the worker without char
 	}
 });
 
-test("an interrupted attempt whose records become ineligible is settled without a retry launch, including after restore", async () => {
+test("an interrupted attempt whose records become ineligible is dropped without a receipt or retry launch, and a restore owes one admission until a launch supersedes it", async () => {
 	const f = fixture(); f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire();
 	assert.equal(f.launches(), 1); f.scheduler.interrupt(); await f.scheduler.join();
 	f.entries.splice(1); f.advance(); f.scheduler.settled(); await f.fire(); await f.scheduler.join();
-	assert.equal(f.launches(), 1); assert.deepEqual(f.attempts.map((a) => a.state), ["started", "settled"]);
-	assert.equal(f.attempts[1]!.digest, f.attempts[0]!.digest);
-	f.scheduler.activate(f.owner); f.scheduler.settled(); assert.equal(f.pending(), 0);
+	assert.equal(f.launches(), 1);
+	assert.deepEqual(f.attempts.map((a) => a.state), ["started"], "a vanished input is never recorded as reviewed");
+	f.advance(); f.scheduler.settled(); assert.equal(f.pending(), 0, "the retry at its own window is dropped, not kept pending");
+	f.scheduler.memoryAdded("persona"); f.scheduler.settled();
+	assert.deepEqual(f.delays(), [], "a dropped retry no longer bypasses the token floor");
+	f.scheduler.activate(f.owner); f.scheduler.settled();
+	assert.equal(f.pending(), 1, "without a receipt, restore re-derives the retry from the latest started attempt");
+	await f.fire(); await f.scheduler.join();
+	assert.equal(f.launches(), 1); assert.deepEqual(f.attempts.map((a) => a.state), ["started"]);
+	f.scheduler.settled(); assert.equal(f.pending(), 0, "a restored retry that cannot verify its window stays owed but never re-pends itself");
+	f.entries.push(makeMemory({ term: "long", kind: "convention", text: "Persona prefers explicit examples in release notes.", persona: "dev" }, 2_000_000));
+	f.scheduler.memoryAdded("persona"); f.scheduler.settled();
+	assert.deepEqual(f.delays(), [2_000], "the owed retry admits the next dirty trigger without the token floor");
+	await f.fire(); assert.equal(f.launches(), 2);
+	f.finish('{"operations":[]}'); await f.scheduler.join();
+	f.scheduler.activate(f.owner); f.scheduler.settled();
+	assert.equal(f.pending(), 0, "the later launch on the tier supersedes the interrupted receipt");
 });
 
 test("explicit single large record still allows a one-source replacement", async () => {
@@ -1006,4 +1022,220 @@ test("revoked owner and malformed output cannot commit into a replacement sessio
 	const f = fixture(); f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire(); f.revoke(); f.finish('{"operations":[]}'); await f.scheduler.join(); assert.equal(f.events.some((event) => event.startsWith("report:")), false);
 	const g = fixture(); g.scheduler.memoryAdded("persona"); g.scheduler.settled(); await g.fire(); g.finish('{"operations":[],"execute":"bad"}'); await g.scheduler.join(); assert.equal(g.applied(), 0);
 	assert.deepEqual(g.attempts.map((attempt) => attempt.state), ["started", "settled"], "completed malformed output is suppressed to avoid a failure loop");
+});
+
+test("an automatic review stopped twice on unchanged records is parked, not settled, until its input changes", async () => {
+	const stopped: MindWorkerResult = { status: "stopped", ok: false, output: "", error: "Mind worker cancelled" };
+	const f = fixture();
+	f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire();
+	f.finish(stopped); await f.scheduler.join();
+	f.advance(); f.scheduler.settled(); await f.fire();
+	assert.equal(f.launches(), 2, "the first interruption earns exactly one token-free retry");
+	f.finish(stopped); await f.scheduler.join();
+	for (let round = 0; round < 3; round++) { f.advance(); f.scheduler.settled(); await f.fire(); }
+	assert.equal(f.launches(), 2, "a second interruption of the same input ends its retries");
+	assert.equal(f.pending(), 0);
+	assert.doesNotMatch(f.scheduler.status(), /without another token wait/);
+	assert.match(f.scheduler.status(), /parked until its records change/);
+	assert.deepEqual(f.attempts.map((attempt) => attempt.state), ["started", "started"], "interrupted work is never recorded as completed");
+	assert.equal(f.reports.length, 1); assert.match(f.reports[0]!.body, /interrupted twice/);
+	f.scheduler.activate(f.owner); f.scheduler.settled();
+	assert.equal(f.pending(), 0, "restore derives the parked input from its two interrupted receipts");
+	f.scheduler.memoryAdded("persona"); f.scheduler.tokensUsed(AUTO_INPUT_TOKEN_THRESHOLD); f.advance(); f.scheduler.settled(); await f.fire(); await f.scheduler.join();
+	assert.equal(f.launches(), 2, "an open token gate does not relaunch the parked input");
+	f.entries.push(makeMemory({ term: "long", kind: "convention", text: "Persona prefers concise sentences in release notes.", persona: "dev" }, 2_000_000));
+	f.scheduler.memoryAdded("persona"); f.scheduler.tokensUsed(AUTO_INPUT_TOKEN_THRESHOLD); f.advance(); f.scheduler.settled(); await f.fire();
+	assert.equal(f.launches(), 3, "changed input is reviewed again");
+	f.finish('{"operations":[]}'); await f.scheduler.join();
+});
+
+test("foreground interruptions count toward the single retry of an unchanged input", async () => {
+	const f = fixture();
+	f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire();
+	f.scheduler.interrupt(); await f.scheduler.join();
+	f.advance(); f.scheduler.settled(); await f.fire();
+	assert.equal(f.launches(), 2);
+	f.scheduler.interrupt(); await f.scheduler.join();
+	f.advance(); f.scheduler.settled();
+	assert.equal(f.pending(), 0, "the second interruption of the same input does not rearm a retry");
+	assert.deepEqual(f.attempts.map((attempt) => attempt.state), ["started", "started"]);
+});
+
+test("a failed automatic worker is terminal for its input and never bypasses the token gate", async () => {
+	const f = fixture();
+	f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire();
+	f.finish({ status: "failed", ok: false, output: "", error: "Mind worker exceeded its 180 s limit" }); await f.scheduler.join();
+	assert.deepEqual(f.attempts.map((attempt) => attempt.state), ["started", "settled"]);
+	assert.match(f.reports[0]!.body, /worker failed; memory unchanged: Mind worker exceeded its 180 s limit/);
+	for (let round = 0; round < 3; round++) { f.advance(); f.scheduler.settled(); await f.fire(); }
+	assert.equal(f.launches(), 1);
+	f.scheduler.memoryAdded("persona"); f.scheduler.tokensUsed(AUTO_INPUT_TOKEN_THRESHOLD); f.advance(); f.scheduler.settled(); await f.fire(); await f.scheduler.join();
+	assert.equal(f.launches(), 1, "the failed digest stays suppressed until its input changes");
+});
+
+test("shutdown join stops waiting for an unsettled worker at its bound and leaves the slot free", async () => {
+	const f = fixture({ cancelCompletes: false });
+	f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire();
+	assert.equal(f.launches(), 1);
+	f.scheduler.stop();
+	let joined = false;
+	const joining = f.scheduler.join(5_000).then(() => { joined = true; });
+	for (let i = 0; i < 24; i++) await Promise.resolve();
+	assert.equal(joined, false, "the bound has not elapsed yet");
+	assert.deepEqual(f.delays(), [5_000]);
+	await f.fire();
+	assert.equal(joined, true, "the bound releases the wait for Persona's completion");
+	await joining;
+	assert.deepEqual(f.attempts.map((attempt) => attempt.state), ["started"], "an abandoned wait is an interruption, not completed work");
+	f.scheduler.activate(f.owner);
+	assert.match(f.scheduler.status(), /interrupted review pending/);
+	assert.equal(f.scheduler.startExplicit("persona"), true, "the worker slot is free for the next activation");
+	await until(() => f.launches() === 2, "explicit worker after abandoned shutdown wait");
+	f.finish('{"operations":[]}'); await f.scheduler.join();
+});
+
+test("shutdown join keeps waiting for a local apply past the worker bound", async () => {
+	let release!: () => void;
+	const f = fixture({ applyGate: new Promise((resolve) => { release = resolve; }) });
+	f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire();
+	f.finish(JSON.stringify({ operations: [{ sourceIds: f.entries.map((entry) => entry.id), kind: "convention", text: "A validated replacement proposal." }] }));
+	await until(() => f.applied() === 1, "apply admitted");
+	f.scheduler.stop();
+	let joined = false;
+	const joining = f.scheduler.join(5_000).then(() => { joined = true; });
+	await f.fire();
+	assert.equal(joined, false, "local persistence is joined regardless of the worker bound");
+	release(); await joining;
+	assert.equal(joined, true);
+});
+
+test("a parked window is bypassed by rotation without being recorded as reviewed, and stays suppressed until it changes", async () => {
+	const stopped: MindWorkerResult = { status: "stopped", ok: false, output: "", error: "Mind worker cancelled" };
+	const base = 1_000_000;
+	const persona = Array.from({ length: 24 }, (_, index) => makeMemory({ term: "long", kind: "convention", text: `Persona convention number ${index} keeps release notes precise.`, persona: "dev" }, base + index));
+	const f = fixture({ allowedTargets: ["persona"], entriesByTarget: { persona } });
+	f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire();
+	f.finish(stopped); await f.scheduler.join();
+	f.advance(); f.scheduler.settled(); await f.fire();
+	f.finish(stopped); await f.scheduler.join();
+	assert.equal(f.launches(), 2);
+	const parkedDigest = f.attempts[0]!.digest;
+	const firstWindow = f.tasks[0]!;
+	const outside = persona.find((entry) => !firstWindow.includes(entry.id))!;
+	outside.text = "Persona convention changed outside the parked window keeps release notes precise.";
+	const trigger = async (): Promise<void> => {
+		const before = f.launches();
+		f.scheduler.memoryAdded("persona"); f.scheduler.tokensUsed(AUTO_INPUT_TOKEN_THRESHOLD); f.advance(); f.scheduler.settled(); await f.fire();
+		if (f.launches() > before) { f.finish('{"operations":[]}'); await f.scheduler.join(); }
+	};
+	for (let round = 0; round < 3; round++) await trigger();
+	assert.ok(f.tasks.some((task) => task.includes(outside.text)), "the changed record outside the parked window reaches a worker");
+	assert.ok(!f.attempts.some((attempt) => attempt.digest === parkedDigest && attempt.state === "settled"), "bypassing never records the parked window as reviewed");
+	assert.ok(!f.tasks.slice(2).includes(firstWindow), "the unchanged parked window is not relaunched");
+	// Rotation wraps back to the parked window; it is bypassed again rather than relaunched.
+	for (let round = 0; round < 3; round++) await trigger();
+	assert.equal(f.tasks.filter((task) => task === firstWindow).length, 2, "the parked window stays suppressed while unchanged");
+	// Cursors are not persisted: a restart rotates from the first window, which receipts still park.
+	const secondWindowEntry = persona.find((entry) => f.tasks[2]!.includes(entry.id) && !firstWindow.includes(entry.id))!;
+	secondWindowEntry.text = "Persona convention changed in the second window keeps release notes precise.";
+	f.scheduler.activate(f.owner);
+	const launchesBeforeRestartTrigger = f.launches();
+	await trigger();
+	assert.equal(f.launches(), launchesBeforeRestartTrigger, "after restart the parked first window is bypassed, not relaunched");
+	await trigger();
+	assert.equal(f.launches(), launchesBeforeRestartTrigger + 1, "after restart rotation moves past the parked window");
+	assert.ok(f.tasks.at(-1)!.includes(secondWindowEntry.text));
+	const parkedEntry = persona.find((entry) => firstWindow.includes(entry.id) && entry.id !== persona[23]!.id)!;
+	parkedEntry.text = "Persona convention changed inside the parked window keeps release notes precise.";
+	f.scheduler.activate(f.owner);
+	await trigger();
+	assert.ok(f.tasks.at(-1)!.includes(parkedEntry.text), "a changed parked window is eligible again");
+});
+
+test("a retry owed to a later window survives a restart that bypasses a parked first window, without being recorded as reviewed", async () => {
+	const stopped: MindWorkerResult = { status: "stopped", ok: false, output: "", error: "Mind worker cancelled" };
+	const persona = Array.from({ length: 24 }, (_, index) => makeMemory({ term: "long", kind: "convention", text: `Persona convention number ${index} keeps release notes precise.`, persona: "dev" }, 1_000_000 + index));
+	const f = fixture({ allowedTargets: ["persona"], entriesByTarget: { persona } });
+	const gatedTrigger = async (): Promise<void> => {
+		f.scheduler.memoryAdded("persona"); f.scheduler.tokensUsed(AUTO_INPUT_TOKEN_THRESHOLD); f.advance(); f.scheduler.settled(); await f.fire();
+	};
+	f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire();
+	f.finish(stopped); await f.scheduler.join();
+	f.advance(); f.scheduler.settled(); await f.fire();
+	f.finish(stopped); await f.scheduler.join();
+	assert.equal(f.launches(), 2, "the first window is parked after two interruptions");
+	await gatedTrigger();
+	assert.equal(f.launches(), 2, "rotation bypasses the parked first window");
+	await gatedTrigger();
+	assert.equal(f.launches(), 3);
+	const laterWindow = f.tasks[2]!;
+	assert.notEqual(laterWindow, f.tasks[0]);
+	f.finish(stopped); await f.scheduler.join();
+	const laterDigest = f.attempts.at(-1)!.digest;
+	f.scheduler.activate(f.owner);
+	assert.match(f.scheduler.status(), /interrupted review pending/, "restore owes the later window one retry");
+	f.advance(); f.scheduler.settled(); await f.fire(); await f.scheduler.join();
+	assert.equal(f.launches(), 3, "rotation restarts at the parked window and bypasses it");
+	assert.ok(!f.attempts.some((attempt) => attempt.digest === laterDigest && attempt.state === "settled"), "bypassing another window never records the interrupted window as reviewed");
+	assert.doesNotMatch(f.scheduler.status(), /without another token wait/, "the owed retry does not sweep rotation on settled events alone");
+	f.scheduler.memoryAdded("persona"); f.advance(); f.scheduler.settled(); await f.fire();
+	assert.equal(f.launches(), 4, "the owed retry is admitted without the token floor when rotation reaches its window");
+	assert.equal(f.tasks[3], laterWindow, "a worker reviews the interrupted window");
+	f.finish('{"operations":[]}'); await f.scheduler.join();
+	assert.ok(f.attempts.some((attempt) => attempt.digest === laterDigest && attempt.state === "settled"), "only the completed review settles it");
+});
+
+test("a retry owed to a later window survives a restart that meets an already reviewed first window, without being recorded as reviewed", async () => {
+	const stopped: MindWorkerResult = { status: "stopped", ok: false, output: "", error: "Mind worker cancelled" };
+	const persona = Array.from({ length: 24 }, (_, index) => makeMemory({ term: "long", kind: "convention", text: `Persona convention number ${index} keeps release notes precise.`, persona: "dev" }, 1_000_000 + index));
+	const f = fixture({ allowedTargets: ["persona"], entriesByTarget: { persona } });
+	f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire();
+	f.finish('{"operations":[]}'); await f.scheduler.join();
+	f.scheduler.memoryAdded("persona"); f.scheduler.tokensUsed(AUTO_INPUT_TOKEN_THRESHOLD); f.advance(); f.scheduler.settled(); await f.fire();
+	assert.equal(f.launches(), 2);
+	const laterWindow = f.tasks[1]!;
+	assert.notEqual(laterWindow, f.tasks[0]);
+	f.finish(stopped); await f.scheduler.join();
+	const laterDigest = f.attempts.at(-1)!.digest;
+	f.scheduler.activate(f.owner);
+	assert.match(f.scheduler.status(), /interrupted review pending/);
+	f.advance(); f.scheduler.settled(); await f.fire(); await f.scheduler.join();
+	assert.equal(f.launches(), 2, "rotation restarts at the reviewed window and skips it");
+	assert.ok(!f.attempts.some((attempt) => attempt.digest === laterDigest && attempt.state === "settled"), "skipping a reviewed window never records the interrupted window as reviewed");
+	f.scheduler.memoryAdded("persona"); f.advance(); f.scheduler.settled(); await f.fire();
+	assert.equal(f.launches(), 3);
+	assert.equal(f.tasks[2], laterWindow, "a worker reviews the interrupted window when rotation reaches it");
+	f.finish('{"operations":[]}'); await f.scheduler.join();
+});
+
+test("turning automatic review off during the retry keeps the spent retry, in memory as after a restart", async () => {
+	const stopped: MindWorkerResult = { status: "stopped", ok: false, output: "", error: "Mind worker cancelled" };
+	const f = fixture({ allowedTargets: ["persona"] });
+	f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire();
+	f.finish(stopped); await f.scheduler.join();
+	f.advance(); f.scheduler.settled(); await f.fire();
+	assert.equal(f.launches(), 2, "token-free retry started");
+	f.scheduler.setEnabled(false); await f.scheduler.join();
+	f.scheduler.setEnabled(true);
+	f.scheduler.memoryAdded("persona"); f.scheduler.tokensUsed(AUTO_INPUT_TOKEN_THRESHOLD); f.advance(); f.scheduler.settled(); await f.fire();
+	assert.equal(f.launches(), 2, "the unchanged input is parked although the retry ended while disabled");
+	assert.deepEqual(f.attempts.map((attempt) => attempt.state), ["started", "started"]);
+	f.scheduler.activate(f.owner);
+	f.scheduler.memoryAdded("persona"); f.scheduler.tokensUsed(AUTO_INPUT_TOKEN_THRESHOLD); f.advance(); f.scheduler.settled(); await f.fire();
+	assert.equal(f.launches(), 2, "a restart derives the same parking");
+});
+
+test("a token-gated relaunch after an interruption while disabled counts toward the same input's retry", async () => {
+	const stopped: MindWorkerResult = { status: "stopped", ok: false, output: "", error: "Mind worker cancelled" };
+	const f = fixture({ allowedTargets: ["persona"] });
+	f.scheduler.memoryAdded("persona"); f.scheduler.settled(); await f.fire();
+	f.scheduler.setEnabled(false); await f.scheduler.join();
+	f.scheduler.setEnabled(true);
+	f.scheduler.memoryAdded("persona"); f.scheduler.tokensUsed(AUTO_INPUT_TOKEN_THRESHOLD); f.advance(); f.scheduler.settled(); await f.fire();
+	assert.equal(f.launches(), 2, "re-enabling grants no token-free retry; the dirty token-gated trigger relaunches");
+	f.finish(stopped); await f.scheduler.join();
+	f.advance(); f.scheduler.settled(); await f.fire();
+	assert.equal(f.launches(), 2, "two interrupted launches of unchanged input park it, as a restart would");
+	assert.equal(f.pending(), 0);
+	assert.deepEqual(f.attempts.map((attempt) => attempt.state), ["started", "started"]);
 });

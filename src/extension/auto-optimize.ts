@@ -8,6 +8,12 @@ export const AUTO_INPUT_TOKEN_THRESHOLD = 1_000_000;
 export const AUTO_COOLDOWN_MS = 5 * 60_000;
 export const AUTO_IDLE_MS = 2_000;
 export const AUTO_ATTEMPT_ENTRY = "pi-persona-mind-auto-attempt";
+/** Shutdown bound for awaiting a Persona worker's completion; local apply/persistence stays joined. */
+export const SHUTDOWN_WORKER_WAIT_MS = 5_000;
+/** Stands in for a worker whose completion shutdown stopped waiting for: an interruption, never completed work. */
+export const WORKER_WAIT_RELEASED: MindWorkerResult = { status: "stopped", ok: false, output: "", error: "Mind stopped waiting for the worker at shutdown" };
+/** Receipts a restart restores per owner; the in-memory mirror keeps the same window. */
+const ATTEMPT_HISTORY = 64;
 type Target = AutoOptimizeTarget;
 type Optimizer = Pick<MemoryOptimizer, "inspect" | "preview" | "apply" | "invalidate">;
 interface CoverageCursor { offset: number; withinPage: number }
@@ -46,16 +52,20 @@ export class AutoOptimizeScheduler {
 	private enabled = true;
 	private pending = new Set<Target>();
 	private retryTargets = new Set<Target>();
-	private retryAttempts = new Map<Target, { digest: string; at: number }>();
+	/** The launch cursor is known only in memory; a restored retry has no verifiable position. */
+	private retryAttempts = new Map<Target, { digest: string; at: number; cursor?: CoverageCursor }>();
 	private cursors = new Map<Target, CoverageCursor>();
 	private inputTokens = 0;
 	private seen = new Set<string>();
+	/** Receipts as a restart would load them: parking is derived from these, never from enabled or retry state. */
+	private attempts: AutoAttempt[] = [];
+	private workerReleases = new Set<() => void>();
 	private lastAttempt = -Infinity;
 	private generation = 0;
 	private disabledGeneration = 0;
 	private timer: (() => void) | undefined;
 	private timerGeneration = 0;
-	private running: { optimizer: Optimizer; cancel?: () => void; retryTarget?: Target; explicit?: boolean } | undefined;
+	private running: { optimizer: Optimizer; cancel?: () => void; retryTarget?: Target; explicit?: boolean; parkOnInterrupt?: string } | undefined;
 	private review: { target: Target; attempt?: { digest: string; at: number }; settled: boolean } | undefined;
 	private work: Promise<void> = Promise.resolve();
 	private last = "waiting for new memory";
@@ -66,29 +76,32 @@ export class AutoOptimizeScheduler {
 	}
 	activate(owner: AutoOptimizeOwner, enabled = this.enabled): void {
 		this.stop(); this.owner = owner; this.enabled = enabled;
+		this.attempts = owner.attempts.slice(-ATTEMPT_HISTORY);
 		this.cursors = new Map(owner.allowedTargets.map((target) => [target, { offset: 0, withinPage: 0 }]));
 		const settledDigests = new Set(owner.attempts.filter((attempt) => attempt.state === "settled").map((attempt) => attempt.digest));
 		this.seen = new Set([...settledDigests].slice(-64));
 		this.lastAttempt = Math.max(-Infinity, ...owner.attempts.filter((a) => a.at <= this.now()).map((a) => a.at));
-		if (this.enabled) {
-			// A later attempt supersedes the interrupted trigger for that tier, even when new
-			// records changed its digest. Never resurrect an older launch after the retry settled.
-			const latestByTarget = new Map<Target, AutoAttempt>();
-			for (const attempt of owner.attempts) if (attempt.target) latestByTarget.set(attempt.target, attempt);
-			for (const attempt of latestByTarget.values()) {
-				if (attempt.state === "started" && !attempt.explicit && !settledDigests.has(attempt.digest) && attempt.target && owner.allowedTargets.includes(attempt.target)) {
-					this.pending.add(attempt.target);
-					this.retryTargets.add(attempt.target);
-					this.retryAttempts.set(attempt.target, { digest: attempt.digest, at: attempt.at });
-				}
-			}
+		// A later attempt supersedes the interrupted trigger for that tier, even when new
+		// records changed its digest. Never resurrect an older launch after the retry settled.
+		const latestByTarget = new Map<Target, AutoAttempt>();
+		for (const attempt of this.attempts) if (attempt.target) latestByTarget.set(attempt.target, attempt);
+		let parked = false;
+		for (const attempt of latestByTarget.values()) {
+			if (attempt.state !== "started" || attempt.explicit || settledDigests.has(attempt.digest) || !attempt.target || !owner.allowedTargets.includes(attempt.target)) continue;
+			// Two consecutive interrupted launches of one input already spent its single retry; a
+			// restore must not grant another background run (e.g. a review that keeps hitting a deadline).
+			if (interruptedTwice(this.attempts, attempt.target, attempt.digest)) { parked = true; continue; }
+			if (!this.enabled) continue;
+			this.pending.add(attempt.target);
+			this.retryTargets.add(attempt.target);
+			this.retryAttempts.set(attempt.target, { digest: attempt.digest, at: attempt.at });
 		}
-		this.last = this.retryTargets.size ? "interrupted review pending" : "waiting for new memory";
+		this.last = this.retryTargets.size ? "interrupted review pending" : parked ? "interrupted review parked until its records change" : "waiting for new memory";
 	}
-	stop(): void { this.review = undefined; this.interrupt(); this.owner = undefined; this.pending.clear(); this.retryTargets.clear(); this.retryAttempts.clear(); this.cursors.clear(); this.inputTokens = 0; this.seen.clear(); this.lastAttempt = -Infinity; }
+	stop(): void { this.review = undefined; this.interrupt(); this.owner = undefined; this.pending.clear(); this.retryTargets.clear(); this.retryAttempts.clear(); this.cursors.clear(); this.inputTokens = 0; this.seen.clear(); this.attempts = []; this.lastAttempt = -Infinity; }
 	interrupt(): void {
 		this.timer?.(); this.timer = undefined; this.timerGeneration++; this.generation++;
-		if (this.enabled && !this.running?.explicit && this.running?.retryTarget) {
+		if (this.enabled && !this.running?.explicit && this.running?.retryTarget && !this.running.parkOnInterrupt) {
 			this.pending.add(this.running.retryTarget);
 			this.retryTargets.add(this.running.retryTarget);
 		}
@@ -193,20 +206,36 @@ export class AutoOptimizeScheduler {
 		});
 		return true;
 	}
-	join(): Promise<void> { return this.work; }
+	/** Joins admitted work; a bound releases only the wait for the remote worker's completion. */
+	join(workerWaitMs?: number): Promise<void> {
+		const work = this.work;
+		if (workerWaitMs === undefined) return work;
+		const cancel = this.schedule(() => { for (const release of this.workerReleases) release(); }, workerWaitMs);
+		return work.finally(cancel);
+	}
 	private safeCurrent(owner: AutoOptimizeOwner): boolean { try { return this.owner === owner && owner.current(); } catch { return false; } }
 	private safeIdle(owner: AutoOptimizeOwner): boolean { try { return owner.idle(); } catch { return false; } }
 	private allows(owner: AutoOptimizeOwner, target: Target): boolean { return owner.allowedTargets.includes(target); }
 	private remember(owner: AutoOptimizeOwner, target: Target, digest: string, state: AutoAttempt["state"], at: number, explicit = false): void {
-		owner.recordAttempt({ digest, target, at, state, ...(explicit ? { explicit: true } : {}) });
+		const attempt: AutoAttempt = { digest, target, at, state, ...(explicit ? { explicit: true } : {}) };
+		owner.recordAttempt(attempt);
+		this.attempts.push(attempt); if (this.attempts.length > ATTEMPT_HISTORY) this.attempts.shift();
 		if (state === "settled") {
 			this.seen.add(digest); while (this.seen.size > 64) this.seen.delete(this.seen.values().next().value!);
 		}
 	}
-	private settleSkippedRetry(owner: AutoOptimizeOwner, target: Target): void {
-		const attempt = this.retryTargets.has(target) ? this.retryAttempts.get(target) : undefined;
-		if (attempt) this.remember(owner, target, attempt.digest, "settled", attempt.at);
+	/**
+	 * A skipped window never settles a pending retry; only a completed review does. The retry is
+	 * dropped without a receipt when its own launch cursor no longer yields its input. Elsewhere
+	 * (rotation moved, or a restore that cannot know the position) it stays owed, not pending:
+	 * the next dirty trigger for the tier may use it, and any launch on the tier consumes it.
+	 */
+	private skipRetryWindow(target: Target, cursor: CoverageCursor): void {
+		const launchedAt = this.retryAttempts.get(target)?.cursor;
+		const ownWindow = launchedAt?.offset === cursor.offset && launchedAt.withinPage === cursor.withinPage;
+		if (this.retryTargets.has(target) && !ownWindow) return;
 		this.retryAttempts.delete(target);
+		this.retryTargets.delete(target);
 	}
 	private async run(explicitTargets?: readonly Target[], explicit = false, qualifyTargets = false): Promise<void> {
 		const owner = this.owner;
@@ -226,6 +255,10 @@ export class AutoOptimizeScheduler {
 			return;
 		}
 		const running: NonNullable<AutoOptimizeScheduler["running"]> = { optimizer, explicit };
+		// Latched, so a second wait in the same run (cancel-then-join) also returns once released.
+		let releaseWorkerWait!: () => void;
+		const workerWaitReleased = new Promise<MindWorkerResult>((resolve) => { releaseWorkerWait = () => resolve(WORKER_WAIT_RELEASED); });
+		this.workerReleases.add(releaseWorkerWait);
 		let attemptRecorded = false;
 		let unsettledTarget: Target | undefined;
 		let nextCursor: CoverageCursor | undefined;
@@ -303,26 +336,32 @@ export class AutoOptimizeScheduler {
 					: { offset: cursor.offset, withinPage: page.nextRotation };
 				const input = page.input;
 				if (!input) {
-					if (!explicit) this.settleSkippedRetry(owner, target);
+					if (explicit) this.retryTargets.delete(target);
+					else this.skipRetryWindow(target, cursor);
 					this.cursors.set(target, nextCursor);
-					this.retryTargets.delete(target);
 					this.last = "no eligible records in this bounded page";
 					if (explicit && !report(target, "Mind optimization result", formatAutoInputSkip(target, inspection, page))) return;
 					continue;
 				}
-				if (!explicit && this.seen.has(input.digest)) {
-					this.settleSkippedRetry(owner, target);
+				if (!explicit && interruptedTwice(this.attempts, target, input.digest)) {
+					// Rotation passes a parked window without a settled receipt or seen entry, so it is
+					// bypassed again whenever the cursor returns while unchanged and is reviewed once it changes.
+					this.skipRetryWindow(target, cursor);
 					this.cursors.set(target, nextCursor);
-					this.retryTargets.delete(target);
+					this.last = "this bounded record set is parked until its records change";
+					continue;
+				}
+				if (!explicit && this.seen.has(input.digest)) {
+					this.skipRetryWindow(target, cursor);
+					this.cursors.set(target, nextCursor);
 					this.last = "this bounded record set was already reviewed";
 					continue;
 				}
 				if (!explicit && !input.entries.some((entry, index) => input.entries.some((other, otherIndex) => otherIndex !== index && other.kind === entry.kind && other.persona === entry.persona))) {
-					this.settleSkippedRetry(owner, target);
+					this.skipRetryWindow(target, cursor);
 					this.seen.add(input.digest);
 					while (this.seen.size > 64) this.seen.delete(this.seen.values().next().value!);
 					this.cursors.set(target, nextCursor);
-					this.retryTargets.delete(target);
 					this.last = "no eligible same-kind pair in this bounded page";
 					continue;
 				}
@@ -352,22 +391,32 @@ export class AutoOptimizeScheduler {
 				try {
 					this.remember(owner, target, input.digest, "started", attemptAt, explicit);
 					if (!explicit) {
-						this.retryAttempts.set(target, { digest: input.digest, at: attemptAt });
+						this.retryAttempts.set(target, { digest: input.digest, at: attemptAt, cursor });
 						attemptRecorded = true;
+						// The receipts already hold this input's earlier interruption, however that
+						// launch ended or was retried: interrupting this one parks it, as after a restart.
+						if (interruptedTwice(this.attempts, target, input.digest)) running.parkOnInterrupt = input.digest;
 					}
 				} catch {
 					try { running.cancel?.(); } catch { /* best-effort stop before apply */ }
 					this.last = "attempt could not be saved; worker cancelled before apply";
 					// Keep the one-worker slot until cancellation has actually joined its worker.
-					try { await worker.completion; } catch { /* failed cancellation is still terminal */ }
+					try { await Promise.race([worker.completion, workerWaitReleased]); } catch { /* failed cancellation is still terminal */ }
 					report(target, explicit ? "Mind optimization result" : "Mind automatic result",
 						`Bounded review stopped: ${this.last}; memory unchanged.\nWorker ${worker.runId} · ${worker.model} · ${worker.thinking}`,
 						"attempt could not be saved; memory unchanged", explicit, true);
 					return;
 				}
-				const result = await worker.completion;
+				const result = await Promise.race([worker.completion, workerWaitReleased]);
 				if (!current()) return;
 				if (workerWasStopped(result)) {
+					if (!explicit && running.parkOnInterrupt) {
+						unsettledTarget = undefined;
+						this.retryAttempts.delete(target);
+						this.last = "review interrupted twice on unchanged records; parked until its records change";
+						report(target, "Mind automatic result", `Bounded review interrupted twice on the same records; memory unchanged. It is not retried until those records change.\nWorker ${worker.runId} · ${worker.model} · ${worker.thinking}`, "interrupted twice; parked until its records change");
+						return;
+					}
 					if (!explicit) {
 						retryRequiresSettled = true;
 						this.pending.add(target);
@@ -450,11 +499,18 @@ export class AutoOptimizeScheduler {
 			if (activeTarget && current()) report(activeTarget, "Mind optimization result", `Bounded review failed unexpectedly; ${this.last}.`, "review failed unexpectedly; inspect current memory before retrying", true);
 		} finally {
 			try { optimizer.invalidate(); } catch { /* Run-local plan cleanup cannot change completed review/apply results. */ }
+			this.workerReleases.delete(releaseWorkerWait);
 			if (this.running === running) this.running = undefined;
-			if (unsettledTarget !== undefined && !current() && mayRetry()) {
-				this.pending.add(unsettledTarget);
-				this.retryTargets.add(unsettledTarget);
-				this.last = "review interrupted; waiting for the next settled event";
+			if (unsettledTarget !== undefined && !current()) {
+				// The receipts already park this input; disabling withdraws retry permission, not that fact.
+				if (running.parkOnInterrupt) {
+					this.retryAttempts.delete(unsettledTarget);
+					if (mayRetry()) this.last = "review interrupted twice on unchanged records; parked until its records change";
+				} else if (mayRetry()) {
+					this.pending.add(unsettledTarget);
+					this.retryTargets.add(unsettledTarget);
+					this.last = "review interrupted; waiting for the next settled event";
+				}
 			}
 			// One actual attempt may leave other dirty tiers pending; they need the input floor
 			// and cooldown. Only the same interrupted tier bypasses the token floor.
@@ -486,6 +542,22 @@ export function formatAutoInputSkip(target: Target, inspection: OptimizeInspecti
 		"input-budget": "full-record input budget too small",
 	};
 	return `Target: ${target} — skipped: ${headlines[page.reason]}; no worker started, no memory changed.\nSelected page offset ${offset}: ${returned} record(s) returned of ${matched} inspection matches; ${eligible} safe/owned eligible record(s); ${total} active record(s) in this target; ${coverage}${morePages}.\nReason: ${reasons[page.reason]}.`;
+}
+
+/**
+ * True when the tier's receipts hold two consecutive automatic started receipts for this input with
+ * no later settlement of it. In-memory scheduling and restart restoration share this one derivation.
+ */
+function interruptedTwice(attempts: readonly AutoAttempt[], target: Target, digest: string): boolean {
+	let run = 0;
+	let parked = false;
+	for (const attempt of attempts) {
+		if (attempt.target !== target) continue;
+		if (attempt.digest === digest && attempt.state === "settled") { run = 0; parked = false; }
+		else if (attempt.digest === digest && attempt.state === "started" && !attempt.explicit) { run++; if (run >= 2) parked = true; }
+		else run = 0;
+	}
+	return parked;
 }
 
 function workerWasStopped(result: MindWorkerResult): boolean {

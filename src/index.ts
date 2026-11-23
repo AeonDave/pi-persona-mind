@@ -39,6 +39,7 @@ import { loadInspectorPage } from "./extension/inspector-data.ts";
 import { openMemoryInspector } from "./ui/memory-inspector.ts";
 import { queryInspectorFrame } from "./ui/inspector-frame.ts";
 import { createKnowledgeReview } from "./extension/knowledge-review.ts";
+import { SHUTDOWN_WORKER_WAIT_MS } from "./extension/auto-optimize.ts";
 import { launchMindWorker } from "./extension/mind-worker.ts";
 import { runMindInspectorActions } from "./extension/mind-actions.ts";
 import { MIND_RESULT_ENTRY_TYPE, registerMindResultRenderer } from "./ui/mind-result-card.ts";
@@ -1257,7 +1258,9 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		wakeGeneration++;
 		clearTimers();
 		releaseWakeOwner();
-		await knowledgeReview.join();
+		// The bound covers only the remote worker wait (load order relative to Persona is not guaranteed);
+		// withDeadline would also cut the admitted apply/persistence join that must finish.
+		await knowledgeReview.join(SHUTDOWN_WORKER_WAIT_MS);
 	});
 
 	registerMindCommands(pi, {

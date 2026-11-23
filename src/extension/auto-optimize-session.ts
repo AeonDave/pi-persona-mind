@@ -3,7 +3,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { MindService } from "../core/service.ts";
 import type { Scope } from "../core/scope.ts";
 import type { AutoOptimizeTarget } from "../core/auto-optimize.ts";
-import { AUTO_ATTEMPT_ENTRY, AutoOptimizeScheduler, type AutoAttempt, type AutoOptimizeReportContext, type ReviewReservation } from "./auto-optimize.ts";
+import { AUTO_ATTEMPT_ENTRY, AutoOptimizeScheduler, SHUTDOWN_WORKER_WAIT_MS, type AutoAttempt, type AutoOptimizeReportContext, type ReviewReservation } from "./auto-optimize.ts";
 import { launchMindWorker } from "./mind-worker.ts";
 import { MIND_RESULT_ENTRY_TYPE } from "../ui/mind-result-card.ts";
 
@@ -131,7 +131,8 @@ export function installAutoOptimize(pi: ExtensionAPI, deps: Dependencies): AutoO
 		if (target) memoryAdded(ctx, target);
 	});
 	pi.on("agent_settled", (event, ctx) => { if (!event.aborted && safeAvailable(ctx)) { activate(ctx); scheduler.settled(); } });
-	pi.on("session_shutdown", async () => { revoke(); await scheduler.join(); });
+	// Bounded because Mind cannot rely on Persona's shutdown handler running first to force-settle the worker.
+	pi.on("session_shutdown", async () => { revoke(); await scheduler.join(SHUTDOWN_WORKER_WAIT_MS); });
 	return { activate, revoke, memoryAdded,
 		status: () => boundContext ? scheduler.status() : "inactive · automatic work requires an interactive Persona session",
 		setEnabled: (enabled) => scheduler.setEnabled(enabled),

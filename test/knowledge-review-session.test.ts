@@ -5,7 +5,8 @@ import { createKnowledgeReview } from "../src/extension/knowledge-review.ts";
 import { makeMemory } from "../src/core/memory.ts";
 import type { MindWorkerResult } from "../src/extension/mind-worker.ts";
 
-function fixture() {
+function fixture(options: { cancelCompletes?: boolean } = {}) {
+	const timers: Array<{ work: () => void; delay: number }> = [];
 	const memory = makeMemory({ term: "long", kind: "note", text: "The project uses Node 18.", tags: ["runtime"], persona: "dev" }, Date.now());
 	let finish!: (result: MindWorkerResult) => void;
 	let current = true, fresh = true, approved = true, reserved = false, failReport = false;
@@ -39,11 +40,12 @@ function fixture() {
 			return { current: () => current && reserved, launched: () => events.push("launched"), settled: () => events.push("settled"), release: () => { reserved = false; events.push("release"); } };
 		},
 		collect: async () => ({ evidence: [{ id: "repo:1", kind: "repository", label: "package.json:1", text: 'engines.node = ">=22"', digest: "a".repeat(64) }], coverage: ["one selected file"], assertFresh: () => { if (!fresh) throw new Error("Evidence changed"); } }),
-		launch: (_ctx, task) => { events.push("launch"); assert.match(task, /Node 18/); return { ok: true, model: "selected/current", thinking: "high", runId: "review-worker", completion: new Promise((resolve) => { finish = resolve; }), cancel: () => { events.push("cancel"); finish({ ok: false, status: "stopped", output: "" }); } }; },
+		launch: (_ctx, task) => { events.push("launch"); assert.match(task, /Node 18/); return { ok: true, model: "selected/current", thinking: "high", runId: "review-worker", completion: new Promise((resolve) => { finish = resolve; }), cancel: () => { events.push("cancel"); if (options.cancelCompletes !== false) finish({ ok: false, status: "stopped", output: "" }); } }; },
 		appendResult: (_ctx, title, body) => { if (failReport && title.endsWith("— applied")) throw new Error("native report append failed"); reports.push(body); },
+		schedule: (work, delay) => { const timer = { work, delay }; timers.push(timer); return () => { const i = timers.indexOf(timer); if (i >= 0) timers.splice(i, 1); }; },
 	});
 	const output = (status: string, fields = {}) => JSON.stringify({ findings: [{ memoryId: memory.id, status, reason: "Selected repository metadata supplies the current runtime requirement.", evidenceIds: ["repo:1"], ...fields }] });
-	return { review, ctx, events, reports, notices, output, finish: (output: string) => finish({ ok: true, status: "done", output }), applies: () => applies,
+	return { review, ctx, events, reports, notices, output, delays: () => timers.map((timer) => timer.delay), fireTimer: () => timers.shift()?.work(), finish: (output: string) => finish({ ok: true, status: "done", output }), applies: () => applies,
 		revoke: () => { current = false; }, mutate: () => { fresh = false; }, approve: (value: boolean) => { approved = value; },
 		gateApproval: (gate: Promise<boolean>, entered?: () => void) => { confirmation = gate; confirmationEntered = entered; },
 		gateApply: (gate: Promise<void>, entered: () => void, fail = false) => { applyGate = gate; applyEntered = entered; applyError = fail; },
@@ -170,4 +172,41 @@ test("a committed correction with failed reporting is not described as an unappl
 	assert.equal(f.applies(), 1);
 	assert.equal(f.review.hasPending(), false);
 	assert.match(f.notices.join("\n"), /Corrections were applied, but reporting failed/);
+});
+
+test("shutdown join stops waiting for an unsettled review worker at its bound and frees the review slot", async () => {
+	const f = fixture({ cancelCompletes: false });
+	await f.review.start(f.ctx, "project-long");
+	f.review.interrupt();
+	let joined = false;
+	const joining = f.review.join(5_000).then(() => { joined = true; });
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(joined, false, "the bound has not elapsed yet");
+	assert.deepEqual(f.delays(), [5_000]);
+	f.fireTimer();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(joined, true, "the bound releases the wait for Persona's completion");
+	await joining;
+	assert.equal(f.events.includes("settled"), false, "an abandoned wait is an interruption, not completed work");
+	assert.equal(f.events.includes("release"), true);
+	assert.equal(f.reports.length, 0);
+	await f.review.start(f.ctx, "project-long");
+	assert.equal(f.events.filter((event) => event === "launch").length, 2, "the next review is not refused as busy");
+});
+
+test("shutdown join keeps waiting for an admitted local apply past the worker bound", async () => {
+	const f = fixture(); await f.review.start(f.ctx, "project-long");
+	f.finish(f.output("correct", { replacement: "The project requires Node 22." })); await f.review.join();
+	let release!: () => void, entered!: () => void;
+	const admitted = new Promise<void>((resolve) => { entered = resolve; });
+	f.gateApply(new Promise((resolve) => { release = resolve; }), entered);
+	const applying = f.review.apply(f.ctx); await admitted;
+	f.review.interrupt();
+	let joined = false;
+	const joining = f.review.join(5_000).then(() => { joined = true; });
+	f.fireTimer();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(joined, false, "local persistence is joined regardless of the worker bound");
+	release(); await applying; await joining;
+	assert.equal(joined, true);
 });
