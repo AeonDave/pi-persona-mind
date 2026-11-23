@@ -17,7 +17,7 @@ patch an installed host.
 Mind requires a loaded compatible pi-persona through its versioned local companion handshake.
 Missing/incompatible presence leaves tools inactive and suppresses capture, storage/import,
 injection and reminders. A settings file or installed npm package is not proof of an active
-companion. Mind 0.9.3 requires Persona 1.18.1 or later for these paired contracts. Its optional npm
+companion. Mind 0.9.4 requires Persona 1.18.1 or later for these paired contracts. Its optional npm
 peer declares that requirement without auto-installing or activating another extension.
 
 The node-only core has no Pi imports. The factory wires native Pi hooks, tools, scope, scheduling

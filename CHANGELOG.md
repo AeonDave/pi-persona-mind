@@ -1,23 +1,28 @@
 # Changelog
 
-## Unreleased
+## [0.9.4](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.9.4) - 2026-11-23
 
 - A memory replacement or consolidation refused before anything was written (a full store, a lock
   timeout, any failure that left the memory unchanged) no longer leaves a permanent `prepared` receipt.
   Thirty-two of them used to block every later replacement and consolidation on that store. Receipts
-  left prepared by earlier versions carry no store fingerprint and still need the history file removed
-  by hand.
+  left prepared by earlier versions carry no store fingerprint and stay protected, so a store already
+  holding 32 of them still refuses replacements until its history file is repaired by hand.
 - Words after a dotted version are searchable again: `node:22.19-alpine` matches `alpine`, `3.12-slim`
   matches `slim`. Numeric versions stay exact (`22.19` still does not match `22.19-alpine`), and a tail
   word is never treated as a negation.
 - Automatic memory review retries an interrupted input once, not on every turn. A second interruption
   parks that window until its records change, and rotation moves past it instead of stopping there.
-  Turning automatic review off and on no longer resets the count. A worker that Persona ends at its
-  180-second deadline is a failure, not an interruption.
+  Turning automatic review off and on no longer resets the count. When a review is parked, the status
+  line says so and a result card reports that it was interrupted twice. A worker that reaches its
+  180-second deadline is a failure and is not retried with pi-persona 1.20.0 or later, which reports it
+  as failed; earlier pi-persona versions report it as a stop, so it is retried once and then parked.
+- A skipped review window no longer marks another window's pending retry as reviewed. An input whose
+  review was interrupted could be recorded as settled when rotation reached a different window, so it
+  was never reviewed. The retry is now kept, or dropped without a receipt when its own records are gone.
 - The 32-handoff limit is per persona. One persona's handoffs no longer stop the others from saving;
   only the 128 KiB file limit is shared, and a save it refuses says how many entries the caller and the
-  other personas hold. Handoff refusals for an unreadable file name the file and no longer mention
-  optimizing.
+  other personas hold. Handoff refusals for an unreadable file say what is wrong with it (unsafe path, size,
+  version, missing with a backup, corrupt or inaccessible), name the file and no longer mention optimizing.
 - `remember` with `supersedes` is no longer blocked by a corrupt memory tier it does not write to, when
   that tier recovers completely from its backup. It still refuses, naming the store, when another tier
   cannot be read completely, because that tier could hide the fact being replaced. A backup that exists

@@ -1,7 +1,7 @@
 <h1 align="center">pi-persona-mind</h1>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v0.9.3/assets/banner.png" alt="pi-persona-mind — durable memory for Pi">
+  <img src="https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v0.9.4/assets/banner.png" alt="pi-persona-mind — durable memory for Pi">
 </p>
 
 [![CI](https://github.com/AeonDave/pi-persona-mind/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/AeonDave/pi-persona-mind/actions/workflows/test.yml)
@@ -28,7 +28,7 @@ knowledge reviews use the current session model and incur model usage.
 
 ## Quick start
 
-Mind 0.9.3 requires **Pi 1.6.0**, **Node.js 22.19.0+**, and
+Mind 0.9.4 requires **Pi 1.6.0**, **Node.js 22.19.0+**, and
 [**pi-persona 1.18.1+**](https://github.com/AeonDave/pi-persona) loaded in the same instance.
 
 ```bash
@@ -156,8 +156,9 @@ In a new session with the same project and persona, use **`/mind handoff list`**
 **`/mind handoff show <id>`** to consult it.
 
 A handoff is an explicit work snapshot, not proof that a task is complete. It is never injected or
-executed automatically. Completion requires a resolution; forgetting is explicit. Up to 32 handoffs
-share a bounded project file, with no automatic expiry or eviction.
+executed automatically. Completion requires a resolution; forgetting is explicit. Each persona can hold
+up to 32 handoffs in a bounded project file (128 KiB for the whole file), with no automatic expiry or
+eviction.
 [Commands, ownership and limits →](docs/DESIGN.md#cross-session-handoffs)
 
 ## Learn more
