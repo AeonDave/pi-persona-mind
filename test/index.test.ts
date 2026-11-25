@@ -189,16 +189,18 @@ after(async () => {
 	await rm(dir, { recursive: true, force: true });
 });
 
-test("the Pi host floor comparison requires stable 1.6.0 or newer releases", () => {
+test("the Pi host floor comparison requires Pi 1.6.1 or later", () => {
 	assert.equal(isSupportedPiVersion("0.99.9"), false);
 	assert.equal(isSupportedPiVersion("1.4.9"), false);
 	assert.equal(isSupportedPiVersion("1.5.1"), false);
 	assert.equal(isSupportedPiVersion("1.5.2"), false);
 	assert.equal(isSupportedPiVersion("1.5.3-alpha.1"), false);
 	assert.equal(isSupportedPiVersion("1.6.0-rc.1"), false);
-	assert.equal(isSupportedPiVersion("1.6.0"), true);
-	assert.equal(isSupportedPiVersion("1.6.0+host.1"), true);
-	assert.equal(isSupportedPiVersion("1.6.1-alpha.1"), true);
+	assert.equal(isSupportedPiVersion("1.6.0"), false);
+	assert.equal(isSupportedPiVersion("1.6.1-alpha.1"), false);
+	assert.equal(isSupportedPiVersion("1.6.1"), true);
+	assert.equal(isSupportedPiVersion("1.6.1+host.1"), true);
+	assert.equal(isSupportedPiVersion("1.6.2-alpha.1"), true);
 	assert.equal(isSupportedPiVersion("2.0.0"), true);
 	assert.equal(isSupportedPiVersion("unknown"), false);
 	assert.equal(isSupportedPiVersion("01.0.0"), false);

@@ -9,7 +9,7 @@ the user workflow is in [README](../README.md). Local design rationale and evalu
 This design contract describes the current development tree; released changes are recorded separately
 in CHANGELOG.md.
 
-Target the latest stable Pi only, currently 1.6.0, and Node >=22.19. All four development Pi packages
+Target the latest stable Pi only, currently 1.6.1, and Node >=22.19. All four development Pi packages
 are pinned together; runtime host/typebox packages remain optional wildcard peers. No second host
 runtime or historical hook-shape adapter is bundled. A development-only security override does not
 patch an installed host.
@@ -554,7 +554,7 @@ language detector, language-specific factor, local tokenizer execution or runtim
 The reference encoding is not the current model's billing counter, and eight curated vectors do not
 establish broad language coverage or justify automatic budget tuning. The runtime budget is unchanged.
 
-Tests isolate PI_PERSONA_* and a throwaway PI_AGENT_DIR, use the actual Pi 1.6.0 SDK/tool pipeline and
+Tests isolate PI_PERSONA_* and a throwaway PI_AGENT_DIR, use the actual Pi 1.6.1 SDK/tool pipeline and
 offline providers, and join session_shutdown before SDK disposal. Native session tests cover persisted
 reopen, branch/fork, in-memory behavior and owner revocation. Store tests cover lost writes, stale plans,
 invalid inputs and concurrent apply. Installed-host/package qualification complements source tests.

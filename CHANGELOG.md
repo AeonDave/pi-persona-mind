@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+- Mind now requires Pi 1.6.1. Its memory, backlog and delegated-worker integration are tested
+  against that host.
+
 ## [0.9.5](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.9.5) - 2026-11-25
 
 - Saved Persona workers rank lean memory by the launch task and show relative ages as of the

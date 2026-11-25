@@ -7,6 +7,7 @@ import {
   createAgentSession, createEventBus, DefaultResourceLoader, ModelRuntime,
   SessionManager, SettingsManager, VERSION, type AgentSession, type ExtensionFactory, type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
+import { MIN_PI_VERSION } from "../../src/core/host-compat.ts";
 
 /** Protocol fixture only. The installed-host qualifier loads the actual companion separately. */
 const companionFixture: ExtensionFactory = (pi) => {
@@ -26,7 +27,7 @@ const companionFixture: ExtensionFactory = (pi) => {
 };
 
 export async function runtimeHarness(root: string, extensionPath: string | ExtensionFactory, factories: ExtensionFactory[] = [], options: { companion?: boolean; additionalExtensionPaths?: string[] } = {}) {
-  assert.equal(VERSION, "1.6.0", "run against the supported current host");
+  assert.equal(VERSION, MIN_PI_VERSION, "run against the supported current host");
   const cwd = join(root, "workspace");
   const agentDir = join(root, "agent");
   await mkdir(cwd, { recursive: true });

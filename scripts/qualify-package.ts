@@ -1,9 +1,10 @@
-/** Load an extracted extension through the current Pi 1.6.0 SDK. */
+/** Load an extracted extension through the current Pi SDK. */
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { VERSION } from "@earendil-works/pi-coding-agent";
 import { runtimeHarness } from "../test/setup/pi-runtime.ts";
 // @ts-expect-error The shared qualification runner is a standalone Node script.
 import { qualifyMemory } from "./qualify-memory.mjs";
@@ -35,7 +36,7 @@ try {
   assert.equal(h.faux.state.callCount, 4, "the reminder itself adds no model call");
   await qualifyMemory(h.session);
   assert.equal(h.faux.state.callCount, 4, "explicit local memory operations add no model call");
-  console.log("PASS: extracted Mind package loaded in Pi 1.6.0; session notes, full read, staged optimization, stale-plan refusal and one display-only wake qualified.");
+  console.log(`PASS: extracted Mind package loaded in Pi ${VERSION}; session notes, full read, staged optimization, stale-plan refusal and one display-only wake qualified.`);
 } finally {
   try { await h?.dispose(); }
   finally { await rm(root, { recursive: true, force: true }); }

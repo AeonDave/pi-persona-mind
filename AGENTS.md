@@ -9,7 +9,7 @@ coupled through a versioned local companion handshake to
 - Typecheck: `npm run typecheck` (`tsc --noEmit`, strict + `exactOptionalPropertyTypes`)
 - Tests: `npm test` · both: `npm run verify`
 - Hermetic choke point: `node --import tsx --import ./test/setup/hermetic-env.ts --test test/*.test.ts`
-- Installed Pi 1.6.0 qualification: `node --import tsx scripts/qualify-host.mjs <absolute-pi-package-root> <absolute-pi-persona-extension-path> [<absolute-packed-mind-extension-path>]`
+- Installed Pi 1.6.1 qualification: `node --import tsx scripts/qualify-host.mjs <absolute-pi-package-root> <absolute-pi-persona-extension-path> [<absolute-packed-mind-extension-path>]`
   (isolated profile, offline synthetic provider; no cloud authentication/model-quality claim).
 
 ## Conventions
@@ -17,7 +17,7 @@ coupled through a versioned local companion handshake to
 - User-requested commits use **AeonDave** as both author and committer, retaining the user's configured
   email. Never add `Co-authored-by` or assistant/bot attribution; do not push unless explicitly requested.
 - Erasable-syntax-only TS. `src/core/*` is pure (no Pi imports) and unit-tested.
-- Target the latest stable Pi only (currently 1.6.0), Node 22.19.0+. Keep host packages and
+- Target the latest stable Pi only (currently 1.6.1), Node 22.19.0+. Keep host packages and
   typebox as optional peers on `*`, with all four Pi development packages pinned together.
   No historical-host branches; never bundle a second host runtime. Scope development security
   overrides to their affected parent/version and remove them when that graph no longer needs them.

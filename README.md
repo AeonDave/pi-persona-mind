@@ -28,7 +28,7 @@ knowledge reviews use the current session model and incur model usage.
 
 ## Quick start
 
-Mind 0.9.5 requires **Pi 1.6.0**, **Node.js 22.19.0+**, and
+Mind 0.9.5 requires **Pi 1.6.1**, **Node.js 22.19.0+**, and
 [**pi-persona 1.18.1+**](https://github.com/AeonDave/pi-persona) loaded in the same instance.
 
 ```bash

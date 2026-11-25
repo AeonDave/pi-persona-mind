@@ -6,10 +6,14 @@ function json(relative: string) {
 	return JSON.parse(readFileSync(new URL(relative, import.meta.url), "utf8"));
 }
 
-test("the manifest qualifies Pi 1.6.0 without bundling the host or TypeBox", () => {
+test("the manifest pins the Pi SDK without bundling the host or TypeBox", () => {
 	const manifest = json("../package.json");
-  const lock = json("../package-lock.json");
-  for (const host of ["pi-ai", "pi-agent-core", "pi-coding-agent", "pi-tui"]) assert.equal(manifest.devDependencies[`@earendil-works/${host}`], "1.6.0");
+	const lock = json("../package-lock.json");
+	for (const host of ["pi-ai", "pi-agent-core", "pi-coding-agent", "pi-tui"]) {
+		const name = `@earendil-works/${host}`;
+		assert.equal(lock.packages[""].devDependencies[name], manifest.devDependencies[name]);
+		assert.equal(lock.packages[`node_modules/${name}`].version, manifest.devDependencies[name]);
+	}
 	assert.equal(manifest.engines.node, ">=22.19.0");
 	assert.equal(lock.version, manifest.version);
 	assert.equal(lock.packages[""].version, manifest.version);
@@ -19,9 +23,6 @@ test("the manifest qualifies Pi 1.6.0 without bundling the host or TypeBox", () 
 		assert.equal(manifest.dependencies?.[name], undefined);
 		assert.equal(lock.packages[""]?.peerDependencies[name], manifest.peerDependencies[name]);
 		assert.equal(lock.packages[""]?.peerDependenciesMeta[name]?.optional, true);
-	}
-	for (const name of ["@earendil-works/pi-coding-agent", "@earendil-works/pi-tui"]) {
-		assert.equal(manifest.devDependencies[name], "1.6.0");
 	}
 	assert.deepEqual(manifest.pi.extensions, ["./src/index.ts"]);
 	assert.ok(manifest.files.includes("src"));
