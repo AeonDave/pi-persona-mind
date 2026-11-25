@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.5](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.9.5) - 2026-11-25
+
+- Saved Persona workers rank lean memory by the launch task and show relative ages as of the
+  launch turn. They still load current durable memory for Persona to check against the saved
+  worker contract.
+
 ## [0.9.4](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.9.4) - 2026-11-23
 
 - A memory replacement or consolidation refused before anything was written (a full store, a lock

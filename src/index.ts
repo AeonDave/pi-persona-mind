@@ -46,6 +46,7 @@ import { MIND_RESULT_ENTRY_TYPE, registerMindResultRenderer } from "./ui/mind-re
 import { parsePersonaMemoryOwner, PERSONA_MEMORY_OWNER_CHANGED, personaGuardedTools, queryPersonaDependency, queryPersonaMemoryOwner } from "./extension/persona-dependency.ts";
 import { createMindActivityRunner } from "./extension/activity.ts";
 import { installAutoOptimize } from "./extension/auto-optimize-session.ts";
+import { workerMemoryAnchor } from "./extension/worker-memory-anchor.ts";
 
 const STATUS_KEY = "pi-persona-mind";
 /** Display-only transcript card for a due backlog wake. Never sent to the model; never starts a turn. */
@@ -1096,7 +1097,14 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		const sessionBlock = isDelegatedLeg ? "" : sessionMemory.injection(ctx, { query, maxTokens: 600 });
 		try {
 			// A worker inherits the LEAN mind (north-star + identity only); the supervisor gets it all.
-			block = await withDeadline(getMind(ctx).buildInjection({ lean: isDelegatedLeg, cleanup: !backgroundMigrationPending, query, fixedBlocks: [sessionBlock, cueHint].filter(Boolean).map((text) => `${text}\n\n`) }), INJECT_DEADLINE_MS, "", () => {
+			const memoryAnchor = isDelegatedLeg ? workerMemoryAnchor(ctx.sessionManager) : undefined;
+			block = await withDeadline(getMind(ctx).buildInjection({
+				lean: isDelegatedLeg,
+				cleanup: !backgroundMigrationPending,
+				query: memoryAnchor?.query ?? query,
+				fixedBlocks: [sessionBlock, cueHint].filter(Boolean).map((text) => `${text}\n\n`),
+				...(memoryAnchor ? { leanReferenceTime: memoryAnchor.timestamp } : {}),
+			}), INJECT_DEADLINE_MS, "", () => {
 				if (ownerCurrent()) surfaceWarning(ctx, `memory injection exceeded ${INJECT_DEADLINE_MS}ms and was skipped for this turn`);
 			});
 		} catch (err) {

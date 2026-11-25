@@ -13,10 +13,12 @@ test("the manifest qualifies Pi 1.6.0 without bundling the host or TypeBox", () 
 	assert.equal(manifest.engines.node, ">=22.19.0");
 	assert.equal(lock.version, manifest.version);
 	assert.equal(lock.packages[""].version, manifest.version);
-	for (const name of ["@earendil-works/pi-coding-agent", "@earendil-works/pi-tui", "typebox"]) {
+	for (const name of ["@earendil-works/pi-ai", "@earendil-works/pi-coding-agent", "@earendil-works/pi-tui", "typebox"]) {
 		assert.equal(manifest.peerDependencies[name], "*", `${name} is supplied by Pi`);
 		assert.equal(manifest.peerDependenciesMeta[name].optional, true);
 		assert.equal(manifest.dependencies?.[name], undefined);
+		assert.equal(lock.packages[""]?.peerDependencies[name], manifest.peerDependencies[name]);
+		assert.equal(lock.packages[""]?.peerDependenciesMeta[name]?.optional, true);
 	}
 	for (const name of ["@earendil-works/pi-coding-agent", "@earendil-works/pi-tui"]) {
 		assert.equal(manifest.devDependencies[name], "1.6.0");

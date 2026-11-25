@@ -17,7 +17,7 @@ patch an installed host.
 Mind requires a loaded compatible pi-persona through its versioned local companion handshake.
 Missing/incompatible presence leaves tools inactive and suppresses capture, storage/import,
 injection and reminders. A settings file or installed npm package is not proof of an active
-companion. Mind 0.9.4 requires Persona 1.18.1 or later for these paired contracts. Its optional npm
+companion. Mind 0.9.5 requires Persona 1.18.1 or later for these paired contracts. Its optional npm
 peer declares that requirement without auto-installing or activating another extension.
 
 The node-only core has no Pi imports. The factory wires native Pi hooks, tools, scope, scheduling
@@ -97,6 +97,10 @@ PI_PERSONA_DISABLE alone does not designate a worker. Workers get lean objective
 no project/session notes, no memory/backlog tools and no reminders. Both Persona engines freeze the
 launching persona. In-process workers receive it through their own extension bus; child processes
 receive a scrubbed spawn-local payload. A later parent selection cannot move a worker's memory scope.
+For a persisted worker with one valid Persona v1 contract on the active branch, lean memory ranking
+uses the first user turn after that contract. Labels such as `today` and `1d` in the worker's lean
+memory refer to that launch turn's timestamp. Mind reads current durable memory for each turn, and
+Persona checks the resulting prompt against the saved contract.
 
 Intercom/Exocom and worker output stay foreign reference material, not automatic capture requests.
 Only the reserved pi-persona-deferred-input custom type replays direct user input. This is a

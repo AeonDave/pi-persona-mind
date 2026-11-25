@@ -1611,6 +1611,68 @@ test("a delegated worker leg (PI_PERSONA_CHILD) withholds tools + wakes and inje
 	assert.equal(wakeTexts(leg).length, 0, "a leg fires no backlog wakes");
 });
 
+test("a saved v1 worker keeps its launch query and relative dates for live lean memory", async (t) => {
+	const launchedAt = Date.UTC(2026, 10, 24, 12);
+	t.mock.timers.enable({ apis: ["Date"], now: launchedAt });
+	const cwd = join(dir, "worker-continuation", "project");
+	const agentDir = join(dir, "worker-continuation", "agent");
+	const supervisor = mockPi();
+	const supervisorCtx = ctxFor(cwd);
+	createExtension(supervisor.pi, { agentDir });
+	await supervisor.handlers.get("session_start")?.({}, supervisorCtx);
+	t.after(async () => { await supervisor.handlers.get("session_shutdown")?.({}, supervisorCtx); });
+	const remember = async (text: string) => {
+		const saved = await supervisor.tools.get("memory")!.execute("save", { action: "remember", term: "long", scope: "persona", kind: "convention", text }, undefined, undefined, supervisorCtx);
+		assert.equal(saved.details.ok, true);
+	};
+	await remember("Palette paintings use a limited gallery selection.");
+	await remember("Astronomy meteor observations retain timestamp metadata.");
+
+	const manager = SessionManager.create(cwd, join(agentDir, "sessions"));
+	const worker = mockPi({}, () => manager);
+	const ctx = { ...ctxFor(cwd), sessionManager: manager };
+	const previousLeg = process.env.PI_PERSONA_LEG;
+	process.env.PI_PERSONA_LEG = "1";
+	try { createExtension(worker.pi, { agentDir }); }
+	finally {
+		if (previousLeg === undefined) delete process.env.PI_PERSONA_LEG;
+		else process.env.PI_PERSONA_LEG = previousLeg;
+	}
+	t.after(async () => { await worker.handlers.get("session_shutdown")?.({}, ctx); });
+	const prepare = async (prompt: string) => {
+		const result = await worker.handlers.get("before_agent_start")?.({ messageType: "user", systemPrompt: "BASE", prompt }, ctx) as { systemPrompt?: string };
+		assert.ok(result.systemPrompt);
+		return result.systemPrompt;
+	};
+	const launch = "Task: Review palette paintings gallery choices.";
+	const followup = "Task: Review astronomy meteor observations.";
+	const initial = await prepare(launch);
+	assert.match(initial, /Palette paintings[^\n]+\(today\)[\s\S]+Astronomy meteor/);
+	assert.match(await prepare(followup), /Astronomy meteor[\s\S]+Palette paintings/, "ordinary workers still rank by the current task");
+
+	const beforeContract = manager.appendMessage({ role: "user", content: [{ type: "text", text: followup }], timestamp: launchedAt });
+	manager.appendCustomEntry("pi-persona-worker-contract", { version: 1, sha256: "a".repeat(64) });
+	manager.appendMessage({ role: "user", content: [{ type: "text", text: launch }], timestamp: launchedAt });
+	t.mock.timers.setTime(launchedAt + 86_400_000);
+	const supervisorPrompt = await supervisor.handlers.get("before_agent_start")?.({ messageType: "user", systemPrompt: "BASE", prompt: launch }, supervisorCtx) as { systemPrompt?: string };
+	assert.match(supervisorPrompt.systemPrompt ?? "", /Palette paintings[^\n]+\(1d\)/, "supervisor memory uses the current clock");
+	assert.equal(await prepare(launch), initial, "yesterday's launch dates survive a follow-up with identical task and memory");
+	assert.equal(await prepare(followup), initial, "a v1 continuation ranks against its original task on the current branch");
+	await remember("Always archive the selection criteria for review.");
+	assert.match(await prepare(followup), /Always archive the selection criteria/, "a saved worker reloads current memory instead of replaying an old snapshot");
+
+	manager.appendCustomEntry("pi-persona-worker-contract", { version: 1, sha256: "b".repeat(64) });
+	assert.match(await prepare(followup), /Astronomy meteor[\s\S]+Palette paintings/, "ambiguous contracts leave ordinary worker ranking in effect");
+	manager.branch(beforeContract);
+	manager.appendCustomEntry("pi-persona-worker-contract", { version: 1, sha256: "invalid" });
+	manager.appendMessage({ role: "user", content: [{ type: "text", text: launch }], timestamp: launchedAt });
+	assert.match(await prepare(followup), /Astronomy meteor[\s\S]+Palette paintings/, "a malformed marker cannot claim the task from another branch");
+	manager.branch(beforeContract);
+	manager.appendCustomEntry("pi-persona-worker-contract", { version: 1, sha256: "c".repeat(64) });
+	manager.appendMessage({ role: "user", content: [{ type: "text", text: launch }], timestamp: Date.now() + 1 });
+	assert.match(await prepare(followup), /Astronomy meteor[^\n]+\(1d\)[\s\S]+Palette paintings/, "a future timestamp cannot anchor a worker prompt");
+});
+
 test("PI_PERSONA_LEG marks a delegated leg — the mind withholds its write tools", () => {
 	const prev = process.env.PI_PERSONA_LEG;
 	process.env.PI_PERSONA_LEG = "1";

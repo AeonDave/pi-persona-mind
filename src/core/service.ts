@@ -691,7 +691,7 @@ export class MindService {
 	 * persona, so it inherits who the persona IS but not the supervisor's project state or deferred
 	 * intent. (The caller also withholds the write tools + wakes from a leg — see index.ts.)
 	 */
-	async buildInjection(opts: { lean?: boolean; query?: string; fixedBlocks?: readonly string[]; cleanup?: boolean } = {}): Promise<string> {
+	async buildInjection(opts: { lean?: boolean; query?: string; fixedBlocks?: readonly string[]; cleanup?: boolean; leanReferenceTime?: number } = {}): Promise<string> {
 		// Workers inherit a read-only lean block; they must not mutate the supervisor's stores.
 		// A background import may own the profile lock while awaiting another store writer. Reads
 		// already filter expiry; defer disk hygiene until a later turn rather than joining that import.
@@ -701,7 +701,7 @@ export class MindService {
 		if (opts.lean || this.scope.homeWorkspace) {
 			const ltm = this.safeMemories(await this.longMemories(), "long-term");
 			if (opts.lean) {
-				return renderMind({ persona: this.scope.persona, ltm, stm: [], backlog: [], now, lean: true, ...context, ...(this.budget ? { budget: this.budget } : {}) });
+				return renderMind({ persona: this.scope.persona, ltm, stm: [], backlog: [], now: opts.leanReferenceTime ?? now, lean: true, ...context, ...(this.budget ? { budget: this.budget } : {}) });
 			}
 			return renderMind({ persona: this.scope.persona, ltm, stm: [], backlog: [], now, ...context, ...(this.budget ? { budget: this.budget } : {}) });
 		}
