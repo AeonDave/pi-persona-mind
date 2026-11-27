@@ -52,6 +52,11 @@ const agentDir = join(tempRoot, "agent");
 const personaDir = join(agentDir, "persona", "agents");
 const projectDir = join(workspace, ".pi");
 const projectAgentsDir = join(projectDir, "agents");
+const workerSkillName = "mind-qualification";
+const workerSkillBody = "Use the indigo gauge when reviewing a qualification fixture.";
+const workerSkillDir = join(agentDir, "skills", workerSkillName);
+const workerSkillPath = join(workerSkillDir, "SKILL.md");
+const workerSkill = `---\nname: ${workerSkillName}\ndescription: Offline qualification fixture skill\n---\n\n${workerSkillBody}\n`;
 const extensionPaths = [mindEntry, ...(parentEntry ? [parentEntry] : [])];
 const hostProbeEntry = join(tempRoot, "pi-host-identity-probe.ts");
 const loaderExtensionPaths = [...extensionPaths, hostProbeEntry];
@@ -129,6 +134,8 @@ async function scaffold() {
 	await mkdir(workspace, { recursive: true });
 	await mkdir(personaDir, { recursive: true });
 	await mkdir(projectAgentsDir, { recursive: true });
+	await mkdir(workerSkillDir, { recursive: true });
+	await writeFile(workerSkillPath, workerSkill, "utf8");
 	for (const persona of ["alpha", "beta", "magi"]) {
 		const extra = persona === "magi"
 			? "council:\n  strategy: magi\n  roster: magi\n  params:\n    reflect: false\n"
@@ -292,8 +299,8 @@ try {
 	await session.agent.waitForIdle();
 	assert.match(observed.at(-1)?.text ?? "", /copper lantern/, "Trusted deferred input was not captured and reinjected");
 
-	const toolContext = session.extensionRunner.createToolContext("mind-host-qualification", undefined);
 	const runTool = async (name, args) => {
+		const toolContext = session.extensionRunner.createToolContext("mind-host-qualification", undefined);
 		const outcome = await toolContext.executeTool(name, args);
 		assert.equal(outcome.isError, false, `${name} fixture failed: ${textOf(outcome.result?.content)}`);
 		return outcome;
@@ -394,40 +401,82 @@ try {
 		assert.deepEqual(headlessLoader.getExtensions().errors, []);
 		const headless = await host.createAgentSession({ cwd: workspace, agentDir, resourceLoader: headlessLoader,
 			settingsManager, modelRuntime: runtime, model: runtime.getModel(providerId, modelId),
-			sessionManager: host.SessionManager.inMemory(workspace) });
+			sessionManager: host.SessionManager.create(workspace, join(tempRoot, "sessions")) });
 		session = headless.session;
 		await session.bindExtensions({ mode: "print" });
 		await session.prompt("/persona alpha");
 		session.setActiveToolsByName(activeTools);
-		const workerContext = [];
-		const beforeDelegation = fauxModel.state.callCount;
-		fauxModel.setResponses([
-			faux.fauxAssistantMessage(faux.fauxToolCall("delegate", {
-				tasks: [{ agent: "mind-worker", task: "Return one concise observation from the local fixture.", thinking: "low" }],
-			}, { id: "mind-host-qualification-delegate" }), { stopReason: "toolUse" }),
-			(context) => {
-				const snapshot = { text: contextText(context), tools: systemToolNames(context) };
-				if (snapshot.text.includes("<persona-mind")) workerContext.push(snapshot);
-				return faux.fauxAssistantMessage("The worker tried no unavailable tools and returned one observation.");
-			},
-			faux.fauxAssistantMessage("Delegated worker qualification completed."),
-		]);
-		await session.prompt("Delegate the fixture observation to mind-worker.", { source: "interactive" });
-		assert.equal(workerContext.length, 1, "The actual in-process worker did not load Mind and emit its native provider context");
-		const worker = workerContext[0];
-		mustContain(worker.text, "<persona-mind", "worker native prompt");
-		mustContain(worker.text, "Alpha-private convention", "worker native prompt");
-		mustContain(worker.text, "Shared convention: the stable local fixture", "worker native prompt");
-		mustOmit(worker.text, "Alpha STM marker", "worker lean prompt");
-		mustOmit(worker.text, "Alpha backlog marker", "worker lean prompt");
-		assert.ok(!worker.tools.includes("memory") && !worker.tools.includes("backlog"), "Delegated worker received Mind write tools");
-		assert.ok(worker.tools.includes("read"), "Positive control: delegated agent's default read tool was not present in native host context");
-		assert.equal(fauxModel.state.callCount, beforeDelegation + 3, "Expected supervisor, worker, and final supervisor faux requests only");
-		const delegateResult = session.sessionManager.getBranch()
-			.map((entry) => entry.type === "message" ? entry.message : undefined)
-			.find((message) => message?.role === "toolResult" && message.toolName === "delegate");
-		assert.ok(delegateResult, "The supervisor transcript did not contain the delegated worker result");
-		assert.equal(delegateResult.isError, false, textOf(delegateResult.content));
+		const sessionFact = "The headless supervisor alone sees the sandstone badge.";
+		fauxModel.setResponses([faux.fauxAssistantMessage("Recorded the session note.")]);
+		await session.prompt(`Remember that ${sessionFact}`, { source: "interactive" });
+		const delegateTurn = async (label, args, workerReply) => {
+			const toolCallId = `mind-host-delegate-${label}`;
+			const before = fauxModel.state.callCount;
+			let supervisorContext;
+			let workerContext;
+			fauxModel.setResponses([
+				(context) => {
+					supervisorContext = contextText(context);
+					return faux.fauxAssistantMessage(faux.fauxToolCall("delegate", args, { id: toolCallId }), { stopReason: "toolUse" });
+				},
+				...(workerReply ? [(context) => {
+					workerContext = context;
+					return faux.fauxAssistantMessage(workerReply);
+				}] : []),
+				faux.fauxAssistantMessage("Acknowledged."),
+			]);
+			await session.prompt(`Run the ${label} fixture check.`, { source: "interactive" });
+			const result = session.sessionManager.getBranch()
+				.map((entry) => entry.type === "message" ? entry.message : undefined)
+				.find((message) => message?.role === "toolResult" && message.toolCallId === toolCallId);
+			assert.ok(result, `Missing native delegate result for ${label}`);
+			const output = textOf(result.content);
+			assert.equal(result.isError, !workerReply, `${label} delegate result: ${output}`);
+			assert.equal(fauxModel.state.callCount, before + (workerReply ? 3 : 2), `${label} provider request count`);
+			return { result, output, supervisorContext, workerContext };
+		};
+		const assertWorkerPrompt = (context, label) => {
+			assert.ok(context, `Missing native worker provider context for ${label}`);
+			const text = contextText(context);
+			const skillSection = systems(context).map((message) => message.sections?.skills ?? "").join("\n");
+			mustContain(skillSection, workerSkillBody, `${label} native skill section`);
+			assert.equal(text.split(workerSkillBody).length - 1, 1, `${label} selected skill body count`);
+			for (const expected of ["<persona-mind", alphaPrivate, sharedLtm]) mustContain(text, expected, `${label} lean prompt`);
+			for (const omitted of [shortTerm, backlogText, sessionFact]) mustOmit(text, omitted, `${label} lean prompt`);
+			assert.deepEqual(systemToolNames(context), ["read"], `${label} worker tool grant`);
+		};
+		const firstTask = "Report how the Alpha-private convention applies to these fixture notes.";
+		const firstReply = "The first worker observation is verified.";
+		const first = await delegateTurn("initial", {
+			agent: "mind-worker", task: firstTask, skills: [workerSkillName], tools: ["read"], thinking: "low",
+		}, firstReply);
+		mustContain(first.supervisorContext, sessionFact, "headless supervisor session notes");
+		assertWorkerPrompt(first.workerContext, "initial");
+		mustContain(first.output, firstReply, "initial delegate result");
+		const initialRunId = first.result.details?.settledRuns?.[0]?.id;
+		assert.ok(initialRunId, "Initial delegate result did not identify its saved worker");
+
+		await writeFile(workerSkillPath, workerSkill.replace(workerSkillBody, "Use the scarlet gauge when reviewing a qualification fixture."), "utf8");
+		const changedSkill = await delegateTurn("changed-skill", { resume: initialRunId, task: "Check the updated fixture instructions." });
+		assert.match(changedSkill.output, /worker session contract changed/i);
+		await writeFile(workerSkillPath, workerSkill, "utf8");
+
+		const resumedTask = "Check the shared convention about the stable local fixture.";
+		const resumedReply = "The follow-up worker observation is verified.";
+		const resumed = await delegateTurn("resumed", { resume: initialRunId, task: resumedTask }, resumedReply);
+		assertWorkerPrompt(resumed.workerContext, "resumed");
+		mustContain(resumed.output, resumedReply, "resumed delegate result");
+		const workerHistory = resumed.workerContext.messages.filter((message) => message.role !== "system");
+		for (const expected of [firstTask, firstReply, resumedTask]) mustContain(JSON.stringify(workerHistory), expected, "resumed worker conversation");
+		const resumedRunId = resumed.result.details?.settledRuns?.[0]?.id;
+		assert.ok(resumedRunId && resumedRunId !== initialRunId, "The follow-up did not settle as a new worker run");
+
+		const changedObjective = "Review the copper gauge before closing qualification.";
+		const savedObjective = await runTool("memory", { action: "remember", term: "long", scope: "persona", kind: "objective", text: changedObjective });
+		assert.equal(savedObjective.result?.details?.ok, true, "The updated objective must be stored before the resume attempt");
+		const changedMemory = await delegateTurn("changed-memory", { resume: resumedRunId, task: "Confirm the status of the original fixture." });
+		mustContain(changedMemory.supervisorContext, changedObjective, "supervisor prompt after objective update");
+		assert.match(changedMemory.output, /worker session contract changed/i);
 	}
 
 	assert.equal(fetchRequests, 0, "Outbound fetch tripwire fired");
@@ -450,6 +499,9 @@ try {
 			alphaBetaIsolationAndSharedLtm: true,
 			liveOwnerWithPersistenceOff: true,
 			delegatedLeanMind: true,
+			delegatedSelectedSkillBody: true,
+			delegatedSavedWorkerContinuation: true,
+			changedSkillAndMemoryRefusedBeforeWorkerRequest: true,
 			workerMindWriteTools: false,
 		} : {}),
 	};

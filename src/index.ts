@@ -1121,8 +1121,18 @@ export function createExtension(pi: ExtensionAPI, opts: ExtensionOptions = {}): 
 		}
 		const injected = [block, sessionBlock, cueHint].filter(Boolean).join("\n\n");
 		if (!isDelegatedLeg) inspector.recordContext(ctx, injected, inspectorCurrent);
-		if (injected) return { systemPrompt: `${event.systemPrompt}\n\n${injected}` };
-		return;
+		if (!injected) return;
+		// Full supervisor memory stays request-local. A prior opaque worker prompt also owns
+		// the whole request; keep it opaque so Persona can enforce its selected-skills guard.
+		if (!isDelegatedLeg || event.systemPromptOptions.forceSystemPrompt !== undefined) {
+			return { systemPrompt: `${event.systemPrompt}\n\n${injected}` };
+		}
+		// Pi gives a nonempty sections.addendum precedence over appendSystemPrompt. Preserve that
+		// effective content in the field Persona fingerprints, leaving the skills section live.
+		const options = event.systemPromptOptions;
+		const prior = options.sections.addendum || options.appendSystemPrompt;
+		options.appendSystemPrompt = prior ? `${prior}\n\n${injected}` : injected;
+		if (options.sections.addendum) options.sections.addendum = options.appendSystemPrompt;
 	});
 
 	// The SYNC delegation path: a `delegate`/`council` tool_result whose report carries a BLOCKED/UNKNOWN

@@ -7,6 +7,7 @@ import { performance } from "node:perf_hooks";
 import { after, before, test } from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { frame } from "./fixtures/inspector-frame.ts";
+import { preparePrompt } from "./fixtures/prepare-prompt.ts";
 
 import { createExtension, isSupportedPiVersion, ownerIsStale } from "../src/index.ts";
 import { makeBacklog } from "../src/core/backlog.ts";
@@ -142,7 +143,12 @@ function mockPi(flags: Readonly<Record<string, boolean | string | undefined>> = 
 		},
 		events,
 	};
-	return { pi: pi as never, tools, commands, shortcuts, handlers, messages, messageOptions, entries, entryRenderers, events, installPersona, unloadPersona, activeTools: () => activeToolNames.slice(),
+	const beforeStart = preparePrompt.bind(null, (event, ctx) => {
+		const handler = handlers.get("before_agent_start");
+		assert.ok(handler);
+		return handler(event, ctx);
+	});
+	return { pi: pi as never, beforeStart, tools, commands, shortcuts, handlers, messages, messageOptions, entries, entryRenderers, events, installPersona, unloadPersona, activeTools: () => activeToolNames.slice(),
 		setPersona: (persona: string | null, sessionId?: string) => { const next = { persona, ready: true }; if (sessionId) fixtureOwners.set(sessionId, next); else defaultOwner = next; },
 		setOwnerReady: (ready: boolean) => { defaultOwner = { ...defaultOwner, ready }; },
 		setOwnerProtocol: (enabled: boolean) => { ownerProtocol = enabled; },
@@ -218,8 +224,8 @@ test("session memory tools follow activation, shutdown, native branch, and new-s
 	const saved = await memory.execute("save", { action: "remember", term: "session", kind: "note", text: "current branch checkpoint" }, undefined, undefined, ctx);
 	assert.equal(saved.details.ok, true);
 	assert.match(String(saved.details.id), /^session:/);
-	const injected = await m.handlers.get("before_agent_start")?.({ messageType: "user", systemPrompt: "BASE", prompt: "continue" }, ctx) as { systemPrompt?: string };
-	assert.match(injected.systemPrompt ?? "", /current branch checkpoint/);
+	const injected = await m.beforeStart("continue", ctx);
+	assert.match(injected.systemPrompt, /current branch checkpoint/);
 	await m.handlers.get("session_shutdown")?.({}, ctx);
 	const denied = await memory.execute("late", { action: "remember", term: "session", kind: "note", text: "late stale note" }, undefined, undefined, ctx);
 	assert.equal(denied.details.ok, false);
@@ -1243,13 +1249,16 @@ test("a remembered fact is injected into the next turn's system prompt", async (
 	const stored = await memory.execute("t1", { action: "remember", term: "long", scope: "persona", kind: "preference", text: "prefers verbose recon" }, undefined, undefined, ctx);
 	assert.equal(stored.details.ok, true);
 
-	const before = m.handlers.get("before_agent_start");
-	assert.ok(before);
-	const result = (await before({ messageType: "user", systemPrompt: "BASE PROMPT", prompt: "carry on" }, ctx)) as { systemPrompt?: string } | undefined;
-	assert.ok(result?.systemPrompt, "the turn's system prompt was augmented");
-	assert.match(result.systemPrompt, /BASE PROMPT/);
-	assert.match(result.systemPrompt, /<persona-mind/);
-	assert.match(result.systemPrompt, /prefers verbose recon/);
+	const normal = await m.beforeStart("carry on", ctx, { customPrompt: "BASE PROMPT", appendSystemPrompt: "configured addendum" });
+	assert.match(normal.systemPromptOptions.forceSystemPrompt ?? "", /BASE PROMPT[\s\S]+configured addendum[\s\S]+prefers verbose recon/);
+	assert.equal(normal.systemPromptOptions.appendSystemPrompt, "configured addendum", "supervisor memory stays request-local");
+
+	for (const forceSystemPrompt of ["external opaque prompt", ""]) {
+		const result = await m.beforeStart("carry on", ctx, { forceSystemPrompt, appendSystemPrompt: "hidden by prior override" });
+		assert.ok(result.systemPrompt.startsWith(forceSystemPrompt));
+		assert.doesNotMatch(result.systemPrompt, /hidden by prior override|<cwd>|BASE/);
+		assert.match(result.systemPrompt, /prefers verbose recon/);
+	}
 });
 
 test("an EMPTY supervisor mind injects one soft discoverability line (an unseen faculty is unused)", async () => {
@@ -1600,14 +1609,29 @@ test("a delegated worker leg (PI_PERSONA_CHILD) withholds tools + wakes and inje
 	t.after(async () => { await leg.handlers.get("session_shutdown")?.({}, legCtx); });
 
 	// Lean injection: it inherits the north-star + identity but NOT the supervisor's project state.
-	const before = leg.handlers.get("before_agent_start");
-	assert.ok(before);
-	const res = (await before({ messageType: "user", systemPrompt: "BASE", prompt: "do the assigned task" }, legCtx)) as { systemPrompt?: string } | undefined;
-	assert.ok(res?.systemPrompt, "the leg inherits a lean mind block");
-	assert.match(res.systemPrompt, /root every box/, "leg inherits the north-star");
-	assert.match(res.systemPrompt, /verbose recon/, "leg inherits durable identity");
-	assert.doesNotMatch(res.systemPrompt, /prod db is read-only/, "leg does NOT inherit working context");
-	assert.doesNotMatch(res.systemPrompt, /revisit the SMB share/, "leg does NOT inherit the backlog");
+	for (const addendum of ["", "visible section override"]) {
+		const result = await leg.beforeStart("do the assigned task", legCtx, {
+			customPrompt: "BASE PROMPT",
+			appendSystemPrompt: "configured addendum",
+			sections: { skills: "selected skill before Mind", addendum },
+		});
+		const options = result.systemPromptOptions;
+		assert.equal(options.forceSystemPrompt, undefined);
+		assert.ok(options.appendSystemPrompt.startsWith((addendum || "configured addendum") + "\n\n"));
+		assert.match(options.appendSystemPrompt, /<persona-mind[\s\S]*prefers verbose recon/);
+		assert.match(result.systemPrompt, /BASE PROMPT/);
+		assert.match(result.systemPrompt, /root every box/);
+		assert.doesNotMatch(result.systemPrompt, /prod db is read-only|revisit the SMB share/);
+		assert.match(result.systemPrompt, /selected skill before Mind/);
+		assert.match(result.systemPrompt, /prefers verbose recon/);
+		assert.equal(result.systemPrompt.includes("configured addendum"), !addendum);
+		assert.equal(result.systemPrompt.split("prefers verbose recon").length - 1, 1);
+		options.sections.skills = "selected skill after Mind";
+		assert.match(result.systemPrompt, /selected skill after Mind/);
+	}
+
+	const opaque = await leg.beforeStart("do the assigned task", legCtx, { forceSystemPrompt: "prior opaque worker" });
+	assert.match(opaque.systemPromptOptions.forceSystemPrompt ?? "", /^prior opaque worker[\s\S]+prefers verbose recon/);
 
 	// A worker never arms/fires the supervisor's backlog wakes.
 	assert.equal(wakeTexts(leg).length, 0, "a leg fires no backlog wakes");
@@ -1642,9 +1666,10 @@ test("a saved v1 worker keeps its launch query and relative dates for live lean 
 	}
 	t.after(async () => { await worker.handlers.get("session_shutdown")?.({}, ctx); });
 	const prepare = async (prompt: string) => {
-		const result = await worker.handlers.get("before_agent_start")?.({ messageType: "user", systemPrompt: "BASE", prompt }, ctx) as { systemPrompt?: string };
-		assert.ok(result.systemPrompt);
-		return result.systemPrompt;
+		const result = await worker.beforeStart(prompt, ctx);
+		assert.equal(result.systemPromptOptions.forceSystemPrompt, undefined);
+		assert.match(result.systemPromptOptions.appendSystemPrompt, /<persona-mind/);
+		return result.systemPromptOptions.appendSystemPrompt;
 	};
 	const launch = "Task: Review palette paintings gallery choices.";
 	const followup = "Task: Review astronomy meteor observations.";
@@ -1656,8 +1681,8 @@ test("a saved v1 worker keeps its launch query and relative dates for live lean 
 	manager.appendCustomEntry("pi-persona-worker-contract", { version: 1, sha256: "a".repeat(64) });
 	manager.appendMessage({ role: "user", content: [{ type: "text", text: launch }], timestamp: launchedAt });
 	t.mock.timers.setTime(launchedAt + 86_400_000);
-	const supervisorPrompt = await supervisor.handlers.get("before_agent_start")?.({ messageType: "user", systemPrompt: "BASE", prompt: launch }, supervisorCtx) as { systemPrompt?: string };
-	assert.match(supervisorPrompt.systemPrompt ?? "", /Palette paintings[^\n]+\(1d\)/, "supervisor memory uses the current clock");
+	const supervisorPrompt = await supervisor.beforeStart(launch, supervisorCtx);
+	assert.match(supervisorPrompt.systemPrompt, /Palette paintings[^\n]+\(1d\)/, "supervisor memory uses the current clock");
 	assert.equal(await prepare(launch), initial, "yesterday's launch dates survive a follow-up with identical task and memory");
 	assert.equal(await prepare(followup), initial, "a v1 continuation ranks against its original task on the current branch");
 	await remember("Always archive the selection criteria for review.");

@@ -1,7 +1,9 @@
 # Changelog
 
-## [Unreleased]
+## [0.9.6](https://github.com/AeonDave/pi-persona-mind/releases/tag/v0.9.6) - 2026-11-27
 
+- Delegated workers can receive their selected skills and Mind memory together. Previously Mind
+  could cause Persona to reject the delegation before the worker's first model call.
 - Mind now requires Pi 1.6.1. Its memory, backlog and delegated-worker integration are tested
   against that host.
 

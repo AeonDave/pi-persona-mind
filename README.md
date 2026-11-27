@@ -1,7 +1,7 @@
 <h1 align="center">pi-persona-mind</h1>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v0.9.5/assets/banner.png" alt="pi-persona-mind — durable memory for Pi">
+  <img src="https://raw.githubusercontent.com/AeonDave/pi-persona-mind/v0.9.6/assets/banner.png" alt="pi-persona-mind — durable memory for Pi">
 </p>
 
 [![CI](https://github.com/AeonDave/pi-persona-mind/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/AeonDave/pi-persona-mind/actions/workflows/test.yml)
@@ -28,7 +28,7 @@ knowledge reviews use the current session model and incur model usage.
 
 ## Quick start
 
-Mind 0.9.5 requires **Pi 1.6.1**, **Node.js 22.19.0+**, and
+Mind 0.9.6 requires **Pi 1.6.1**, **Node.js 22.19.0+**, and
 [**pi-persona 1.18.1+**](https://github.com/AeonDave/pi-persona) loaded in the same instance.
 
 ```bash
@@ -76,7 +76,8 @@ or `shared` destination. Strong direct-user cues may be captured automatically, 
 Broader retention requires a separate deliberate `memory` call with an explicit durable scope.
 
 Reminders notify you while Pi is open; they do not wake the model. Delegated workers receive a lean
-memory selection, without session notes or memory/backlog write tools. Home-directory sessions skip
+memory selection alongside any skills assigned with `delegate`. Session notes and memory/backlog
+write tools stay with the supervisor. Home-directory sessions skip
 project injection and reminders. See [lifetimes and scope](docs/DESIGN.md#four-lifetimes) and
 [session notes](docs/DESIGN.md#session-notes) for persistence, branch-local forgetting and expiry.
 
